@@ -1,7 +1,6 @@
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
-from trl import SFTTrainer, SFTConfig
-from trl.trainer.utils import DataCollatorForCompletionOnlyLM
+from trl import SFTTrainer, SFTConfig, DataCollatorForCompletionOnlyLM
 from peft import LoraConfig, get_peft_model
 from dataset_hf import prepare_cuda_agent_dataset
 
