@@ -10,7 +10,7 @@ def main():
     output_model_dir = "./sft_qwen3_8b_cuda"
     
     print(f"Loading Tokenizer: {model_id}")
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, use_fast=False)
     tokenizer.pad_token = tokenizer.eos_token
     
     print(f"Loading Model: {model_id}")
