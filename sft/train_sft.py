@@ -1,6 +1,6 @@
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
-from trl import SFTTrainer, SFTConfig, DataCollatorForCompletionOnlyLM
+from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling
+from trl import SFTTrainer, SFTConfig
 from peft import LoraConfig, get_peft_model
 from dataset_hf import prepare_cuda_agent_dataset
 
@@ -53,9 +53,9 @@ def main():
         gradient_checkpointing=True
     )
     
-    # Important: Tell the trainer to only compute loss on the response
-    response_template = "<|im_start|>assistant\n"
-    collator = DataCollatorForCompletionOnlyLM(response_template, tokenizer=tokenizer)
+    # TRL 0.14+ handles completion-only masking natively via the dataset formatting
+    # We just need standard language modeling collator
+    collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
     
     print("Initializing SFTTrainer")
     trainer = SFTTrainer(
