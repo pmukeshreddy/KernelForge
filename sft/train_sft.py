@@ -6,7 +6,7 @@ from dataset_hf import prepare_cuda_agent_dataset
 
 def main():
     model_id = "Qwen/Qwen3-8B"  # Or Qwen2.5-Coder-7B depending on release
-    dataset_name = "UCSC-VLAA/cuda-agent-sft" # The actual 6K ops from HF
+    dataset_name = "BytedTsinghua-SIA/CUDA-Agent-Ops-6K" # The actual 6K ops from HF
     output_model_dir = "./sft_qwen3_8b_cuda"
     
     print(f"Loading Tokenizer: {model_id}")
@@ -62,10 +62,9 @@ def main():
         model=model,
         train_dataset=train_dataset,
         args=training_args,
-        peft_config=peft_config,
         dataset_text_field="text",
         tokenizer=tokenizer,
-        max_seq_length=4096, # Kernels can be long
+        max_seq_length=8192, # Kernels and PyTorch ops can be long
         data_collator=collator,
     )
     

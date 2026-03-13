@@ -10,10 +10,8 @@ source .venv/bin/activate
 echo "2. Installing requirements..."
 pip install -r requirements.txt
 
-echo "3. Installing flash-attn from pre-built wheel (much faster)..."
-# Note: You may need to update this URL to match your exact Python, PyTorch, and CUDA versions
-# Find wheels at: https://github.com/Dao-AILab/flash-attention/releases
-pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.5.6/flash_attn-2.5.6+cu122torch2.1cxx11abiFALSE-cp310-cp310-linux_x86_64.whl || echo "Wheel installation failed, proceeding without it."
+echo "3. Installing flash-attn (Optional but recommended for H100)..."
+pip install flash-attn --no-build-isolation || echo "Flash attention installation failed, proceeding without it."
 
 echo "4. Logging into HuggingFace (required for gated models like Qwen)..."
 # User needs to ensure HF_TOKEN is set in the environment, or run huggingface-cli login manually

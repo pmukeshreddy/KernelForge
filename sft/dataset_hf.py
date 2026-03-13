@@ -2,27 +2,34 @@ import os
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
-def format_cuda_prompt(instruction, kernel=None):
+# A richer system prompt informed by CUDA Agent's approach
+SYSTEM_PROMPT = """<|im_start|>system
+You are an expert GPU kernel developer and optimizer. Your goal is to rewrite PyTorch operations into high-performance, optimized CUDA C++ code using appropriate kernel launch parameters, thread block dimensions, shared memory, and memory coalescing techniques.
+
+When given a PyTorch operator implementation (model.py) and a description of the operation (ops), you must output the equivalent, heavily optimized CUDA C++ implementation (model_new.py).
+<|im_end|>
+"""
+
+def format_cuda_prompt(ops_description, model_py, model_new_py=None):
     """
-    Given an instruction (and optionally the kernel), format the prompt 
-    in the chat template expected by Qwen3 (or a standard instruction format).
+    Format the prompt using the Qwen chat template. 
+    Input is the baseline PyTorch and operation string. 
+    Target is the optimized CUDA code.
     """
-    prompt = f"<|im_start|>system\nYou are an expert GPU programmer. Write a correct and optimized CUDA kernel for the requested operation.<|im_end|>\n"
-    prompt += f"<|im_start|>user\n{instruction}<|im_end|>\n"
+    prompt = SYSTEM_PROMPT
+    prompt += f"<|im_start|>user\nOperation description:\n{ops_description}\n\nPyTorch implementation (model.py):\n```python\n{model_py}\n```<|im_end|>\n"
     prompt += f"<|im_start|>assistant\n```cpp\n"
-    if kernel:
-        prompt += f"{kernel}\n```<|im_end|>\n"
+    if model_new_py:
+        prompt += f"{model_new_py}\n```<|im_end|>\n"
     return prompt
 
-def prepare_cuda_agent_dataset(dataset_name="UCSC-VLAA/cuda-agent-sft", split="train"):
+def prepare_cuda_agent_dataset(dataset_name="BytedTsinghua-SIA/CUDA-Agent-Ops-6K", split="train"):
     """
-    Loads and formats the CUDA Agent 6K operations dataset for SFT.
-    Users should replace the dataset_name with the actual huggingface repo ID.
+    Loads and formats the CUDA Agent-Ops-6K dataset.
+    Columns are: 'ops', 'model.py', 'model_new.py'
     """
     print(f"Loading dataset: {dataset_name} ({split})")
     
-    # We use a placeholder local path if HF repo isn't public, otherwise load directly.
-    # For now, we attempt to load from HF.
     try:
         dataset = load_dataset(dataset_name, split=split)
     except Exception as e:
@@ -31,19 +38,23 @@ def prepare_cuda_agent_dataset(dataset_name="UCSC-VLAA/cuda-agent-sft", split="t
         raise
         
     def format_example(example):
-        instruction = example.get("instruction", example.get("prompt", ""))
-        kernel = example.get("kernel", example.get("completion", ""))
+        ops_desc = example.get("ops", "")
+        model_py = example.get("model.py", "")
+        model_new_py = example.get("model_new.py", "")
         
-        formatted_text = format_cuda_prompt(instruction, kernel)
+        formatted_text = format_cuda_prompt(ops_desc, model_py, model_new_py)
         return {"text": formatted_text}
         
+    # We may want to filter out extremely long examples during mapping, 
+    # but the trainer's max_seq_length logic will handle truncation.
     formatted_dataset = dataset.map(format_example)
     return formatted_dataset
 
 if __name__ == "__main__":
     # Test script locally
     try:
-        ds = prepare_cuda_agent_dataset("Salesforce/wikitext", "train") # Replace with actual 6K ops dataset when ready
+        ds = prepare_cuda_agent_dataset("BytedTsinghua-SIA/CUDA-Agent-Ops-6K", "train")
+
         print("Sample:", ds[0]['text'])
     except Exception as e:
         pass

@@ -2,6 +2,7 @@ import os
 import subprocess
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from datasets import load_dataset
 from tqdm import tqdm
 from dataset_hf import format_cuda_prompt
 
@@ -66,20 +67,24 @@ def main():
         trust_remote_code=True
     )
     
-    # A small proxy eval set to verify cold-start ability
-    instructions = [
-        "Write a CUDA kernel to perform element-wise addition of two arrays.",
-        "Write an optimized CUDA kernel for SGEMM (Single Precision Matrix Multiplication) using shared memory.",
-        "Write a CUDA kernel to perform a parallel reduction (sum) over an array.",
-        "Write a CUDA kernel to compute the sigmoid of every element in a 2D tensor."
-    ]
+    # A proxy eval set of 50 examples from the dataset to verify cold-start ability
+    print("Loading evaluation dataset...")
+    # Load a small selection from the dataset (e.g. taking the last 50 from train as a pseudo-val split)
+    try:
+        ds = load_dataset("BytedTsinghua-SIA/CUDA-Agent-Ops-6K", split="train[-50:]")
+    except Exception as e:
+        print(f"Failed to load dataset for evaluation: {e}")
+        return
     
     success_count = 0
     results = []
 
-    print("Generating and testing kernels...")
-    for instr in tqdm(instructions):
-        prompt = format_cuda_prompt(instr)
+    print(f"Generating and testing kernels for {len(ds)} examples...")
+    for example in tqdm(ds):
+        ops_desc = example.get("ops", "")
+        model_py = example.get("model.py", "")
+        
+        prompt = format_cuda_prompt(ops_desc, model_py)
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
         
         # Determine offset to extract only the generated tokens
@@ -88,7 +93,7 @@ def main():
         with torch.no_grad():
             outputs = model.generate(
                 **inputs, 
-                max_new_tokens=1024, 
+                max_new_tokens=4096, # Increased to allow for longer kernel generation
                 temperature=0.2, 
                 do_sample=True,
                 pad_token_id=tokenizer.eos_token_id
@@ -96,15 +101,21 @@ def main():
         
         response = tokenizer.decode(outputs[0][prompt_len:], skip_special_tokens=True)
         
-        # Extract the cpp code block
+        # Robust code extraction
         code = ""
-        if "```cpp" in response:
-            code = response.split("```cpp")[1].split("```")[0].strip()
-        elif "```cuda" in response:
-            code = response.split("```cuda")[1].split("```")[0].strip()
-        elif "```" in response:
-             code = response.split("```")[1].strip()
+        if "```cpp" in response and "```" in response.split("```cpp", 1)[1]:
+            code = response.split("```cpp", 1)[1].split("```", 1)[0].strip()
+        elif "```cuda" in response and "```" in response.split("```cuda", 1)[1]:
+            code = response.split("```cuda", 1)[1].split("```", 1)[0].strip()
+        elif "```c++" in response and "```" in response.split("```c++", 1)[1]:
+            code = response.split("```c++", 1)[1].split("```", 1)[0].strip()
+        elif "```" in response and response.count("```") >= 2:
+             # Fallback to the first generic code block
+             code = response.split("```", 1)[1].split("```", 1)[0].strip()
+             # Optionally strip a language identifier like 'c' if mistakenly generated
+             if code.startswith("c\n"): code = code[2:].strip()
         else:
+            # Absolute fallback: just try to compile whatever it hallucinated
             code = response.strip()
             
         # Basic sanity check wrapping for incomplete generations (e.g. missing includes)
@@ -114,7 +125,7 @@ def main():
         success, err = compile_kernel(code)
         
         results.append({
-            "instruction": instr,
+            "ops": ops_desc,
             "success": success,
             "error": err
         })
@@ -122,11 +133,12 @@ def main():
         if success:
             success_count += 1
         else:
-            print(f"\n[FAIL] {instr}")
-            print(f"Compiler Error:\n{err}")
+            # We don't print every failure to avoid console spam over 50 examples,
+            # but you can log them to a file if needed.
+            pass
             
-    compilation_rate = (success_count / len(instructions)) * 100
-    print(f"\nFinal Compilation Rate: {success_count}/{len(instructions)} ({compilation_rate:.2f}%)")
+    compilation_rate = (success_count / len(ds)) * 100
+    print(f"\nFinal Compilation Rate: {success_count}/{len(ds)} ({compilation_rate:.2f}%)")
 
 if __name__ == "__main__":
     main()
