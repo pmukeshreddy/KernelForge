@@ -46,14 +46,27 @@ def main():
         for jf in json_files:
             gpu_name = os.path.basename(jf).replace('.json', '')
             with open(jf) as f:
-                data = json.load(f)
+                content = f.read().strip()
             
-            if isinstance(data, list):
-                entries = data
-            elif isinstance(data, dict):
-                entries = list(data.values()) if not isinstance(list(data.values())[0], str) else [data]
-            else:
-                continue
+            # Try as single JSON first, then as JSONL
+            entries = []
+            try:
+                data = json.loads(content)
+                if isinstance(data, list):
+                    entries = data
+                elif isinstance(data, dict):
+                    entries = list(data.values()) if all(isinstance(v, dict) for v in data.values()) else [data]
+            except json.JSONDecodeError:
+                # Try JSONL (one JSON object per line)
+                for line in content.split('\n'):
+                    line = line.strip()
+                    if line:
+                        try:
+                            entries.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            continue
+            
+            print(f"  {gpu_name}: {len(entries)} entries")
             
             for entry in entries:
                 ref = entry.get("ref_code", "")
