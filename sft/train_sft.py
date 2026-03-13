@@ -52,7 +52,6 @@ def main():
         save_strategy="epoch",
         bf16=True,
         gradient_checkpointing=True,
-        max_seq_length=4096,
         dataset_text_field="text",
     )
     
@@ -64,6 +63,7 @@ def main():
         train_dataset=train_dataset,
         args=training_args,
         data_collator=collator,
+        max_seq_length=4096,
     )
     
     print("Starting Training...")
