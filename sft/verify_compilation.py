@@ -4,7 +4,6 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from tqdm import tqdm
-from dataset_hf import format_cuda_prompt
 
 def check_nvcc():
     """Check if nvcc is available."""
@@ -15,130 +14,108 @@ def check_nvcc():
         return False
 
 def compile_kernel(kernel_code, filename="temp_kernel.cu"):
-    """
-    Writes the kernel to a file and attempts to compile it with nvcc.
-    Returns (success: bool, error_message: str)
-    """
+    """Compile with nvcc. Returns (success, error)."""
     with open(filename, "w") as f:
         f.write(kernel_code)
-    
     try:
-        # We only compile (-c) to an object file without linking or executing
-        # This checks syntax and basic CUDA semantics
         result = subprocess.run(
             ["nvcc", "-c", filename, "-o", "temp_kernel.o"], 
-            capture_output=True, 
-            text=True, 
-            timeout=15
+            capture_output=True, text=True, timeout=15
         )
-        success = result.returncode == 0
-        return success, result.stderr
+        return result.returncode == 0, result.stderr
     except subprocess.TimeoutExpired:
-        return False, "Timeout during compilation"
+        return False, "Timeout"
     except Exception as e:
         return False, str(e)
     finally:
-        # Cleanup
-        if os.path.exists(filename):
-            os.remove(filename)
-        if os.path.exists("temp_kernel.o"):
-            os.remove("temp_kernel.o")
+        for f in [filename, "temp_kernel.o"]:
+            if os.path.exists(f):
+                os.remove(f)
+
+SYSTEM = """<|im_start|>system
+You are an expert GPU kernel developer. Rewrite PyTorch operations into optimized CUDA C++ code with __global__ kernels, proper thread indexing, shared memory, and memory coalescing. Output only the CUDA C++ code.
+<|im_end|>
+"""
+
+def make_prompt(pytorch_code):
+    return SYSTEM + f"<|im_start|>user\nRewrite this PyTorch model as an optimized CUDA kernel with __global__ functions, thread indexing, and proper memory access:\n```python\n{pytorch_code}\n```<|im_end|>\n<|im_start|>assistant\n```cpp\n"
 
 def main():
     if not check_nvcc():
-        print("Warning: 'nvcc' not found. Ensure CUDA toolkit is installed.")
+        print("Warning: 'nvcc' not found.")
         return
 
-    model_path = "./sft_qwen3_8b_cuda" # Path to SFT model
-    
+    model_path = "./sft_qwen3_8b_cuda"
     if not os.path.exists(model_path):
-        print(f"Warning: Model not found at {model_path}. Maybe SFT has not completed yet.")
-        print("Using base model for demonstration...")
+        print(f"Model not found at {model_path}. Using base model.")
         model_path = "Qwen/Qwen3-8B"
 
-    print(f"Loading Tokenizer from {model_path}")
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, use_fast=False)
-    
     print(f"Loading Model from {model_path}")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, use_fast=False)
     model = AutoModelForCausalLM.from_pretrained(
-        model_path, 
-        torch_dtype=torch.bfloat16, 
-        device_map="auto",
-        trust_remote_code=True
+        model_path, torch_dtype=torch.bfloat16, device_map="auto", trust_remote_code=True
     )
     
-    # A proxy eval set of 50 examples from the dataset to verify cold-start ability
-    print("Loading evaluation dataset...")
-    # Load a small selection from the dataset (e.g. taking the last 50 from train as a pseudo-val split)
-    try:
-        ds = load_dataset("BytedTsinghua-SIA/CUDA-Agent-Ops-6K", split="train[-50:]")
-    except Exception as e:
-        print(f"Failed to load dataset for evaluation: {e}")
-        return
+    # Use KernelBench level_1 as eval set (same format as training)
+    print("Loading KernelBench level_1 for evaluation...")
+    ds = load_dataset("ScalingIntelligence/KernelBench", split="level_1")
+    
+    # Take last 20 as eval
+    eval_ds = ds.select(range(max(0, len(ds)-20), len(ds)))
     
     success_count = 0
-    results = []
+    has_cuda_count = 0
+    total = len(eval_ds)
 
-    print(f"Generating and testing kernels for {len(ds)} examples...")
-    for example in tqdm(ds):
-        ops_desc = example.get("ops", "")
-        model_py = example.get("model.py", "")
-        
-        prompt = format_cuda_prompt(ops_desc, model_py)
+    print(f"Generating and testing kernels for {total} examples...")
+    pbar = tqdm(eval_ds, total=total)
+    for example in pbar:
+        pytorch_code = example.get("code", "")
+        prompt = make_prompt(pytorch_code)
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-        
-        # Determine offset to extract only the generated tokens
         prompt_len = inputs.input_ids.shape[1]
         
         with torch.no_grad():
             outputs = model.generate(
-                **inputs, 
-                max_new_tokens=4096, # Increased to allow for longer kernel generation
-                temperature=0.2, 
-                do_sample=True,
-                pad_token_id=tokenizer.eos_token_id
+                **inputs, max_new_tokens=2048, temperature=0.2, 
+                do_sample=True, pad_token_id=tokenizer.eos_token_id
             )
         
         response = tokenizer.decode(outputs[0][prompt_len:], skip_special_tokens=True)
         
-        # Robust code extraction
+        # Extract code
         code = ""
-        if "```cpp" in response and "```" in response.split("```cpp", 1)[1]:
-            code = response.split("```cpp", 1)[1].split("```", 1)[0].strip()
-        elif "```cuda" in response and "```" in response.split("```cuda", 1)[1]:
-            code = response.split("```cuda", 1)[1].split("```", 1)[0].strip()
-        elif "```c++" in response and "```" in response.split("```c++", 1)[1]:
-            code = response.split("```c++", 1)[1].split("```", 1)[0].strip()
-        elif "```" in response and response.count("```") >= 2:
-             code = response.split("```", 1)[1].split("```", 1)[0].strip()
-             if code.startswith("c\n"): code = code[2:].strip()
+        for lang in ["cpp", "cuda", "c++"]:
+            marker = f"```{lang}"
+            if marker in response:
+                parts = response.split(marker, 1)[1]
+                if "```" in parts:
+                    code = parts.split("```", 1)[0].strip()
+                    break
+        if not code and "```" in response and response.count("```") >= 2:
+            code = response.split("```", 1)[1].split("```", 1)[0].strip()
         
-        # Reject empty or trivially short code
+        # Check for CUDA constructs
         if len(code) < 50:
-            results.append({"ops": ops_desc, "success": False, "error": "Code too short or empty"})
+            pbar.set_postfix({"pass": success_count, "cuda": has_cuda_count, "fail": pbar.n+1-success_count})
             continue
         
-        # Must contain actual CUDA kernel constructs - no free passes
         has_cuda = any(kw in code for kw in ["__global__", "__device__", "<<<", "blockIdx", "threadIdx"])
-        if not has_cuda:
-            results.append({"ops": ops_desc, "success": False, "error": "No CUDA kernel constructs found"})
+        if has_cuda:
+            has_cuda_count += 1
+        else:
+            pbar.set_postfix({"pass": success_count, "cuda": has_cuda_count, "fail": pbar.n+1-success_count})
             continue
             
         success, err = compile_kernel(code)
-        
-        results.append({
-            "ops": ops_desc,
-            "success": success,
-            "error": err
-        })
-        
         if success:
             success_count += 1
-        else:
-            pass
+        
+        pbar.set_postfix({"pass": success_count, "cuda": has_cuda_count, "fail": pbar.n+1-success_count})
             
-    compilation_rate = (success_count / len(ds)) * 100
-    print(f"\nFinal Compilation Rate: {success_count}/{len(ds)} ({compilation_rate:.2f}%)")
+    print(f"\n=== Final Results ===")
+    print(f"Has CUDA constructs: {has_cuda_count}/{total} ({has_cuda_count/total*100:.1f}%)")
+    print(f"Compiles with nvcc:  {success_count}/{total} ({success_count/total*100:.1f}%)")
 
 if __name__ == "__main__":
     main()
