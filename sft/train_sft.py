@@ -16,7 +16,7 @@ def main():
     print(f"Loading Model: {model_id}")
     model = AutoModelForCausalLM.from_pretrained(
         model_id, 
-        torch_dtype=torch.bfloat16, 
+        dtype=torch.bfloat16, 
         device_map="auto",
         trust_remote_code=True,
         attn_implementation="flash_attention_2" # Highly recommended for H100
