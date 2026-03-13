@@ -11,6 +11,7 @@ echo "2. Installing requirements..."
 pip install -r requirements.txt
 
 echo "3. Installing flash-attn (Optional but recommended for H100)..."
+pip install wheel setuptools
 pip install flash-attn --no-build-isolation || echo "Flash attention installation failed, proceeding without it."
 
 echo "4. Logging into HuggingFace (required for gated models like Qwen)..."
