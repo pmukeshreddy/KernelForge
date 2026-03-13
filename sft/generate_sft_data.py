@@ -52,8 +52,8 @@ def extract_code(response):
 def main():
     model_id = "Qwen/Qwen3-8B"
     output_file = "./sft_training_pairs.jsonl"
-    num_attempts_per_problem = 3  # Generate N attempts per problem, keep best
-    max_problems = 6000  # Process all problems
+    num_attempts_per_problem = 1  # Generate 1 attempt per problem (faster)
+    max_problems = 1000  # 1000 good pairs is plenty for SFT
     
     print(f"Loading model: {model_id}")
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, use_fast=False)
