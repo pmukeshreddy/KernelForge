@@ -110,17 +110,19 @@ def main():
         elif "```c++" in response and "```" in response.split("```c++", 1)[1]:
             code = response.split("```c++", 1)[1].split("```", 1)[0].strip()
         elif "```" in response and response.count("```") >= 2:
-             # Fallback to the first generic code block
              code = response.split("```", 1)[1].split("```", 1)[0].strip()
-             # Optionally strip a language identifier like 'c' if mistakenly generated
              if code.startswith("c\n"): code = code[2:].strip()
-        else:
-            # Absolute fallback: just try to compile whatever it hallucinated
-            code = response.strip()
-            
-        # Basic sanity check wrapping for incomplete generations (e.g. missing includes)
-        if "#include" not in code:
-            code = "#include <cuda_runtime.h>\n#include <stdio.h>\n" + code
+        
+        # Reject empty or trivially short code
+        if len(code) < 50:
+            results.append({"ops": ops_desc, "success": False, "error": "Code too short or empty"})
+            continue
+        
+        # Must contain actual CUDA kernel constructs - no free passes
+        has_cuda = any(kw in code for kw in ["__global__", "__device__", "<<<", "blockIdx", "threadIdx"])
+        if not has_cuda:
+            results.append({"ops": ops_desc, "success": False, "error": "No CUDA kernel constructs found"})
+            continue
             
         success, err = compile_kernel(code)
         
@@ -133,8 +135,6 @@ def main():
         if success:
             success_count += 1
         else:
-            # We don't print every failure to avoid console spam over 50 examples,
-            # but you can log them to a file if needed.
             pass
             
     compilation_rate = (success_count / len(ds)) * 100
