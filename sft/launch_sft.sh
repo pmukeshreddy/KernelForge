@@ -12,7 +12,7 @@ pip install -r requirements.txt
 
 echo "3. Installing flash-attn (Optional but recommended for H100)..."
 pip install wheel setuptools
-pip install flash-attn --no-build-isolation || echo "Flash attention installation failed, proceeding without it."
+pip install https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3+cu128torch2.10-cp310-cp310-linux_x86_64.whl || echo "Flash attention wheel installation failed, proceeding without it."
 
 echo "4. Logging into HuggingFace (required for gated models like Qwen)..."
 # User needs to ensure HF_TOKEN is set in the environment, or run huggingface-cli login manually
