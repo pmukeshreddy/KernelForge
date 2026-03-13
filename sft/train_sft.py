@@ -1,6 +1,7 @@
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
-from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
+from trl import SFTTrainer, SFTConfig
+from trl.trainer.utils import DataCollatorForCompletionOnlyLM
 from peft import LoraConfig, get_peft_model
 from dataset_hf import prepare_cuda_agent_dataset
 
@@ -37,7 +38,7 @@ def main():
     # Load and format the dataset
     train_dataset = prepare_cuda_agent_dataset(dataset_name, split="train")
     
-    training_args = TrainingArguments(
+    training_args = SFTConfig(
         output_dir="./sft_output",
         per_device_train_batch_size=4,
         gradient_accumulation_steps=8,
@@ -62,9 +63,6 @@ def main():
         model=model,
         train_dataset=train_dataset,
         args=training_args,
-        dataset_text_field="text",
-        tokenizer=tokenizer,
-        max_seq_length=8192, # Kernels and PyTorch ops can be long
         data_collator=collator,
     )
     
