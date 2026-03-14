@@ -76,7 +76,21 @@ def evaluate(kernel_code: str, reference_code: str, timeout: int = 300,
             with open(result_path) as f:
                 result = json.load(f)
         elif proc.returncode != 0:
-            result["compiler_error"] = (proc.stderr or "")[-500:]
+            # Clean compiler output: extract only error lines, strip build flag noise
+            raw_err = proc.stderr or ""
+            error_lines = []
+            for line in raw_err.split('\n'):
+                line_stripped = line.strip()
+                # Keep lines with actual errors, skip build command flags
+                if any(kw in line_stripped for kw in ['error:', 'Error:', 'undefined', 'FAILED', 'fatal']):
+                    # Strip leading path noise, keep just filename and error
+                    if '.cu(' in line_stripped:
+                        line_stripped = line_stripped[line_stripped.rfind('/', 0, line_stripped.find('.cu('))+1:]
+                    error_lines.append(line_stripped)
+            if error_lines:
+                result["compiler_error"] = '\n'.join(error_lines[-10:])  # Last 10 error lines
+            else:
+                result["compiler_error"] = raw_err[-500:]  # Fallback
 
     except subprocess.TimeoutExpired:
         if os.path.exists(result_path):
@@ -155,7 +169,7 @@ try:
             rf, nf = r.float(), n.float()
             if rf.shape != nf.shape:
                 trial_ok = False
-                correctness_detail = f"Output tensor {{t_idx}}: SHAPE MISMATCH - expected shape {{list(rf.shape)}}, got {{list(nf.shape)}}"
+                correctness_detail = f"Output tensor {{t_idx}}: SHAPE MISMATCH - expected shape {{list(rf.shape)}}, got {{list(nf.shape)}}."
                 break
             if not torch.allclose(rf, nf, atol=1e-2, rtol=1e-2):
                 trial_ok = False

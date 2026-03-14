@@ -76,7 +76,16 @@ def profile_kernel(kernel_code: str, reference_code: str, timeout: int = 120) ->
                 preexec_fn=os.setsid, 
             )
         except FileNotFoundError:
-            return "Profiler Skipped: 'ncu' command not found. Install Nsight Compute for hardware profiling."
+            raise RuntimeError(
+                "\n" + "="*60 + "\n"
+                "FATAL: 'ncu' (Nsight Compute) is NOT INSTALLED.\n"
+                "The optimization loop CANNOT function without hardware profiling.\n"
+                "Install it with:\n"
+                "  apt-get update && apt-get install -y nsight-compute\n"
+                "Or:\n"
+                "  apt-get install -y cuda-nsight-compute-12-*\n"
+                + "="*60
+            )
         
         stdout, stderr = "", ""
         try:
