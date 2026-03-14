@@ -54,13 +54,18 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
     # Use the last binding function as the one to call from forward()
     binding_func = func_names[-1]
     
-    # 3. Build the full Python wrapper
+    # 3. Escape CUDA code for safe embedding in Python triple-quoted string
+    safe_cuda = cuda_code.replace('\\', '\\\\').replace('"""', "'''")
+    # Escape cpp_source for single-quoted Python string
+    safe_cpp = cpp_source.replace('\\', '\\\\').replace('"', '\\"')
+    
+    # 4. Build the full Python wrapper
     wrapper = f'''import torch
 from torch.utils.cpp_extension import load_inline
 
-cuda_source = """{cuda_code}"""
+cuda_source = """{safe_cuda}"""
 
-cpp_source = "{cpp_source}"
+cpp_source = "{safe_cpp}"
 
 ext = load_inline(
     name="custom_ext",

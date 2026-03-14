@@ -9,12 +9,30 @@ calculated by the Nsight Compute profiler.
 It uses a HuggingFace generic GRPO implementation optimized for code-generation.
 """
 
+import re
 from dataclasses import dataclass
 import json
 import torch
 from datasets import load_dataset
 from trl import GRPOConfig, GRPOTrainer
-from agent import KernelForgeAgent
+from agent import build_load_inline_wrapper
+
+
+def extract_cuda_from_completion(completion: str) -> str:
+    """Extract CUDA C++ code block from a model completion."""
+    for lang in ["cpp", "cuda", "c\\+\\+"]:
+        match = re.search(rf"```{lang}(.*?)```", completion, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+    
+    # Fallback: strip <think> blocks, check if remainder looks like CUDA
+    clean = re.sub(r"<think>.*?</think>", "", completion, flags=re.DOTALL)
+    clean = re.sub(r"<think>.*", "", clean, flags=re.DOTALL)
+    stripped = clean.strip()
+    if any(kw in stripped for kw in ["__global__", "torch::Tensor", "#include"]):
+        return stripped
+    return ""
+
 
 @dataclass
 class KernelForgeConfig:
@@ -27,11 +45,12 @@ class KernelForgeConfig:
     max_completion_length: int = 1536
     learning_rate: float = 1e-6 # Very low LR to prevent format collapse
 
+
 def kernel_reward_func(prompts, completions, **kwargs) -> list[float]:
     """
     The actual Reward Function invoked by the RL Trainer.
-    We pass the generated completion to our verified Sandbox (SP1-3).
-    If it compiles and is correct, we pass it to the Profiler (SP4) for Speedup.
+    Extracts CUDA C++ from the completion, wraps it in load_inline,
+    evaluates in sandbox, and returns speedup reward.
     """
     import os
     from sandbox import evaluate
@@ -40,15 +59,22 @@ def kernel_reward_func(prompts, completions, **kwargs) -> list[float]:
     rewards = []
     
     for prompt, completion in zip(prompts, completions):
-        # The prompt is just the PyTorch operation.
         target_program = prompt
         
-        # The completion is the LLM's `load_inline` python code block
-        candidate_code = KernelForgeAgent().extract_code_block(completion)
+        # Extract raw CUDA C++ from the completion
+        cuda_code = extract_cuda_from_completion(completion)
+        
+        if not cuda_code:
+            # Format Collapse Penalty - no valid C++ block found
+            rewards.append(-1.0)
+            continue
+        
+        # Wrap raw C++ in load_inline Python
+        candidate_code = build_load_inline_wrapper(cuda_code, target_program)
         
         if not candidate_code:
-            # Format Collapse Penalty
-            rewards.append(-1.0)
+            # Could not parse binding function
+            rewards.append(-0.5)
             continue
             
         print(f"🛠️ Evaluating generation on Sandbox...")
@@ -60,8 +86,8 @@ def kernel_reward_func(prompts, completions, **kwargs) -> list[float]:
             print(f"❌ Failed: Penalty -0.5")
             continue
             
-        # Success! Calculate true hardware speedup mapping
-        reward = calculate_reward(eval_result, target_program)
+        # Success! Calculate true hardware speedup
+        reward = calculate_reward(eval_result)
         print(f"🏆 Speedup Achieved: {reward:.2f}x")
         rewards.append(reward)
         
