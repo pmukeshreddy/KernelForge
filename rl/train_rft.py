@@ -28,7 +28,7 @@ def load_dataset(filepath: str) -> list:
 def run_rft_collection(dataset_path: str, output_path: str):
     """Samples the LLM, filters bad generations, and saves the RFT dataset."""
     print(f"Initializing Rejection Fine-Tuning (RFT) Sampling...")
-    agent = KernelForgeAgent(model_name="Qwen/Qwen2.5-Coder-3B-Instruct")
+    agent = KernelForgeAgent()
     
     # Load raw PyTorch -> CUDA prompts (SP1/SFT base)
     dataset = load_dataset(dataset_path)
