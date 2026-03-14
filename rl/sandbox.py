@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import shutil
 import json
-from .antihack import check_security
+from antihack import check_security
 
 
 def evaluate(kernel_code: str, reference_code: str, timeout: int = 300,
