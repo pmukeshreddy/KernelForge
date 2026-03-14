@@ -15,7 +15,7 @@ import os
 from agent import KernelForgeAgent
 
 NUM_SAMPLES_PER_PROMPT = 8
-MAX_REACT_STEPS = 2
+MAX_REACT_STEPS = 5
 MIN_SPEEDUP_REWARD = 1.05
 
 def load_dataset(filepath: str) -> list:

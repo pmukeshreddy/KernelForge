@@ -107,8 +107,11 @@ If Warp Occupancy is low (< 40%), the SM doesn't have enough active warps to hid
 These are critical correctness errors that will cause "illegal memory access" CUDA runtime crashes:
 
 - **Shared memory must be TILE-sized, NEVER matrix-sized**: Use fixed `__shared__ float tile[TILE_SIZE][TILE_SIZE]` arrays. NEVER use `extern __shared__` sized by M, K, or N — shared memory is limited to ~48KB per block, but `K*K*sizeof(float)` for a 4096x4096 matrix is 64MB.
+- **NEVER use two `extern __shared__` declarations**: Multiple `extern __shared__` arrays all alias to the same base address. Use fixed-size static arrays (e.g., `__shared__ float sA[TILE][TILE]; __shared__ float sB[TILE][TILE];`) instead.
+- **Max 1024 threads per block**: CUDA hard limit. For 2D blocks, `blockDim.x * blockDim.y <= 1024`. This means TILE_SIZE must be ≤ 32 for 2D blocks (32×32 = 1024). TILE_SIZE of 64 or 128 with `dim3(TILE_SIZE, TILE_SIZE)` will CRASH.
 - **Index shared memory with threadIdx only**: Inside shared memory arrays, indices must be bounded by the tile/block dimensions (e.g., `tile[threadIdx.y][threadIdx.x]`). NEVER use full matrix dimensions like `row * K + col` to index into shared memory.
 - **Each thread must write to its own unique output element**: When writing to the output matrix C, the index MUST include both block-level AND thread-level offsets: `C[(blockIdx.y * TILE_SIZE + threadIdx.y) * N + (blockIdx.x * TILE_SIZE + threadIdx.x)]`. Omitting `threadIdx` causes all threads in a block to overwrite the same element.
+- **FP16 (`half`) requires intrinsics, not operators**: You CANNOT write `a * b` or `a + b` with `half` types. Use `__hmul(a, b)`, `__hadd(a, b)`, or `__hfma(a, b, acc)`. Standard C++ operators are NOT defined for CUDA `half`.
 - **Tiled matmul pattern**: Loop over tiles along the K dimension. Each iteration: load one TILE_SIZE×TILE_SIZE tile of A and B into shared memory, `__syncthreads()`, accumulate partial dot products, `__syncthreads()`, repeat.
 """
 
