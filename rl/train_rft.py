@@ -19,8 +19,10 @@ MAX_REACT_STEPS = 2
 MIN_SPEEDUP_REWARD = 1.05
 
 def load_dataset(filepath: str) -> list:
-    """Loads a JSON dataset of PyTorch reference implementations."""
+    """Loads a JSON or JSONL dataset of PyTorch reference implementations."""
     with open(filepath, 'r') as f:
+        if filepath.endswith('.jsonl'):
+            return [json.loads(line) for line in f if line.strip()]
         return json.load(f)
 
 def run_rft_collection(dataset_path: str, output_path: str):
