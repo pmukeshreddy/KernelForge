@@ -104,6 +104,7 @@ class KernelForgeAgent:
             candidate_code = self.extract_code_block(response)
             if not candidate_code:
                 print("❌ Failed to extract python block. Requesting fix...")
+                print(f"--- FAILED GENERATED TEXT ---\n{response}\n-----------------------------")
                 messages.append({"role": "user", "content": "Error: Could not find ```python block in your response. Please output the code properly."})
                 continue
                 
