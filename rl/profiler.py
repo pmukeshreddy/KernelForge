@@ -165,16 +165,15 @@ def _generate_feedback(metrics: Dict[str, float]) -> str:
     occupancy = metrics.get("occupancy", 0.0)
     
     # Determine bottleneck
-    ratio = compute / (memory + 1e-5) # avoid div0
-    if memory > 75.0 and compute < 50.0:
+    if memory > compute * 2.0 or memory > 70.0:
         bottleneck = "MEMORY-BOUND"
         advice = "Try coalesced global memory accesses, vectorization (float4), or utilizing shared memory caching to reduce global memory traffic."
-    elif compute > 75.0 and memory < 50.0:
+    elif compute > memory * 2.0 or compute > 70.0:
         bottleneck = "COMPUTE-BOUND"
         advice = "Reduce divergent branches, unroll inner loops, or use intrinsic math functions (e.g., __fdividef) to speed up math operations."
-    elif compute > 60.0 and memory > 60.0:
+    elif compute > 40.0 and memory > 40.0:
         bottleneck = "BALANCED (PIPELINE-BOUND)"
-        advice = "Both memory and compute are highly utilized. Focus on instruction-level parallelism (ILP) and hiding latency through higher occupancy."
+        advice = "Both memory and compute are moderately utilized. Focus on instruction-level parallelism (ILP) and hiding latency through higher occupancy."
     else:
         bottleneck = "LATENCY-BOUND (POOR OCCUPANCY/SYNCHRONIZATION)"
         advice = "The kernel is stalled. Increase occupancy, remove excessive __syncthreads(), or redesign to map more parallel work per block."

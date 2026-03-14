@@ -19,7 +19,9 @@ class Model(nn.Module):
     def forward(self, x): return x
 
 def get_inputs():
-    return [torch.randn(1024, 1024)]
+    # 256MB per tensor (total 512MB for read+write) to blow past A100's 40MB L2 Cache 
+    # and guarantee we hit global memory bandwidth limits.
+    return [torch.randn(8192, 8192)]
 
 def get_init_inputs():
     return []
