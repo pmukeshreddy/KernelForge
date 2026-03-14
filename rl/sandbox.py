@@ -48,6 +48,9 @@ def evaluate(kernel_code: str, reference_code: str, timeout: int = 300,
         # Run in subprocess
         env = os.environ.copy()
         env["PYTHONPATH"] = tmpdir
+        env["TORCH_EXTENSIONS_DIR"] = os.path.join(tmpdir, "torch_extensions")
+        if "TORCH_CUDA_ARCH_LIST" not in env:
+            env["TORCH_CUDA_ARCH_LIST"] = "8.0"
 
         proc = subprocess.run(
             [sys.executable, eval_path],
