@@ -120,7 +120,7 @@ class KernelForgeAgent:
             if not eval_result["correct"]:
                 # Compilation failed or output was wrong
                 error_msg = eval_result.get("compiler_error") or "Outputs do not match the reference implementation exactly (Correctness Failed)."
-                print(f"❌ Evaluation Failed: ...{error_msg.strip()[-200:]}\n")
+                print(f"❌ Evaluation Failed: {error_msg.strip()[:100]}...\n")
                 print(f"--- FAILED GENERATED CODE ---\n{candidate_code}\n-----------------------------")
                 
                 # Feed error back to LLM
@@ -135,7 +135,7 @@ class KernelForgeAgent:
             print("🔬 Profiling Hardware Metrics...")
             profiler_feedback = profile_kernel(candidate_code, target_program)
             
-            reward = calculate_reward(eval_result, target_program)
+            reward = calculate_reward(eval_result)
             print(f"🏆 Reward: {reward:.2f}x Speedup")
             
             # Track best performance
