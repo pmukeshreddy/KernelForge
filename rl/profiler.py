@@ -57,6 +57,7 @@ def profile_kernel(kernel_code: str, reference_code: str, timeout: int = 120) ->
         
         ncu_cmd = [
             "ncu",
+            "--target-processes", "all",
             "--metrics", ",".join(metrics),
             "--csv",
             "--page", "raw",
@@ -121,15 +122,14 @@ def _parse_ncu_csv(csv_text: str) -> Dict[str, float]:
         
     reader = csv.DictReader(lines[csv_start:])
     for row in reader:
-        # Check if the column is named 'Metric Name' or similar
-        metric_col = next((k for k in row.keys() if "Metric Name" in k), None)
-        val_col = next((k for k in row.keys() if "Metric Value" in k), None)
+        # Format 1 (Newer NCU): Rows have "Metric Name" and "Metric Value"
+        metric_col = next((k for k in row.keys() if k and "Metric Name" in k), None)
+        val_col = next((k for k in row.keys() if k and "Metric Value" in k), None)
         
         if metric_col and val_col:
             name = str(row[metric_col]).strip()
             val_str = str(row[val_col]).strip().replace('%', '')
             try:
-                # ncu uses strict metric names in the CSV output
                 if "sm__throughput" in name:
                     metrics["compute"] = float(val_str)
                 elif "gpu__compute_memory" in name:
@@ -138,7 +138,23 @@ def _parse_ncu_csv(csv_text: str) -> Dict[str, float]:
                     metrics["occupancy"] = float(val_str)
             except ValueError:
                 pass
-                
+        
+        # Format 2 (Older NCU 2022.x): Metrics are direct column headers
+        else:
+            for col_name, val in row.items():
+                if not col_name: continue
+                name = str(col_name).strip()
+                val_str = str(val).strip().replace('%', '')
+                try:
+                    if "sm__throughput" in name:
+                        metrics["compute"] = float(val_str)
+                    elif "gpu__compute_memory" in name:
+                        metrics["memory"] = float(val_str)
+                    elif "sm__warps_active" in name:
+                        metrics["occupancy"] = float(val_str)
+                except ValueError:
+                    pass
+                    
     return metrics
 
 
