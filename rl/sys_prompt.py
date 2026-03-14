@@ -33,6 +33,8 @@ CRITICAL: You must keep your reasoning extremely concise. DO NOT write long math
 You must output EXACTLY ONE Python code block containing the full, executable `load_inline` script.
 Do not output markdown outside the code block.
 
+Here is a COMPLETE, WORKING reference example for tiled matrix multiplication. Follow this pattern exactly:
+
 ```python
 import torch
 from torch.utils.cpp_extension import load_inline
@@ -41,35 +43,59 @@ cuda_source = \"\"\"
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 
-// YOUR OPTIMIZED CUDA KERNEL GOES HERE
-__global__ void my_optimized_kernel(...) {
-    // ...
+#define TILE_SIZE 32
+
+__global__ void matmul_kernel(const float* A, const float* B, float* C, int M, int K, int N) {
+    __shared__ float sA[TILE_SIZE][TILE_SIZE];
+    __shared__ float sB[TILE_SIZE][TILE_SIZE];
+
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    float val = 0.0f;
+
+    for (int t = 0; t < (K + TILE_SIZE - 1) / TILE_SIZE; ++t) {
+        int aCol = t * TILE_SIZE + threadIdx.x;
+        int bRow = t * TILE_SIZE + threadIdx.y;
+        sA[threadIdx.y][threadIdx.x] = (row < M && aCol < K) ? A[row * K + aCol] : 0.0f;
+        sB[threadIdx.y][threadIdx.x] = (bRow < K && col < N) ? B[bRow * N + col] : 0.0f;
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < TILE_SIZE; ++i)
+            val += sA[threadIdx.y][i] * sB[i][threadIdx.x];
+        __syncthreads();
+    }
+
+    if (row < M && col < N)
+        C[row * N + col] = val;
 }
 
-// BINDING FUNCTION
-torch::Tensor run_cuda(...) {
-    // ... launch logic
+torch::Tensor run_cuda(torch::Tensor A, torch::Tensor B) {
+    int M = A.size(0), K = A.size(1), N = B.size(1);
+    auto C = torch::zeros({M, N}, A.options());
+    dim3 threads(TILE_SIZE, TILE_SIZE);
+    dim3 blocks((N + TILE_SIZE - 1) / TILE_SIZE, (M + TILE_SIZE - 1) / TILE_SIZE);
+    matmul_kernel<<<blocks, threads>>>(A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(), M, K, N);
+    return C;
 }
 \"\"\"
 
-cpp_source = "torch::Tensor run_cuda(...);"
+cpp_source = "torch::Tensor run_cuda(torch::Tensor A, torch::Tensor B);"
 
-# Compile
 ext = load_inline(
     name="custom_ext",
     cpp_sources=cpp_source,
     cuda_sources=cuda_source,
     functions=["run_cuda"],
     extra_cflags=["-O3"],
-    extra_cuda_cflags=["-O3", "-use_fast_math", "-Xcompiler", "-O3"]
+    extra_cuda_cflags=["-O3", "--use_fast_math"]
 )
 
-# You must define a `ModelNew` class that wraps your kernel so the sandbox can benchmark it against the original PyTorch model.
 class ModelNew(torch.nn.Module):
     def __init__(self):
         super().__init__()
-    def forward(self, x):
-        return ext.run_cuda(x)
+    def forward(self, A, B):
+        return ext.run_cuda(A, B)
 ```
 
 # CUDA Optimization Playbook (A100 Architecture)
@@ -108,11 +134,11 @@ These are critical correctness errors that will cause "illegal memory access" CU
 
 - **Shared memory must be TILE-sized, NEVER matrix-sized**: Use fixed `__shared__ float tile[TILE_SIZE][TILE_SIZE]` arrays. NEVER use `extern __shared__` sized by M, K, or N — shared memory is limited to ~48KB per block, but `K*K*sizeof(float)` for a 4096x4096 matrix is 64MB.
 - **NEVER use two `extern __shared__` declarations**: Multiple `extern __shared__` arrays all alias to the same base address. Use fixed-size static arrays (e.g., `__shared__ float sA[TILE][TILE]; __shared__ float sB[TILE][TILE];`) instead.
-- **Max 1024 threads per block**: CUDA hard limit. For 2D blocks, `blockDim.x * blockDim.y <= 1024`. This means TILE_SIZE must be ≤ 32 for 2D blocks (32×32 = 1024). TILE_SIZE of 64 or 128 with `dim3(TILE_SIZE, TILE_SIZE)` will CRASH.
+- **Max 1024 threads per block**: CUDA hard limit. For 2D blocks, `blockDim.x * blockDim.y <= 1024`. This means TILE_SIZE must be <= 32 for 2D blocks (32x32 = 1024). TILE_SIZE of 64 or 128 with `dim3(TILE_SIZE, TILE_SIZE)` will CRASH.
 - **Index shared memory with threadIdx only**: Inside shared memory arrays, indices must be bounded by the tile/block dimensions (e.g., `tile[threadIdx.y][threadIdx.x]`). NEVER use full matrix dimensions like `row * K + col` to index into shared memory.
 - **Each thread must write to its own unique output element**: When writing to the output matrix C, the index MUST include both block-level AND thread-level offsets: `C[(blockIdx.y * TILE_SIZE + threadIdx.y) * N + (blockIdx.x * TILE_SIZE + threadIdx.x)]`. Omitting `threadIdx` causes all threads in a block to overwrite the same element.
 - **FP16 (`half`) requires intrinsics, not operators**: You CANNOT write `a * b` or `a + b` with `half` types. Use `__hmul(a, b)`, `__hadd(a, b)`, or `__hfma(a, b, acc)`. Standard C++ operators are NOT defined for CUDA `half`.
-- **Tiled matmul pattern**: Loop over tiles along the K dimension. Each iteration: load one TILE_SIZE×TILE_SIZE tile of A and B into shared memory, `__syncthreads()`, accumulate partial dot products, `__syncthreads()`, repeat.
+- **Tiled matmul pattern**: Loop over tiles along the K dimension. Each iteration: load one TILE_SIZE x TILE_SIZE tile of A and B into shared memory, `__syncthreads()`, accumulate partial dot products, `__syncthreads()`, repeat.
 """
 
 def get_system_prompt():
