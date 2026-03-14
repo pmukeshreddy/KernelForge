@@ -13,7 +13,7 @@ def test_system_prompt_loading():
     # Verify key constraints are present
     assert "NVIDIA A100 GPU" in prompt
     assert "<torch/extension.h>" in prompt
-    assert "class ModelNew" in prompt
+    assert "__global__" in prompt
     assert "bottleneck" in prompt.lower()
     
     print("✅ PASS | System Prompt Content Constraints Verified")

@@ -2,9 +2,9 @@
 agent.py - The Core ReAct Loop for KernelForge RL
 
 This module runs the autonomous optimization loop for a given PyTorch program.
-It prompts an LLM to generate an optimized CUDA kernel, evaluates it in the sandbox,
-runs the profiler if it passes, calculates the speedup reward, and feeds the 
-diagnostics back to the LLM for the next iterative improvement.
+It prompts an LLM to generate optimized CUDA C++ code, wraps it in a load_inline
+Python script, evaluates it in the sandbox, runs the profiler if it passes,
+calculates the speedup reward, and feeds diagnostics back to the LLM.
 """
 
 import sys
@@ -14,6 +14,72 @@ from sandbox import evaluate
 from profiler import profile_kernel
 from reward import calculate_reward
 from sys_prompt import get_system_prompt
+
+
+def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
+    """
+    Wrap raw CUDA C++ code in a full load_inline Python script.
+    
+    Parses the C++ to extract binding function signatures, and parses the
+    reference PyTorch code to get forward() arguments, then generates the
+    complete Python wrapper with ModelNew class.
+    """
+    # 1. Find all torch::Tensor binding function signatures (definitions, not declarations)
+    sig_pattern = r'(torch::Tensor\s+(\w+)\s*\([^)]*\))\s*\{'
+    sig_matches = re.findall(sig_pattern, cuda_code)
+    
+    if not sig_matches:
+        # Fallback: try to find any function returning torch::Tensor
+        sig_pattern_decl = r'(torch::Tensor\s+(\w+)\s*\([^)]*\))\s*;'
+        sig_matches = re.findall(sig_pattern_decl, cuda_code)
+    
+    if not sig_matches:
+        return None  # Can't parse - signal extraction failure
+    
+    # sig_matches is [(full_sig, func_name), ...]
+    func_signatures = [m[0] for m in sig_matches]
+    func_names = [m[1] for m in sig_matches]
+    
+    # Build cpp_source from signatures
+    cpp_source = "; ".join(func_signatures) + ";"
+    
+    # 2. Parse reference code's Model.forward() to get the argument names
+    fwd_match = re.search(r'def forward\(self,\s*(.*?)\)', ref_code)
+    fwd_args = fwd_match.group(1).strip() if fwd_match else "x"
+    # Clean type annotations if any (e.g., "x: torch.Tensor" -> "x")
+    fwd_args_clean = ", ".join(
+        arg.split(":")[0].strip() for arg in fwd_args.split(",")
+    )
+    
+    # Use the last binding function as the one to call from forward()
+    binding_func = func_names[-1]
+    
+    # 3. Build the full Python wrapper
+    wrapper = f'''import torch
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = """{cuda_code}"""
+
+cpp_source = "{cpp_source}"
+
+ext = load_inline(
+    name="custom_ext",
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    functions={func_names},
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"]
+)
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, {fwd_args_clean}):
+        return ext.{binding_func}({fwd_args_clean})
+'''
+    return wrapper
+
+
 class KernelForgeAgent:
     def __init__(self, model_name: str = "mukeshreddy/kernelforge-sft-qwen3-8b", mock_mode: bool = False):
         """Initialize the agent with a local HF model.
@@ -40,8 +106,8 @@ class KernelForgeAgent:
             add_generation_prompt=True
         )
         
-        # Pre-fill the assistant response so it is forced to write code immediately instead of <think>ing.
-        prefill = "```python\nimport torch\n"
+        # Pre-fill the assistant response to force C++ output (matches SFT training format)
+        prefill = "```cpp\n#include <torch/extension.h>\n"
         text += prefill
         
         inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
@@ -58,18 +124,24 @@ class KernelForgeAgent:
         generated_ids = outputs[0][len(inputs.input_ids[0]):]
         return self.tokenizer.decode(generated_ids, skip_special_tokens=True)
 
-    def extract_code_block(self, response: str) -> str:
-        """Extract the python code block from the LLM's response."""
-        match = re.search(r"```python(.*?)```", response, re.DOTALL)
-        if match:
-            return match.group(1).strip()
-            
-        # If no markdown tags are present, strip out <think> blocks before assuming the rest is code.
+    def extract_cuda_code(self, response: str) -> str:
+        """Extract the CUDA C++ code block from the LLM's response."""
+        # Try cpp, cuda, c++ block markers
+        for lang in ["cpp", "cuda", "c\\+\\+"]:
+            match = re.search(rf"```{lang}(.*?)```", response, re.DOTALL)
+            if match:
+                return match.group(1).strip()
+        
+        # If no markdown tags are present, strip out <think> blocks 
         clean_response = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL)
-        # Also clean up unclosed think blocks if the generation got cut off
         clean_response = re.sub(r"<think>.*", "", clean_response, flags=re.DOTALL)
         
-        return clean_response.strip()
+        # Check if remaining text looks like CUDA C++
+        stripped = clean_response.strip()
+        if any(kw in stripped for kw in ["__global__", "torch::Tensor", "#include"]):
+            return stripped
+            
+        return ""
 
     def run_react_loop(self, target_program: str, max_steps: int = 5) -> Tuple[str, float]:
         """
@@ -87,7 +159,7 @@ class KernelForgeAgent:
             {"role": "system", "content": self.system_prompt},
             {
                 "role": "user", 
-                "content": f"Please write a highly optimized custom CUDA kernel to replace this PyTorch reference implementation. Output the complete load_inline build script.\n\nReference Program:\n```python\n{target_program}\n```"
+                "content": f"Write an optimized CUDA C++ kernel to replace this PyTorch implementation. Output only the C++ code.\n\nReference Program:\n```python\n{target_program}\n```"
             }
         ]
 
@@ -100,20 +172,27 @@ class KernelForgeAgent:
             # 1. Generation
             print("🧠 Generating Kernel...")
             response = self.generate(messages)
-            # Save the raw generation to history so the model remembers its reasoning
-            # We must restore the prefill we forced it to start with
-            full_response = "```python\nimport torch\n" + response
+            # Restore the prefill we forced it to start with
+            full_response = "```cpp\n#include <torch/extension.h>\n" + response
             messages.append({"role": "assistant", "content": full_response})
             
-            # 2. Extract Code
-            candidate_code = self.extract_code_block(full_response)
+            # 2. Extract CUDA C++ Code
+            cuda_code = self.extract_cuda_code(full_response)
+            if not cuda_code:
+                print("❌ Failed to extract C++ code block. Requesting fix...")
+                print(f"--- FAILED GENERATED TEXT ---\n{response[:500]}\n-----------------------------")
+                messages.append({"role": "user", "content": "Error: Could not find ```cpp block in your response. Please output the CUDA C++ code properly in a ```cpp code block."})
+                continue
+            
+            # 3. Wrap in load_inline Python
+            candidate_code = build_load_inline_wrapper(cuda_code, target_program)
             if not candidate_code:
-                print("❌ Failed to extract python block. Requesting fix...")
-                print(f"--- FAILED GENERATED TEXT ---\n{response}\n-----------------------------")
-                messages.append({"role": "user", "content": "Error: Could not find ```python block in your response. Please output the code properly."})
+                print("❌ Could not parse binding function from C++ code.")
+                print(f"--- FAILED GENERATED CODE ---\n{cuda_code[:500]}\n-----------------------------")
+                messages.append({"role": "user", "content": "Error: Could not find a `torch::Tensor` binding function in your code. You must include a C++ function that returns `torch::Tensor` and calls your CUDA kernel."})
                 continue
                 
-            # 3. Sandbox Evaluation
+            # 4. Sandbox Evaluation
             print("🛠️  Compiling and Evaluating in Sandbox...")
             eval_result = evaluate(candidate_code, target_program)
             
@@ -121,17 +200,17 @@ class KernelForgeAgent:
                 # Compilation failed or output was wrong
                 error_msg = eval_result.get("compiler_error") or "Outputs do not match the reference implementation exactly (Correctness Failed)."
                 print(f"❌ Evaluation Failed: {error_msg.strip()[:100]}...\n")
-                print(f"--- FAILED GENERATED CODE ---\n{candidate_code}\n-----------------------------")
+                print(f"--- FAILED GENERATED CODE ---\n{cuda_code}\n-----------------------------")
                 
-                # Feed error back to LLM
-                feedback = f"Your code failed during evaluation.\n\nError Log:\n```\n{error_msg}\n```\n\nAnalyze the root cause carefully. If this is a CUDA runtime error (illegal memory access), check your shared memory sizing, indexing bounds, and output write offsets. Fix the bug and output the corrected code."
+                # Feed error back to LLM (show the C++ error, not Python wrapper errors)
+                feedback = f"Your CUDA C++ code failed during compilation or evaluation.\n\nError Log:\n```\n{error_msg}\n```\n\nAnalyze the root cause carefully. If this is a CUDA runtime error (illegal memory access), check your shared memory sizing, indexing bounds, and output write offsets. Remember: use float* and data_ptr<float>() for float32 tensors. Fix the bug and output the corrected C++ code."
                 messages.append({"role": "user", "content": feedback})
                 continue
                 
             runtime_ms = eval_result["runtime_ms"]
             print(f"✅ Sandbox Passed! Latency: {runtime_ms:.3f} ms")
             
-            # 4. Profiling and Reward
+            # 5. Profiling and Reward
             print("🔬 Profiling Hardware Metrics...")
             profiler_feedback = profile_kernel(candidate_code, target_program)
             
@@ -143,10 +222,10 @@ class KernelForgeAgent:
                 best_reward = reward
                 best_code = candidate_code
                 
-            # 5. Iteration Feedback
+            # 6. Iteration Feedback
             if step < max_steps:
                 print("🔄 Sending profiler feedback back to LLM for next iteration...")
-                feedback = f"Success! Your kernel ran in {runtime_ms:.3f} ms, achieving a {reward:.2f}x speedup over the baseline.\n\nHere is the hardware profiling report:\n{profiler_feedback}\n\nCan you apply the SKILL.md playbook strategies to optimize this bottleneck further?"
+                feedback = f"Success! Your kernel ran in {runtime_ms:.3f} ms, achieving a {reward:.2f}x speedup over the baseline.\n\nHere is the hardware profiling report:\n{profiler_feedback}\n\nCan you optimize the C++ kernel further to resolve the bottleneck? Output the improved ```cpp code."
                 messages.append({"role": "user", "content": feedback})
 
         print(f"\n🏁 Optimization Completed. Best Reward: {best_reward:.2f}x")
