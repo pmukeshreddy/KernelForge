@@ -29,6 +29,7 @@ You are participating in an iterative Reinforcement Learning loop:
 7. This loop continues until you achieve maximum speedup or run out of attempts.
 
 # Output Format
+CRITICAL: You must keep your reasoning extremely concise. DO NOT write long mathematical derivations or endless <think> blocks. Output the code immediately.
 You must output EXACTLY ONE Python code block containing the full, executable `load_inline` script.
 Do not output markdown outside the code block.
 
