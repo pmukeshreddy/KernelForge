@@ -117,7 +117,16 @@ __global__ void occ_kernel(float* out, const float* in, int n) {
     }
     __syncthreads();
     
-    if (idx < n) out[idx] = in[idx] + hog[0];
+    if (idx < n) {
+        float val = in[idx] + hog[0];
+        // artificial compute to sustain the kernel lifetime 
+        // so NCU registers the terrible occupancy accurately
+        #pragma unroll
+        for(int i=0; i<500; ++i) {
+            val = sinf(val) * cosf(val);
+        }
+        out[idx] = val;
+    }
 }
 
 torch::Tensor run_cuda(torch::Tensor in) {
