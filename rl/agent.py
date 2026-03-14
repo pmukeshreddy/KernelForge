@@ -42,10 +42,9 @@ class KernelForgeAgent:
         )
         inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
         
-        # We need a decently large token limit since it generates full C++ kernels
         outputs = self.model.generate(
             **inputs,
-            max_new_tokens=2048,
+            max_new_tokens=4096,
             temperature=0.7,   # Slight creativity for exploration
             do_sample=True,
             pad_token_id=self.tokenizer.eos_token_id
@@ -60,8 +59,13 @@ class KernelForgeAgent:
         match = re.search(r"```python(.*?)```", response, re.DOTALL)
         if match:
             return match.group(1).strip()
-        # Fallback: if no tags, assume the whole response is code.
-        return response.strip()
+            
+        # If no markdown tags are present, strip out <think> blocks before assuming the rest is code.
+        clean_response = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL)
+        # Also clean up unclosed think blocks if the generation got cut off
+        clean_response = re.sub(r"<think>.*", "", clean_response, flags=re.DOTALL)
+        
+        return clean_response.strip()
 
     def run_react_loop(self, target_program: str, max_steps: int = 5) -> Tuple[str, float]:
         """
