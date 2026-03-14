@@ -162,6 +162,8 @@ def _generate_feedback(metrics: Dict[str, float]) -> str:
     """Turn raw metrics into an actionable RL prompt."""
     compute = metrics.get("compute", 0.0)
     memory = metrics.get("memory", 0.0)
+    occupancy = metrics.get("occupancy", 0.0)
+    
     # Determine bottleneck
     if occupancy < 40.0:
         bottleneck = "Warning: Occupancy is very low (LATENCY-BOUND). The SMs are largely idle."
