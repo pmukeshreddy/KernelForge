@@ -161,7 +161,7 @@ try:
         save(R); sys.exit(0)
         
 except Exception as e:
-    R["compiler_error"] = f"Runtime: {{traceback.format_exc()[-300:]}}"
+    R["compiler_error"] = f"Runtime: {{traceback.format_exc()[-1500:]}}"
     save(R); sys.exit(0)
 
 # Timing (only if correct)

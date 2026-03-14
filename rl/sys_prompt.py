@@ -102,6 +102,14 @@ If Warp Occupancy is low (< 40%), the SM doesn't have enough active warps to hid
 - **Shared Memory Limits**: The A100 has 164KB of shared memory per SM. If your block uses 48KB, only 3 blocks can fit (144KB). Reduce shared memory size, or increase the work done per block.
 - **Block Sizing**: Always use block sizes that are multiples of 32 (preferably 128, 256, or 512). Very small blocks (e.g., 32 threads) waste SM resources due to block allocation overhead.
 - **Excessive Synchronization**: Avoid `__syncthreads()` inside heavy loops unless absolutely necessary for data correctness.
+
+## 4. Common CUDA Bugs (MUST AVOID)
+These are critical correctness errors that will cause "illegal memory access" CUDA runtime crashes:
+
+- **Shared memory must be TILE-sized, NEVER matrix-sized**: Use fixed `__shared__ float tile[TILE_SIZE][TILE_SIZE]` arrays. NEVER use `extern __shared__` sized by M, K, or N — shared memory is limited to ~48KB per block, but `K*K*sizeof(float)` for a 4096x4096 matrix is 64MB.
+- **Index shared memory with threadIdx only**: Inside shared memory arrays, indices must be bounded by the tile/block dimensions (e.g., `tile[threadIdx.y][threadIdx.x]`). NEVER use full matrix dimensions like `row * K + col` to index into shared memory.
+- **Each thread must write to its own unique output element**: When writing to the output matrix C, the index MUST include both block-level AND thread-level offsets: `C[(blockIdx.y * TILE_SIZE + threadIdx.y) * N + (blockIdx.x * TILE_SIZE + threadIdx.x)]`. Omitting `threadIdx` causes all threads in a block to overwrite the same element.
+- **Tiled matmul pattern**: Loop over tiles along the K dimension. Each iteration: load one TILE_SIZE×TILE_SIZE tile of A and B into shared memory, `__syncthreads()`, accumulate partial dot products, `__syncthreads()`, repeat.
 """
 
 def get_system_prompt():

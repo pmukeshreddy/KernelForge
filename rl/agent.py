@@ -124,7 +124,7 @@ class KernelForgeAgent:
                 print(f"--- FAILED GENERATED CODE ---\n{candidate_code}\n-----------------------------")
                 
                 # Feed error back to LLM
-                feedback = f"Your code failed during evaluation.\n\nError Log:\n```\n{error_msg}\n```\n\nPlease fix the logical or syntax errors."
+                feedback = f"Your code failed during evaluation.\n\nError Log:\n```\n{error_msg}\n```\n\nAnalyze the root cause carefully. If this is a CUDA runtime error (illegal memory access), check your shared memory sizing, indexing bounds, and output write offsets. Fix the bug and output the corrected code."
                 messages.append({"role": "user", "content": feedback})
                 continue
                 
