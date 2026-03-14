@@ -162,10 +162,11 @@ def _generate_feedback(metrics: Dict[str, float]) -> str:
     """Turn raw metrics into an actionable RL prompt."""
     compute = metrics.get("compute", 0.0)
     memory = metrics.get("memory", 0.0)
-    occupancy = metrics.get("occupancy", 0.0)
-    
     # Determine bottleneck
-    if memory > compute * 2.0 or memory > 70.0:
+    if occupancy < 40.0:
+        bottleneck = "Warning: Occupancy is very low (LATENCY-BOUND). The SMs are largely idle."
+        advice = "The kernel is stalled or not mapping enough parallel work. Increase block size, reduce registers/thread, or reduce shared memory usage to map more Warps per SM."
+    elif memory > compute * 2.0 or memory > 70.0:
         bottleneck = "MEMORY-BOUND"
         advice = "Try coalesced global memory accesses, vectorization (float4), or utilizing shared memory caching to reduce global memory traffic."
     elif compute > memory * 2.0 or compute > 70.0:
@@ -175,8 +176,8 @@ def _generate_feedback(metrics: Dict[str, float]) -> str:
         bottleneck = "BALANCED (PIPELINE-BOUND)"
         advice = "Both memory and compute are moderately utilized. Focus on instruction-level parallelism (ILP) and hiding latency through higher occupancy."
     else:
-        bottleneck = "LATENCY-BOUND (POOR OCCUPANCY/SYNCHRONIZATION)"
-        advice = "The kernel is stalled. Increase occupancy, remove excessive __syncthreads(), or redesign to map more parallel work per block."
+        bottleneck = "LATENCY-BOUND (SYNCHRONIZATION/MEMORY LATENCY)"
+        advice = "Neither memory bandwidth nor compute units are saturated. You are likely stalled on excessive __syncthreads(), bad memory access patterns causing cache misses, or loop dependencies."
 
     # Format actionable feedback
     feedback = f"--- Profiler Analysis ---\n"
