@@ -109,16 +109,18 @@ cuda_source = \"\"\"
 
 __global__ void occ_kernel(float* out, const float* in, int n) {
     // Hog 48KB of shared memory to kill occupancy
-    __shared__ float hog[12288]; 
+    __shared__ float hog[12000]; 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     
-    if (threadIdx.x == 0) {
-        hog[0] = in[0];
+    // NVCC is very smart. We HAVE to use every element so it doesn't optimize it away!
+    for (int i = threadIdx.x; i < 12000; i += blockDim.x) {
+        hog[i] = in[0];
     }
     __syncthreads();
     
     if (idx < n) {
-        float val = in[idx] + hog[0];
+        // Dynamic read so compiler can't strip the array
+        float val = in[idx] + hog[idx % 12000];
         // artificial compute to sustain the kernel lifetime 
         // so NCU registers the terrible occupancy accurately
         #pragma unroll
