@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import shutil
 import json
+from .antihack import check_security
 
 
 def evaluate(kernel_code: str, reference_code: str, timeout: int = 300,
@@ -21,6 +22,18 @@ def evaluate(kernel_code: str, reference_code: str, timeout: int = 300,
     Returns dict with: compiles, compiler_error, correct, outputs_match,
     runtime_ms, baseline_runtime_ms
     """
+    # 1. Static Security Analysis
+    is_safe, sec_err = check_security(kernel_code)
+    if not is_safe:
+        return {
+            "compiles": False,
+            "compiler_error": sec_err,
+            "correct": False,
+            "outputs_match": [],
+            "runtime_ms": None,
+            "baseline_runtime_ms": None,
+        }
+
     result = {
         "compiles": False,
         "compiler_error": None,
@@ -112,11 +125,15 @@ except Exception as e:
 
 save(R)  # Save early so timeout knows compilation passed
 
-# Correctness
+import threading
 try:
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ref_model = Model(*get_init_inputs()).to(dev).eval()
     new_model = ModelNew(*get_init_inputs()).to(dev).eval()
+    
+    # 2. Dynamic Security Check (Thread Count)
+    # Exclude the main thread and any Pytorch internal daemon threads gracefully
+    base_threads = threading.active_count()
 
     matches = []
     for i in range({n_correctness}):
@@ -130,6 +147,13 @@ try:
 
     R["outputs_match"] = matches
     R["correct"] = all(matches)
+    
+    # Verify no hidden threads spawned during evaluation
+    if threading.active_count() > base_threads:
+        R["correct"] = False
+        R["compiler_error"] = f"SECURITY VIOLATION: Unauthorized threads spawned ({{threading.active_count()}} active)"
+        save(R); sys.exit(0)
+        
 except Exception as e:
     R["compiler_error"] = f"Runtime: {{traceback.format_exc()[-300:]}}"
     save(R); sys.exit(0)
