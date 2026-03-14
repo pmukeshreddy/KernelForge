@@ -65,15 +65,18 @@ def profile_kernel(kernel_code: str, reference_code: str, timeout: int = 120) ->
         ]
 
         # Use Popen to allow process group kill if nvcc/ncu hangs
-        proc = subprocess.Popen(
-            ncu_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=tmpdir,
-            env=env,
-            preexec_fn=os.setsid, 
-        )
+        try:
+            proc = subprocess.Popen(
+                ncu_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=tmpdir,
+                env=env,
+                preexec_fn=os.setsid, 
+            )
+        except FileNotFoundError:
+            return "Profiler Skipped: 'ncu' command not found. Install Nsight Compute for hardware profiling."
         
         stdout, stderr = "", ""
         try:
