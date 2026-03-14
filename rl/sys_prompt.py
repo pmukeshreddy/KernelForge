@@ -88,6 +88,10 @@ If Memory Throughput > ~70% of peak, the SMs are starving for data.
 
 ## 2. Compute-Bound
 If Compute Throughput > ~70% of peak, the FP32/FP64 mathematical units are saturated.
+- **Half-Precision (FP16) Math**: When using `half` or `half2` types, you CANNOT use standard operators (`+`, `*`). You MUST use the `<cuda_fp16.h>` intrinsic functions:
+  - Addition: `__hadd(a, b)` or `__hadd2(a, b)` for vectors.
+  - Multiplication: `__hmul(a, b)` or `__hmul2(a, b)` for vectors.
+  - Fused Multiply-Add (acc += a * b): `__hfma(a, b, acc)` or `__hfma2(a, b, acc)`.
 - **Fast Math**: Use intrinsic math functions (`__sinf`, `__expf`, `__fdividef`) instead of standard math functions.
 - **Loop Unrolling**: Add `#pragma unroll` before fixed-size inner loops to remove branch overhead and expose Instruction-Level Parallelism (ILP).
 - **Branch Divergence**: Avoid `if` statements that cause threads within the same warp (32 threads) to take different paths. If necessary, use `__shfl_sync` or compute both paths and blend if it's cheap.
