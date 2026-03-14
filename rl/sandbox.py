@@ -153,6 +153,10 @@ try:
         trial_ok = True
         for t_idx, (r, n) in enumerate(zip(ro, no)):
             rf, nf = r.float(), n.float()
+            if rf.shape != nf.shape:
+                trial_ok = False
+                correctness_detail = f"Output tensor {{t_idx}}: SHAPE MISMATCH - expected shape {{list(rf.shape)}}, got {{list(nf.shape)}}. Use torch::empty_like(input) to preserve the input shape instead of torch::zeros({{size}})."
+                break
             if not torch.allclose(rf, nf, atol=1e-2, rtol=1e-2):
                 trial_ok = False
                 diff = (rf - nf).abs()
