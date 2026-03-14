@@ -236,7 +236,7 @@ def run_tests():
         print(f"Running: {name}")
         print(f"{'='*60}")
         
-        timeout = 10 if "Infinite" in name else 30
+        timeout = 15 if "Infinite" in name else 120
         result = evaluate(kernel, REFERENCE, timeout=timeout, n_correctness=5, n_warmup=3, n_timed=10)
         
         print(json.dumps(result, indent=2))

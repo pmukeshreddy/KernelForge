@@ -16,7 +16,7 @@ import time
 import signal
 
 
-def evaluate(kernel_code: str, reference_code: str, timeout: int = 30,
+def evaluate(kernel_code: str, reference_code: str, timeout: int = 120,
              n_correctness: int = 5, n_warmup: int = 10, n_timed: int = 100) -> dict:
     """
     Evaluate a generated CUDA kernel against a reference PyTorch model.
@@ -90,7 +90,14 @@ def evaluate(kernel_code: str, reference_code: str, timeout: int = 30,
                 result["compiler_error"] = f"Process exited with code {proc.returncode}"
     
     except subprocess.TimeoutExpired:
-        result["compiles"] = True  # If it timed out, it got past compilation
+        # Check if result.json was partially written (compilation succeeded)
+        if os.path.exists(result_path):
+            try:
+                with open(result_path) as f:
+                    sub_result = json.load(f)
+                result.update(sub_result)
+            except:
+                pass
         result["correct"] = False
         result["compiler_error"] = f"Execution timed out after {timeout}s"
     except Exception as e:
