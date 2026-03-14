@@ -40,6 +40,10 @@ class KernelForgeAgent:
             tokenize=False,
             add_generation_prompt=True
         )
+        # Pre-fill the assistant response so it is forced to write code immediately instead of <think>ing.
+        prefill = "```python\nimport torch\n"
+        text += prefill
+        
         inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
         
         outputs = self.model.generate(
@@ -96,12 +100,13 @@ class KernelForgeAgent:
             # 1. Generation
             print("🧠 Generating Kernel...")
             response = self.generate(messages)
-            
             # Save the raw generation to history so the model remembers its reasoning
-            messages.append({"role": "assistant", "content": response})
+            # We must restore the prefill we forced it to start with
+            full_response = "```python\nimport torch\n" + response
+            messages.append({"role": "assistant", "content": full_response})
             
             # 2. Extract Code
-            candidate_code = self.extract_code_block(response)
+            candidate_code = self.extract_code_block(full_response)
             if not candidate_code:
                 print("❌ Failed to extract python block. Requesting fix...")
                 print(f"--- FAILED GENERATED TEXT ---\n{response}\n-----------------------------")
