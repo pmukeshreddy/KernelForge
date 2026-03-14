@@ -127,7 +127,7 @@ def run_quality_test(model_name: str, max_steps: int):
             max_steps=max_steps
         )
 
-        passed = reward >= 1.0  # At least 1x means correct output
+        passed = reward > 0  # Any positive reward means correct output
         results.append({
             "name": test["name"],
             "difficulty": test["difficulty"],

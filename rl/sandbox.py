@@ -142,6 +142,7 @@ try:
     base_threads = threading.active_count()
 
     matches = []
+    correctness_detail = ""
     for i in range({n_correctness}):
         torch.manual_seed(42 + i)
         inputs = [x.to(dev) if isinstance(x, torch.Tensor) else x for x in get_inputs()]
@@ -149,10 +150,34 @@ try:
             ro, no = ref_model(*inputs), new_model(*inputs)
         if isinstance(ro, torch.Tensor): ro = (ro,)
         if isinstance(no, torch.Tensor): no = (no,)
-        matches.append(all(torch.allclose(r.float(), n.float(), atol=1e-2, rtol=1e-2) for r, n in zip(ro, no)))
+        trial_ok = True
+        for t_idx, (r, n) in enumerate(zip(ro, no)):
+            rf, nf = r.float(), n.float()
+            if not torch.allclose(rf, nf, atol=1e-2, rtol=1e-2):
+                trial_ok = False
+                diff = (rf - nf).abs()
+                max_err = diff.max().item()
+                max_pos = diff.argmax().item()
+                # Convert flat index to multi-dim for readability
+                shape = rf.shape
+                coords = []
+                flat = max_pos
+                for dim_size in reversed(shape):
+                    coords.append(flat % dim_size)
+                    flat //= dim_size
+                coords = list(reversed(coords))
+                exp_val = rf.flatten()[max_pos].item()
+                got_val = nf.flatten()[max_pos].item()
+                correctness_detail = f"Output tensor {{t_idx}}: max_abs_error={{max_err:.6f}} at position {{coords}}, expected={{exp_val:.6f}}, got={{got_val:.6f}}, shape={{list(shape)}}"
+                break
+        matches.append(trial_ok)
+        if not trial_ok:
+            break
 
     R["outputs_match"] = matches
     R["correct"] = all(matches)
+    if not R["correct"] and correctness_detail:
+        R["compiler_error"] = f"Correctness Failed: {{correctness_detail}}"
     
     # Verify no hidden threads spawned during evaluation
     if threading.active_count() > base_threads:

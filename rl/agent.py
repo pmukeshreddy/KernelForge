@@ -169,6 +169,21 @@ class KernelForgeAgent:
         for step in range(1, max_steps + 1):
             print(f"\n--- Step {step}/{max_steps} ---")
             
+            # Debug: print full message history at step 3 to verify model sees errors
+            if step == 3:
+                print("\n" + "="*60)
+                print("🔍 DEBUG: Full Message History at Step 3")
+                print("="*60)
+                for i, msg in enumerate(messages):
+                    role = msg["role"].upper()
+                    content = msg["content"]
+                    # Truncate long content but show enough to verify
+                    if len(content) > 300:
+                        content = content[:300] + f"\n... [{len(content)} chars total]"
+                    print(f"\n[MSG {i}] {role}:")
+                    print(content)
+                print("="*60 + "\n")
+            
             # 1. Generation
             print("🧠 Generating Kernel...")
             response = self.generate(messages)
