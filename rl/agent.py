@@ -14,6 +14,7 @@ from sandbox import evaluate
 from profiler import profile_kernel
 from reward import calculate_reward
 from sys_prompt import get_system_prompt
+from transformers import LogitsProcessorList, SuppressTokensLogitsProcessor
 
 class KernelForgeAgent:
     def __init__(self, model_name: str = "mukeshreddy/kernelforge-sft-qwen3-8b", mock_mode: bool = False):
@@ -40,18 +41,23 @@ class KernelForgeAgent:
             tokenize=False,
             add_generation_prompt=True
         )
-        # Pre-fill the assistant response so it is forced to write code immediately instead of <think>ing.
-        prefill = "```python\nimport torch\n"
-        text += prefill
         
         inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
+        
+        # Robustly prevent the model from entering "Reasoning" mode by explicitly
+        # banning the <think> token at the CUDA logit level.
+        think_token_id = self.tokenizer.encode("<think>", add_special_tokens=False)
+        logits_processor = LogitsProcessorList([
+            SuppressTokensLogitsProcessor(think_token_id)
+        ])
         
         outputs = self.model.generate(
             **inputs,
             max_new_tokens=4096,
             temperature=0.7,   # Slight creativity for exploration
             do_sample=True,
-            pad_token_id=self.tokenizer.eos_token_id
+            pad_token_id=self.tokenizer.eos_token_id,
+            logits_processor=logits_processor
         )
         
         # Extract only the newly generated text
@@ -101,12 +107,10 @@ class KernelForgeAgent:
             print("🧠 Generating Kernel...")
             response = self.generate(messages)
             # Save the raw generation to history so the model remembers its reasoning
-            # We must restore the prefill we forced it to start with
-            full_response = "```python\nimport torch\n" + response
-            messages.append({"role": "assistant", "content": full_response})
+            messages.append({"role": "assistant", "content": response})
             
             # 2. Extract Code
-            candidate_code = self.extract_code_block(full_response)
+            candidate_code = self.extract_code_block(response)
             if not candidate_code:
                 print("❌ Failed to extract python block. Requesting fix...")
                 print(f"--- FAILED GENERATED TEXT ---\n{response}\n-----------------------------")
