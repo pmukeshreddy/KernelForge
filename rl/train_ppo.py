@@ -18,7 +18,7 @@ from agent import KernelForgeAgent
 
 @dataclass
 class KernelForgeConfig:
-    model_id: str = "Qwen/Qwen2.5-Coder-3B-Instruct"
+    model_id: str = "mukeshreddy/kernelforge-sft-qwen3-8b"
     rft_dataset_path: str = "data/rft_dataset.json" # Baseline prompts
     output_dir: str = "checkpoints/kernelforge_ppo"
     batch_size: int = 4

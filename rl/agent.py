@@ -16,7 +16,7 @@ from reward import calculate_reward
 from sys_prompt import get_system_prompt
 
 class KernelForgeAgent:
-    def __init__(self, model_name: str = "Qwen/Qwen2.5-Coder-3B-Instruct", mock_mode: bool = False):
+    def __init__(self, model_name: str = "mukeshreddy/kernelforge-sft-qwen3-8b", mock_mode: bool = False):
         """Initialize the agent with a local HF model.
         If mock_mode is True, bypasses loading the literal HuggingFace model.
         """
