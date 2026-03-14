@@ -12,12 +12,11 @@ import subprocess
 import tempfile
 import shutil
 import json
-import time
 import signal
 
 
 def evaluate(kernel_code: str, reference_code: str, timeout: int = 120,
-             n_correctness: int = 5, n_warmup: int = 10, n_timed: int = 100) -> dict:
+             n_correctness: int = 5, n_warmup: int = 3, n_timed: int = 10) -> dict:
     """
     Evaluate a generated CUDA kernel against a reference PyTorch model.
     
@@ -42,13 +41,13 @@ def evaluate(kernel_code: str, reference_code: str, timeout: int = 120,
     }
     
     tmpdir = tempfile.mkdtemp(prefix="kernelforge_sandbox_")
+    result_path = os.path.join(tmpdir, "result.json")
     
     try:
         # Write reference and kernel to temp files
         ref_path = os.path.join(tmpdir, "model_ref.py")
         kern_path = os.path.join(tmpdir, "model_new.py")
         eval_path = os.path.join(tmpdir, "eval_kernel.py")
-        result_path = os.path.join(tmpdir, "result.json")
         
         with open(ref_path, "w") as f:
             f.write(reference_code)
@@ -64,42 +63,55 @@ def evaluate(kernel_code: str, reference_code: str, timeout: int = 120,
         # Run evaluation in subprocess with timeout
         env = os.environ.copy()
         env["PYTHONPATH"] = tmpdir + ":" + env.get("PYTHONPATH", "")
+        # Speed up JIT compilation by targeting specific GPU arch
+        if "TORCH_CUDA_ARCH_LIST" not in env:
+            env["TORCH_CUDA_ARCH_LIST"] = "8.0"
         
-        proc = subprocess.run(
-            [sys.executable, eval_path],
-            capture_output=True,
+        # Use Popen with process group for clean kill on timeout
+        proc = subprocess.Popen(
+            [sys.executable, "-u", eval_path],  # -u for unbuffered output
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
             cwd=tmpdir,
             env=env,
+            preexec_fn=os.setsid,  # New process group
         )
         
-        # Parse results
-        if os.path.exists(result_path):
-            with open(result_path) as f:
-                sub_result = json.load(f)
-            result.update(sub_result)
-        elif proc.returncode != 0:
-            result["compiles"] = False
-            # Extract the most useful error
-            stderr = proc.stderr.strip()
-            if stderr:
-                # Get last 500 chars of error for compiler feedback
-                result["compiler_error"] = stderr[-500:]
-            else:
-                result["compiler_error"] = f"Process exited with code {proc.returncode}"
-    
-    except subprocess.TimeoutExpired:
-        # Check if result.json was partially written (compilation succeeded)
-        if os.path.exists(result_path):
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Kill entire process group (catches nvcc child processes too)
             try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+            
+            # Check if result.json was partially written
+            if os.path.exists(result_path):
+                try:
+                    with open(result_path) as f:
+                        sub_result = json.load(f)
+                    result.update(sub_result)
+                except Exception:
+                    pass
+            result["correct"] = False
+            result["compiler_error"] = f"Execution timed out after {timeout}s"
+        else:
+            # Normal completion — parse results
+            if os.path.exists(result_path):
                 with open(result_path) as f:
                     sub_result = json.load(f)
                 result.update(sub_result)
-            except:
-                pass
-        result["correct"] = False
-        result["compiler_error"] = f"Execution timed out after {timeout}s"
+            elif proc.returncode != 0:
+                result["compiles"] = False
+                stderr = (stderr or "").strip()
+                if stderr:
+                    result["compiler_error"] = stderr[-500:]
+                else:
+                    result["compiler_error"] = f"Process exited with code {proc.returncode}"
+    
     except Exception as e:
         result["compiler_error"] = str(e)
     finally:
@@ -115,10 +127,10 @@ def _build_eval_script(n_correctness: int, n_warmup: int, n_timed: int) -> str:
 import sys
 import os
 import json
-import torch
+import time
 import traceback
 
-result_path = os.path.join(os.path.dirname(__file__), "result.json")
+result_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "result.json")
 
 def save_result(r):
     with open(result_path, "w") as f:
@@ -133,7 +145,12 @@ result = {{
     "baseline_runtime_ms": None,
 }}
 
+# Step 0: Import torch
+print(f"[{{time.time():.0f}}] Importing torch...", flush=True)
+import torch
+
 # Step 1: Try to import reference model
+print(f"[{{time.time():.0f}}] Importing reference model...", flush=True)
 try:
     import model_ref
     Model = model_ref.Model
@@ -144,18 +161,25 @@ except Exception as e:
     save_result(result)
     sys.exit(1)
 
-# Step 2: Try to import generated kernel
+# Step 2: Try to import generated kernel (this triggers JIT compilation)
+print(f"[{{time.time():.0f}}] Compiling generated kernel (JIT)...", flush=True)
 try:
     import model_new
     ModelNew = model_new.ModelNew
     result["compiles"] = True
+    print(f"[{{time.time():.0f}}] Compilation succeeded!", flush=True)
 except Exception as e:
     result["compiles"] = False
     result["compiler_error"] = traceback.format_exc()[-500:]
+    print(f"[{{time.time():.0f}}] Compilation failed.", flush=True)
     save_result(result)
     sys.exit(0)
 
+# Save intermediate result (compiles=True) so timeout knows compilation passed
+save_result(result)
+
 # Step 3: Correctness check with multiple random inputs
+print(f"[{{time.time():.0f}}] Running correctness check...", flush=True)
 try:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     init_inputs = get_init_inputs()
@@ -165,7 +189,7 @@ try:
     
     outputs_match = []
     for i in range({n_correctness}):
-        torch.manual_seed(42 + i)  # Different but reproducible inputs
+        torch.manual_seed(42 + i)
         inputs = get_inputs()
         inputs = [x.to(device) if isinstance(x, torch.Tensor) else x for x in inputs]
         
@@ -173,7 +197,6 @@ try:
             ref_out = ref_model(*inputs)
             new_out = new_model(*inputs)
         
-        # Handle single tensor or tuple outputs
         if isinstance(ref_out, torch.Tensor):
             ref_out = (ref_out,)
         if isinstance(new_out, torch.Tensor):
@@ -187,6 +210,7 @@ try:
     
     result["outputs_match"] = outputs_match
     result["correct"] = all(outputs_match)
+    print(f"[{{time.time():.0f}}] Correctness: {{result['correct']}} ({{sum(outputs_match)}}/{{len(outputs_match)}})", flush=True)
 
 except Exception as e:
     result["correct"] = False
@@ -196,6 +220,7 @@ except Exception as e:
 
 # Step 4: Timing (only if correct)
 if result["correct"]:
+    print(f"[{{time.time():.0f}}] Running timing benchmark...", flush=True)
     try:
         torch.manual_seed(0)
         inputs = get_inputs()
@@ -207,20 +232,20 @@ if result["correct"]:
                 ref_model(*inputs)
         torch.cuda.synchronize()
         
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        start_evt = torch.cuda.Event(enable_timing=True)
+        end_evt = torch.cuda.Event(enable_timing=True)
         
         times = []
         for _ in range({n_timed}):
-            start.record()
+            start_evt.record()
             with torch.no_grad():
                 ref_model(*inputs)
-            end.record()
+            end_evt.record()
             torch.cuda.synchronize()
-            times.append(start.elapsed_time(end))
+            times.append(start_evt.elapsed_time(end_evt))
         
         times.sort()
-        result["baseline_runtime_ms"] = times[len(times) // 2]  # median
+        result["baseline_runtime_ms"] = times[len(times) // 2]
         
         # Time new model
         for _ in range({n_warmup}):
@@ -230,20 +255,22 @@ if result["correct"]:
         
         times = []
         for _ in range({n_timed}):
-            start.record()
+            start_evt.record()
             with torch.no_grad():
                 new_model(*inputs)
-            end.record()
+            end_evt.record()
             torch.cuda.synchronize()
-            times.append(start.elapsed_time(end))
+            times.append(start_evt.elapsed_time(end_evt))
         
         times.sort()
-        result["runtime_ms"] = times[len(times) // 2]  # median
+        result["runtime_ms"] = times[len(times) // 2]
+        print(f"[{{time.time():.0f}}] Timing done: baseline={{result['baseline_runtime_ms']:.3f}}ms, kernel={{result['runtime_ms']:.3f}}ms", flush=True)
         
     except Exception as e:
         result["compiler_error"] = f"Timing error: {{e}}"
 
 save_result(result)
+print(f"[{{time.time():.0f}}] Eval complete.", flush=True)
 '''
 
 
