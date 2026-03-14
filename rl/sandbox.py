@@ -120,7 +120,13 @@ try:
     ModelNew = model_new.ModelNew
     R["compiles"] = True
 except Exception as e:
-    R["compiler_error"] = traceback.format_exc()[-500:]
+    # PyTorch RuntimeError contains the C++ compiler log in the string representation.
+    # We take the last 2000 characters to ensure we capture the actual semantic C++ errors 
+    # instead of just "ninja: build stopped"
+    err_str = str(e)
+    if len(err_str) > 2000:
+        err_str = "..." + err_str[-2000:]
+    R["compiler_error"] = err_str
     save(R); sys.exit(0)
 
 save(R)  # Save early so timeout knows compilation passed
