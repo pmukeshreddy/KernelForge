@@ -43,14 +43,20 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
     # Build cpp_source from signatures
     cpp_source = "; ".join(func_signatures) + ";"
     
-    # 2. Parse reference code's Model.forward() to get the argument names
+    # 2. Parse reference code's Model.forward() and __init__() arg names
     fwd_match = re.search(r'def forward\(self,\s*(.*?)\)', ref_code)
     fwd_args = fwd_match.group(1).strip() if fwd_match else "x"
-    # Clean type annotations if any (e.g., "x: torch.Tensor" -> "x")
     fwd_args_clean = ", ".join(
         arg.split(":")[0].strip() for arg in fwd_args.split(",")
     )
-    
+
+    # Mirror Model.__init__ args so get_init_inputs() can construct ModelNew
+    init_match = re.search(r'def __init__\(self,\s*(.*?)\)', ref_code, re.DOTALL)
+    raw_init = init_match.group(1).strip() if (init_match and init_match.group(1).strip()) else ""
+    init_args_clean = ", ".join(
+        arg.split(":")[0].strip() for arg in raw_init.split(",") if arg.strip()
+    ) if raw_init else ""
+
     # Use the last binding function as the one to call from forward()
     binding_func = func_names[-1]
     
@@ -84,7 +90,7 @@ ext = load_inline(
 )
 
 class ModelNew(torch.nn.Module):
-    def __init__(self):
+    def __init__(self{", " + init_args_clean if init_args_clean else ""}):
         super().__init__()
     def forward(self, {fwd_args_clean}):
         return ext.{binding_func}({fwd_args_clean})
