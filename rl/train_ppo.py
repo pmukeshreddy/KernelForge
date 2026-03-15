@@ -309,6 +309,7 @@ def train(config: KernelForgeConfig = None):
         raw_dataset = load_dataset("json", data_files=config.rft_dataset_path, split="train")
         # Keep only entries that have a pytorch_code prompt
         raw_dataset = raw_dataset.filter(lambda x: bool(x.get("pytorch_code", "").strip()))
+        raw_dataset = raw_dataset.rename_column("pytorch_code", "prompt")
     except Exception as e:
         print(f"Failed to load dataset.\n{e}")
         return
