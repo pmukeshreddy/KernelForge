@@ -32,7 +32,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 from trl.experimental.ppo import AutoModelForCausalLMWithValueHead
 
 from agent import build_load_inline_wrapper
@@ -297,18 +297,25 @@ def _get_log_probs_values_entropy(
 
 @torch.no_grad()
 def _get_ref_log_probs(
-    ref_model,
+    model,
     context_ids: torch.Tensor,
     response_ids: torch.Tensor,
 ) -> torch.Tensor:
-    """Reference log probs for one turn. [R]"""
-    device = next(ref_model.parameters()).device
+    """
+    Reference log probs for one turn — base model only (LoRA disabled).
+    Shares weights with the policy model: no second model copy, no extra VRAM.
+    KL anchor = pretrained base distribution (before any SFT/RL fine-tuning).
+    """
+    peft_model = model.pretrained_model
+    device = next(model.parameters()).device
     input_ids = torch.cat([context_ids, response_ids]).unsqueeze(0).to(device)
     Q = len(context_ids)
     R = len(response_ids)
     r_ids = response_ids.to(device)
 
-    outputs = ref_model(input_ids=input_ids)
+    with peft_model.disable_adapter():
+        outputs = peft_model(input_ids=input_ids)
+
     resp_logits = outputs.logits[0, Q - 1 : Q + R - 1, :]
     log_probs = F.log_softmax(resp_logits, dim=-1)
     return log_probs[range(R), r_ids]
@@ -334,7 +341,6 @@ def _compute_gae(
 
 def _compute_trajectory_loss(
     model,
-    ref_model,
     turns: list[TurnData],
     reward: float,
     old_log_probs: list[torch.Tensor],
@@ -353,7 +359,7 @@ def _compute_trajectory_loss(
         if len(resp) == 0:
             continue
         lp, val, ent = _get_log_probs_values_entropy(model, ctx, resp)
-        ref_lp = _get_ref_log_probs(ref_model, ctx, resp)
+        ref_lp = _get_ref_log_probs(model, ctx, resp)
         all_lp.append(lp)
         all_val.append(val)
         all_entropy.append(ent)
@@ -442,19 +448,9 @@ def train(config: KernelForgeConfig = None):
     n_total = sum(p.numel() for p in model.parameters())
     print(f"Trainable: {n_trainable:,} / {n_total:,} params ({100*n_trainable/n_total:.2f}%)")
 
-    # ── Reference model — frozen SFT checkpoint ──────────────────────────────
-    # Anchor for KL divergence. We want the RL policy to stay close to
-    # the SFT policy, not the raw base model (which would fight SFT training).
-    print("Loading frozen reference model (SFT checkpoint)...")
-    ref_model = AutoModelForCausalLM.from_pretrained(
-        config.model_id,
-        dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
-    )
-    ref_model.eval()
-    for param in ref_model.parameters():
-        param.requires_grad = False
+    # No separate reference model needed — _get_ref_log_probs disables LoRA
+    # adapters on the policy model for reference forward passes. Saves ~16GB VRAM.
+    # KL anchor = base model weights (pre-SFT), which is standard for PPO-on-LoRA.
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=config.learning_rate)
@@ -530,7 +526,7 @@ def train(config: KernelForgeConfig = None):
                         continue
 
                     loss = _compute_trajectory_loss(
-                        model, ref_model, turns, reward, old_lp, old_val, config
+                        model, turns, reward, old_lp, old_val, config
                     )
                     # Gradient accumulation: backward per-trajectory, normalize by batch size
                     (loss / max(n_valid, 1)).backward()
