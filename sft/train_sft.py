@@ -69,10 +69,14 @@ def main():
     
     print("Starting Training...")
     trainer.train()
-    
-    # Save the final LoRA-merged model
-    print(f"Saving Model to {output_model_dir}")
-    trainer.save_model(output_model_dir)
+
+    # Merge LoRA weights into base model and save as a full model
+    # GRPOTrainer (PPO stage) requires a full model, not a LoRA adapter
+    print("Merging LoRA weights into base model...")
+    merged_model = trainer.model.merge_and_unload()
+
+    print(f"Saving merged model to {output_model_dir}")
+    merged_model.save_pretrained(output_model_dir)
     tokenizer.save_pretrained(output_model_dir)
     print("Done!")
 
