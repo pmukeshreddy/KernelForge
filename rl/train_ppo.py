@@ -57,7 +57,6 @@ class KernelForgeConfig:
     num_generations: int = 4
     per_device_train_batch_size: int = 1
     gradient_accumulation_steps: int = 4
-    max_prompt_length: int = 512
     max_completion_length: int = 4096
     learning_rate: float = 5e-7
     beta: float = 0.01
@@ -320,7 +319,6 @@ def train(config: KernelForgeConfig = None):
         per_device_train_batch_size=config.per_device_train_batch_size,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         num_generations=config.num_generations,
-        max_prompt_length=config.max_prompt_length,
         max_completion_length=config.max_completion_length,
         learning_rate=config.learning_rate,
         beta=config.beta,
