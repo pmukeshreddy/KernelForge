@@ -31,7 +31,6 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
-from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl.experimental.ppo import AutoModelForCausalLMWithValueHead
 
@@ -70,11 +69,6 @@ class KernelForgeConfig:
     temperature: float = 0.7
     num_train_epochs: int = 1
     save_steps: int = 50
-
-    # LoRA settings — same as SFT stage
-    lora_r: int = 16
-    lora_alpha: int = 32
-    lora_dropout: float = 0.05
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +407,9 @@ def train(config: KernelForgeConfig = None):
     tokenizer = AutoTokenizer.from_pretrained(config.model_id, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
 
-    # ── Actor-Critic: AutoModelForCausalLMWithValueHead + LoRA ──────────────
+    # ── Actor-Critic: AutoModelForCausalLMWithValueHead ─────────────────────
+    # The SFT model already has LoRA adapters — reuse them, don't stack a second LoRA.
+    # Trainable params: existing SFT LoRA adapters + the new value head (v_head).
     print(f"Loading policy model (actor-critic): {config.model_id}...")
     model = AutoModelForCausalLMWithValueHead.from_pretrained(
         config.model_id,
@@ -421,18 +417,11 @@ def train(config: KernelForgeConfig = None):
         device_map="auto",
         trust_remote_code=True,
     )
-
-    lora_config = LoraConfig(
-        r=config.lora_r,
-        lora_alpha=config.lora_alpha,
-        lora_dropout=config.lora_dropout,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                        "gate_proj", "up_proj", "down_proj"],
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-    model.pretrained_model = get_peft_model(model.pretrained_model, lora_config)
-    model.pretrained_model.print_trainable_parameters()
+    # Ensure the existing LoRA adapter is active and trainable
+    model.pretrained_model.enable_adapter_layers()
+    trainable_names = [n for n, p in model.named_parameters() if p.requires_grad]
+    print(f"Trainable params: {len(trainable_names)} param groups "
+          f"({sum(p.numel() for n,p in model.named_parameters() if p.requires_grad):,} params)")
 
     # ── Reference model: frozen base LM (no value head, no LoRA) ────────────
     print("Loading frozen reference model...")
