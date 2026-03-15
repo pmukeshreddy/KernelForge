@@ -32,10 +32,7 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from peft import LoraConfig
 
-try:
-    from trl import AutoModelForCausalLMWithValueHead
-except ImportError:
-    from trl.experimental.ppo import AutoModelForCausalLMWithValueHead
+from trl.experimental.ppo import AutoModelForCausalLMWithValueHead
 
 from trl.experimental.ppo import PPOConfig, PPOTrainer
 from transformers import AutoTokenizer
