@@ -263,6 +263,9 @@ def _run_react_episode(
 # PPO core
 # ---------------------------------------------------------------------------
 
+MAX_SEQ_LEN = 3072  # cap total tokens per forward pass to avoid OOM
+
+
 def _get_log_probs_values_entropy(
     model,
     context_ids: torch.Tensor,
@@ -274,7 +277,17 @@ def _get_log_probs_values_entropy(
         token_log_probs — log π_θ(r_t | context) [R]
         values          — V(s_t) at each response position [R]
         entropy         — mean token entropy scalar (for bonus term)
+
+    Long contexts are truncated from the LEFT (oldest tokens dropped first)
+    while preserving the entire response — keeps the total sequence under
+    MAX_SEQ_LEN to prevent OOM during the PPO backward pass.
     """
+    R = len(response_ids)
+    # Truncate context from the left if needed, always keep full response
+    max_ctx = max(MAX_SEQ_LEN - R, 64)
+    if len(context_ids) > max_ctx:
+        context_ids = context_ids[-max_ctx:]
+
     device = next(model.parameters()).device
     input_ids = torch.cat([context_ids, response_ids]).unsqueeze(0).to(device)
     Q = len(context_ids)
@@ -446,6 +459,9 @@ def train(config: KernelForgeConfig = None):
         trust_remote_code=True,
     )
     model.pretrained_model.enable_adapter_layers()
+    # Gradient checkpointing: recompute activations during backward instead of storing
+    # them — cuts activation memory ~4x at the cost of ~20% extra compute.
+    model.pretrained_model.base_model.model.gradient_checkpointing_enable()
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
     print(f"Trainable: {n_trainable:,} / {n_total:,} params ({100*n_trainable/n_total:.2f}%)")
@@ -494,6 +510,9 @@ def train(config: KernelForgeConfig = None):
 
             mean_reward = sum(all_rewards) / len(all_rewards)
             print(f"\n[Epoch {epoch+1} | Step {global_step+1}] mean_reward={mean_reward:.3f}")
+
+            # Free generation activations before the PPO forward/backward passes
+            torch.cuda.empty_cache()
 
             # ── Collect old log probs + old values (before any gradient update) ──
             all_old_lp:  list[list[torch.Tensor]] = []
