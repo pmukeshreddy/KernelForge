@@ -1,29 +1,30 @@
 """
 train_ppo.py - Stage 3 of the KernelForge Pipeline: Multi-Turn Agentic RL via PPO.
 
-trl.experimental.ppo.PPOTrainer requires a separate reward_model and value_model —
-designed for RLHF with a learned reward model. Our reward is a CUDA sandbox, not a
-neural network. So we implement the PPO update loop directly:
+Self-contained PPO (no PPOTrainer) because trl.experimental.ppo.PPOTrainer
+requires a neural reward_model — our reward is a CUDA sandbox.
 
-  1. Run ReAct episodes → collect (query_ids, response_ids, terminal_reward)
-  2. Forward pass through actor-critic → get log probs + value estimates
-  3. GAE advantage estimation (terminal reward at last response token)
-  4. PPO clipped objective + value loss + KL penalty
-  5. Backprop through LoRA adapters + value head only
+Architecture:
+  Policy+Critic : AutoModelForCausalLMWithValueHead (existing SFT LoRA + new v_head)
+  Reference     : AutoModelForCausalLM frozen at SFT checkpoint (KL anchor)
 
-Model architecture:
-  - Policy+Critic: AutoModelForCausalLMWithValueHead with LoRA
-    (LoRA adapters + v_head are the only trained parameters)
-  - Reference: plain AutoModelForCausalLM, fully frozen
-    (used only for per-token KL divergence penalty)
+Multi-turn correctness:
+  Each turn stores its OWN context_ids (initial prompt + all prior assistant/env
+  messages). Log probs and values are computed per-turn against the context that
+  was actually used during generation — not a flat concatenation that ignores
+  intervening environment feedback.
 
-Each RL episode mirrors agent.py:
-  - prefill "```cpp\\n#include <torch/extension.h>\\n"
-  - extract_cuda_code() → build_load_inline_wrapper() → sandbox → profiler
-  - final reward = best speedup across all turns
-  - only agent-generated tokens enter the PPO gradient
+Fixes applied vs. first draft:
+  1. Value clipping uses old_values (not old_log_probs) — was numerically broken
+  2. old_values collected during rollout alongside old_log_probs
+  3. Per-trajectory backward (no CPU batch_loss accumulation) — gradient device safe
+  4. Per-turn (context_ids, response_ids) tracking — correct credit assignment
+  5. Negative reward for failures (contrast signal for PPO)
+  6. Entropy bonus — prevents policy collapse
+  7. ref_model = frozen SFT checkpoint (correct RL-from-SFT anchor; NOT base Qwen)
 """
 
+import os
 import random
 import re
 from dataclasses import dataclass
@@ -55,20 +56,25 @@ class KernelForgeConfig:
     max_react_steps: int = 2
 
     # PPO hyperparameters
-    batch_size: int = 4       # prompts per PPO update
-    ppo_epochs: int = 4       # optimization passes per batch
+    batch_size: int = 4
+    ppo_epochs: int = 4
     learning_rate: float = 1.4e-5
-    kl_coef: float = 0.2      # KL penalty weight (keeps policy near reference)
-    cliprange: float = 0.2    # PPO policy ratio clip
-    vf_coef: float = 0.1      # value function loss weight
+    kl_coef: float = 0.2
+    cliprange: float = 0.2
+    vf_coef: float = 0.1
     cliprange_value: float = 0.2
-    gamma: float = 1.0        # discount (1.0 = episodic, no discounting)
-    lam: float = 0.95         # GAE lambda
+    entropy_coef: float = 0.01   # entropy bonus to prevent policy collapse
+    gamma: float = 1.0
+    lam: float = 0.95
     max_grad_norm: float = 1.0
     max_new_tokens: int = 2048
     temperature: float = 0.7
     num_train_epochs: int = 1
     save_steps: int = 50
+
+    # Reward shaping
+    reward_failure: float = -1.0   # compile error or wrong output
+    reward_no_code: float = -1.0   # no ```cpp block at all
 
 
 # ---------------------------------------------------------------------------
@@ -92,32 +98,26 @@ def extract_cuda_code(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Generation — one turn
+# Generation helpers
 # ---------------------------------------------------------------------------
 
-def _generate_turn(
+def _generate_from_context(
     model,
     tokenizer,
-    messages: list[dict],
+    context_ids: torch.Tensor,
     max_new_tokens: int = 2048,
     temperature: float = 0.7,
 ) -> tuple[list[int], str]:
     """
-    Returns:
-        generated_ids — agent-only token IDs (no prompt)
-        decoded_text  — full response string including prefill
+    Generate from pre-tokenized context_ids.
+    Returns generated_ids (agent tokens only) and decoded text including prefill.
     """
-    text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    text += PREFILL
-
-    inputs = tokenizer([text], return_tensors="pt").to(model.device)
-    prompt_len = inputs.input_ids.shape[1]
+    input_ids = context_ids.unsqueeze(0).to(next(model.parameters()).device)
+    prompt_len = input_ids.shape[1]
 
     with torch.no_grad():
         outputs = model.generate(
-            **inputs,
+            input_ids,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             do_sample=True,
@@ -130,8 +130,12 @@ def _generate_turn(
 
 
 # ---------------------------------------------------------------------------
-# Episode — one full ReAct loop = one RL trajectory
+# Episode — multi-turn ReAct loop
 # ---------------------------------------------------------------------------
+
+# Each turn stores the context that was used + the agent response
+TurnData = tuple[torch.Tensor, torch.Tensor]  # (context_ids, response_ids)
+
 
 def _run_react_episode(
     prompt_text: str,
@@ -140,15 +144,23 @@ def _run_react_episode(
     max_steps: int = 2,
     max_new_tokens: int = 2048,
     temperature: float = 0.7,
-) -> tuple[torch.Tensor, torch.Tensor, float]:
+    reward_failure: float = -1.0,
+    reward_no_code: float = -1.0,
+) -> tuple[list[TurnData], float]:
     """
-    Returns:
-        query_ids    — initial prompt token IDs (1D LongTensor)
-        response_ids — all agent-generated token IDs across all turns (1D LongTensor)
-        reward       — best speedup achieved (scalar float)
+    Run one full ReAct episode.
 
-    Environment feedback messages (errors, profiler) are appended to messages
-    as context but their tokens are NEVER included in response_ids.
+    Returns:
+        turns  — list of (context_ids, response_ids) ONE entry per turn.
+                 context_ids is the actual tokenized prompt fed to the model
+                 for that specific turn (includes prior env feedback).
+                 NEVER a flat concatenation across turns.
+        reward — terminal reward: best speedup achieved, or negative for failure.
+
+    Reward scale:
+        compile/correctness failure : reward_failure  (negative — contrast signal)
+        no ```cpp block             : reward_no_code   (negative)
+        success                     : calculate_reward() speedup ratio (≥ 1.0)
     """
     system_prompt = get_system_prompt()
     messages = [
@@ -163,27 +175,31 @@ def _run_react_episode(
         },
     ]
 
-    initial_text = (
-        tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        + PREFILL
-    )
-    query_ids = tokenizer(initial_text, return_tensors="pt").input_ids[0]
-
-    all_response_ids: list[int] = []
-    best_reward = 0.0
+    turns: list[TurnData] = []
+    best_reward = reward_failure  # default: penalise if nothing ever compiles
 
     for step in range(max_steps):
         print(f"\n--- Step {step + 1}/{max_steps} ---")
-        print("🧠 Generating Kernel...")
 
-        generated_ids, response_text = _generate_turn(
-            gen_model, tokenizer, messages,
+        # Build THIS turn's context and tokenize it
+        context_text = (
+            tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            + PREFILL
+        )
+        context_ids = tokenizer(context_text, return_tensors="pt").input_ids[0]
+
+        print("🧠 Generating Kernel...")
+        generated_ids, response_text = _generate_from_context(
+            gen_model, tokenizer, context_ids,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
         )
-        all_response_ids.extend(generated_ids)
+
+        # Store THIS turn: (context used for generation, tokens the agent produced)
+        turns.append((context_ids, torch.tensor(generated_ids, dtype=torch.long)))
         messages.append({"role": "assistant", "content": response_text})
 
+        # Extract + wrap
         cuda_code = extract_cuda_code(response_text)
         if not cuda_code:
             print("❌ No ```cpp block found.")
@@ -202,6 +218,7 @@ def _run_react_episode(
             })
             continue
 
+        # Sandbox
         print("🛠️  Compiling and Evaluating in Sandbox...")
         eval_result = evaluate(candidate_code, prompt_text)
 
@@ -215,8 +232,10 @@ def _run_react_episode(
                     "Fix the bug and output the corrected C++ code."
                 ),
             })
+            # best_reward stays at reward_failure unless a later step succeeds
             continue
 
+        # Success
         reward = calculate_reward(eval_result)
         best_reward = max(best_reward, reward)
         runtime_ms = eval_result["runtime_ms"]
@@ -234,69 +253,70 @@ def _run_react_episode(
                 ),
             })
 
-    print(f"\n🏁 Episode done. Best reward: {best_reward:.2f}x")
-    return query_ids, torch.tensor(all_response_ids, dtype=torch.long), best_reward
+    print(f"\n🏁 Episode done. Best reward: {best_reward:.2f}")
+    return turns, best_reward
 
 
 # ---------------------------------------------------------------------------
-# PPO core — forward pass, GAE, update
+# PPO core
 # ---------------------------------------------------------------------------
 
-def _get_log_probs_and_values(
+def _get_log_probs_values_entropy(
     model,
-    query_ids: torch.Tensor,
+    context_ids: torch.Tensor,
     response_ids: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Forward pass through AutoModelForCausalLMWithValueHead.
+    Forward pass for one turn.
     Returns:
-        token_log_probs — log π_θ(r_t | context) for each response token [R]
-        values          — V(s_t) for each response token position [R]
+        token_log_probs — log π_θ(r_t | context) [R]
+        values          — V(s_t) at each response position [R]
+        entropy         — mean token entropy scalar (for bonus term)
     """
     device = next(model.parameters()).device
-    input_ids = torch.cat([query_ids, response_ids]).unsqueeze(0).to(device)
-    Q = len(query_ids)
+    input_ids = torch.cat([context_ids, response_ids]).unsqueeze(0).to(device)
+    Q = len(context_ids)
     R = len(response_ids)
     r_ids = response_ids.to(device)
 
     lm_logits, _, values = model(input_ids=input_ids)
-    # lm_logits: [1, Q+R, vocab_size]
-    # values:    [1, Q+R] or [1, Q+R, 1]
 
-    # Positions Q-1 .. Q+R-2 predict response tokens r_0 .. r_{R-1}
-    resp_logits = lm_logits[0, Q - 1 : Q + R - 1, :]          # [R, vocab_size]
-    log_probs = F.log_softmax(resp_logits, dim=-1)             # [R, vocab_size]
-    token_log_probs = log_probs[range(R), r_ids]               # [R]
+    resp_logits = lm_logits[0, Q - 1 : Q + R - 1, :]       # [R, V]
+    log_probs_all = F.log_softmax(resp_logits, dim=-1)       # [R, V]
+    token_log_probs = log_probs_all[range(R), r_ids]         # [R]
+
+    # Entropy = -E[log p] = -sum(p * log_p)
+    entropy = -(log_probs_all.exp() * log_probs_all).sum(-1).mean()  # scalar
 
     v = values[0, Q - 1 : Q + R - 1]
     if v.dim() == 2:
-        v = v.squeeze(-1)                                      # [R]
+        v = v.squeeze(-1)                                    # [R]
 
-    return token_log_probs, v
+    return token_log_probs, v, entropy
 
 
 @torch.no_grad()
 def _get_ref_log_probs(
     ref_model,
-    query_ids: torch.Tensor,
+    context_ids: torch.Tensor,
     response_ids: torch.Tensor,
 ) -> torch.Tensor:
-    """Log probs from the frozen reference model. [R]"""
+    """Reference log probs for one turn. [R]"""
     device = next(ref_model.parameters()).device
-    input_ids = torch.cat([query_ids, response_ids]).unsqueeze(0).to(device)
-    Q = len(query_ids)
+    input_ids = torch.cat([context_ids, response_ids]).unsqueeze(0).to(device)
+    Q = len(context_ids)
     R = len(response_ids)
     r_ids = response_ids.to(device)
 
     outputs = ref_model(input_ids=input_ids)
-    resp_logits = outputs.logits[0, Q - 1 : Q + R - 1, :]     # [R, vocab_size]
+    resp_logits = outputs.logits[0, Q - 1 : Q + R - 1, :]
     log_probs = F.log_softmax(resp_logits, dim=-1)
-    return log_probs[range(R), r_ids]                          # [R]
+    return log_probs[range(R), r_ids]
 
 
 def _compute_gae(
-    rewards: torch.Tensor,   # [R]  shaped rewards (KL-penalized)
-    values: torch.Tensor,    # [R]  value estimates
+    rewards: torch.Tensor,
+    values: torch.Tensor,
     gamma: float,
     lam: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -305,85 +325,85 @@ def _compute_gae(
     advantages = torch.zeros_like(rewards)
     gae = 0.0
     for t in reversed(range(R)):
-        next_value = values[t + 1].item() if t < R - 1 else 0.0
-        delta = rewards[t] + gamma * next_value - values[t]
+        next_v = values[t + 1].item() if t < R - 1 else 0.0
+        delta = rewards[t] + gamma * next_v - values[t]
         gae = delta + gamma * lam * gae
         advantages[t] = gae
-    returns = advantages + values
-    return advantages, returns
+    return advantages, advantages + values
 
 
-def _ppo_update(
+def _compute_trajectory_loss(
     model,
     ref_model,
-    optimizer,
-    trajectories: list[tuple[torch.Tensor, torch.Tensor, float]],
-    old_log_probs_list: list[torch.Tensor],
+    turns: list[TurnData],
+    reward: float,
+    old_log_probs: list[torch.Tensor],
+    old_values: list[torch.Tensor],
     config: KernelForgeConfig,
-):
+) -> torch.Tensor:
     """
-    Run `ppo_epochs` passes of the PPO objective over the collected batch.
-    Loss = policy clip loss + vf_coef * value loss + kl_coef * KL penalty
+    Compute PPO loss for one multi-turn episode.
+    Each turn is evaluated against its own actual context — no flat concatenation.
+    GAE runs over the flattened (time-ordered) sequence of all turns.
     """
-    for ppo_ep in range(config.ppo_epochs):
-        batch_loss = torch.tensor(0.0)
+    all_lp, all_val, all_entropy = [], [], []
+    all_ref_lp = []
 
-        for (q_ids, r_ids, reward), old_lp in zip(trajectories, old_log_probs_list):
-            if len(r_ids) == 0:
-                continue  # empty response (all steps failed) — skip
+    for (ctx, resp) in turns:
+        if len(resp) == 0:
+            continue
+        lp, val, ent = _get_log_probs_values_entropy(model, ctx, resp)
+        ref_lp = _get_ref_log_probs(ref_model, ctx, resp)
+        all_lp.append(lp)
+        all_val.append(val)
+        all_entropy.append(ent)
+        all_ref_lp.append(ref_lp.to(lp.device))
 
-            # Current policy log probs + values
-            token_lp, values = _get_log_probs_and_values(model, q_ids, r_ids)
-            R = len(r_ids)
+    if not all_lp:
+        return torch.tensor(0.0, requires_grad=True)
 
-            # Reference log probs for KL penalty
-            ref_lp = _get_ref_log_probs(ref_model, q_ids, r_ids)
+    token_lp = torch.cat(all_lp)                # [T_total]
+    values    = torch.cat(all_val)               # [T_total]
+    ref_lp    = torch.cat(all_ref_lp)            # [T_total]
+    entropy   = torch.stack(all_entropy).mean()  # scalar
+    T = len(token_lp)
 
-            # Per-token KL: log(π/π_ref)
-            kl = token_lp - ref_lp.to(token_lp.device)       # [R]
+    # KL per token: log(π / π_ref)
+    kl = token_lp - ref_lp                              # [T]
 
-            # Shaped rewards: terminal reward + KL penalty at every token
-            shaped = -config.kl_coef * kl.detach()
-            shaped[-1] = shaped[-1] + reward
+    # Shaped rewards: KL penalty at every token, terminal reward at last token
+    shaped = -config.kl_coef * kl.detach()
+    shaped[-1] = shaped[-1] + reward
 
-            # GAE
-            advantages, returns = _compute_gae(
-                shaped, values.detach(), config.gamma, config.lam
-            )
+    # GAE
+    advantages, returns = _compute_gae(shaped, values.detach(), config.gamma, config.lam)
 
-            # Normalize advantages across this trajectory
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-            # PPO clipped policy loss
-            old_lp_dev = old_lp.to(token_lp.device)
-            ratio = torch.exp(token_lp - old_lp_dev)
-            pg1 = -advantages * ratio
-            pg2 = -advantages * torch.clamp(ratio, 1 - config.cliprange, 1 + config.cliprange)
-            pg_loss = torch.max(pg1, pg2).mean()
+    # Flatten old tensors (same order as all_lp)
+    old_lp_cat = torch.cat([lp.to(token_lp.device) for lp in old_log_probs])
+    old_val_cat = torch.cat([v.to(values.device) for v in old_values])
 
-            # Value function loss (clipped)
-            v_clipped = old_lp_dev.detach() + torch.clamp(
-                values - old_lp_dev.detach(),
-                -config.cliprange_value,
-                config.cliprange_value,
-            )
-            vf_loss = torch.max(
-                F.mse_loss(values, returns),
-                F.mse_loss(v_clipped, returns),
-            )
+    # PPO clipped policy loss
+    ratio = torch.exp(token_lp - old_lp_cat.detach())
+    pg1 = -advantages * ratio
+    pg2 = -advantages * torch.clamp(ratio, 1 - config.cliprange, 1 + config.cliprange)
+    pg_loss = torch.max(pg1, pg2).mean()
 
-            loss = pg_loss + config.vf_coef * vf_loss
-            batch_loss = batch_loss + loss
+    # Value function loss — clipped around OLD VALUES (not log probs)
+    v_clipped = old_val_cat.detach() + torch.clamp(
+        values - old_val_cat.detach(),
+        -config.cliprange_value,
+        config.cliprange_value,
+    )
+    vf_loss = torch.max(
+        F.mse_loss(values, returns),
+        F.mse_loss(v_clipped, returns),
+    )
 
-        optimizer.zero_grad()
-        (batch_loss / max(len(trajectories), 1)).backward()
-        torch.nn.utils.clip_grad_norm_(
-            [p for p in model.parameters() if p.requires_grad],
-            config.max_grad_norm,
-        )
-        optimizer.step()
-
-        print(f"  [PPO epoch {ppo_ep + 1}/{config.ppo_epochs}] loss={batch_loss.item():.4f}")
+    # Entropy bonus (negative in loss = maximise entropy)
+    total_loss = pg_loss + config.vf_coef * vf_loss - config.entropy_coef * entropy
+    return total_loss
 
 
 # ---------------------------------------------------------------------------
@@ -407,9 +427,9 @@ def train(config: KernelForgeConfig = None):
     tokenizer = AutoTokenizer.from_pretrained(config.model_id, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
 
-    # ── Actor-Critic: AutoModelForCausalLMWithValueHead ─────────────────────
-    # The SFT model already has LoRA adapters — reuse them, don't stack a second LoRA.
-    # Trainable params: existing SFT LoRA adapters + the new value head (v_head).
+    # ── Policy + Critic ──────────────────────────────────────────────────────
+    # Reuse existing SFT LoRA adapters — no second LoRA stacked on top.
+    # Trainable: SFT LoRA adapter weights + v_head (value head).
     print(f"Loading policy model (actor-critic): {config.model_id}...")
     model = AutoModelForCausalLMWithValueHead.from_pretrained(
         config.model_id,
@@ -417,14 +437,15 @@ def train(config: KernelForgeConfig = None):
         device_map="auto",
         trust_remote_code=True,
     )
-    # Ensure the existing LoRA adapter is active and trainable
     model.pretrained_model.enable_adapter_layers()
-    trainable_names = [n for n, p in model.named_parameters() if p.requires_grad]
-    print(f"Trainable params: {len(trainable_names)} param groups "
-          f"({sum(p.numel() for n,p in model.named_parameters() if p.requires_grad):,} params)")
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_total = sum(p.numel() for p in model.parameters())
+    print(f"Trainable: {n_trainable:,} / {n_total:,} params ({100*n_trainable/n_total:.2f}%)")
 
-    # ── Reference model: frozen base LM (no value head, no LoRA) ────────────
-    print("Loading frozen reference model...")
+    # ── Reference model — frozen SFT checkpoint ──────────────────────────────
+    # Anchor for KL divergence. We want the RL policy to stay close to
+    # the SFT policy, not the raw base model (which would fight SFT training).
+    print("Loading frozen reference model (SFT checkpoint)...")
     ref_model = AutoModelForCausalLM.from_pretrained(
         config.model_id,
         dtype=torch.bfloat16,
@@ -435,21 +456,19 @@ def train(config: KernelForgeConfig = None):
     for param in ref_model.parameters():
         param.requires_grad = False
 
-    # Only LoRA adapters + value head are trained
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable, lr=config.learning_rate)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=config.learning_rate)
 
-    # For generation we use the underlying pretrained model (avoids value head interference)
+    # Use underlying LM (without value head) for generation
     gen_model = model.pretrained_model
+
+    os.makedirs(config.output_dir, exist_ok=True)
 
     print(
         f"🚀 Launching multi-turn agentic PPO training...\n"
         f"   max_react_steps={config.max_react_steps}, "
         f"batch_size={config.batch_size}, ppo_epochs={config.ppo_epochs}"
     )
-
-    import os
-    os.makedirs(config.output_dir, exist_ok=True)
 
     global_step = 0
     for epoch in range(config.num_train_epochs):
@@ -459,35 +478,67 @@ def train(config: KernelForgeConfig = None):
         for batch_start in range(0, len(epoch_prompts), config.batch_size):
             batch_prompts = epoch_prompts[batch_start : batch_start + config.batch_size]
 
-            # ── Rollout phase: collect trajectories ──────────────────────────
-            trajectories: list[tuple[torch.Tensor, torch.Tensor, float]] = []
+            # ── Rollout phase ────────────────────────────────────────────────
+            all_turns:   list[list[TurnData]] = []
+            all_rewards: list[float] = []
+
             for prompt_text in batch_prompts:
-                q, r, rew = _run_react_episode(
+                turns, reward = _run_react_episode(
                     prompt_text, gen_model, tokenizer,
                     max_steps=config.max_react_steps,
                     max_new_tokens=config.max_new_tokens,
                     temperature=config.temperature,
+                    reward_failure=config.reward_failure,
+                    reward_no_code=config.reward_no_code,
                 )
-                trajectories.append((q, r, rew))
+                all_turns.append(turns)
+                all_rewards.append(reward)
 
-            mean_reward = sum(t[2] for t in trajectories) / len(trajectories)
-            print(f"\n[Epoch {epoch + 1} | Step {global_step + 1}] "
-                  f"mean_reward={mean_reward:.3f}x  ({len(trajectories)} episodes)")
+            mean_reward = sum(all_rewards) / len(all_rewards)
+            print(f"\n[Epoch {epoch+1} | Step {global_step+1}] mean_reward={mean_reward:.3f}")
 
-            # ── Old log probs (for PPO importance ratio) ─────────────────────
-            old_log_probs_list = []
+            # ── Collect old log probs + old values (before any gradient update) ──
+            all_old_lp:  list[list[torch.Tensor]] = []
+            all_old_val: list[list[torch.Tensor]] = []
+
             model.eval()
-            for q, r, _ in trajectories:
-                if len(r) == 0:
-                    old_log_probs_list.append(torch.zeros(0))
-                    continue
-                with torch.no_grad():
-                    lp, _ = _get_log_probs_and_values(model, q, r)
-                old_log_probs_list.append(lp.detach())
+            for turns in all_turns:
+                ep_lp, ep_val = [], []
+                for ctx, resp in turns:
+                    if len(resp) == 0:
+                        ep_lp.append(torch.zeros(0))
+                        ep_val.append(torch.zeros(0))
+                        continue
+                    with torch.no_grad():
+                        lp, val, _ = _get_log_probs_values_entropy(model, ctx, resp)
+                    ep_lp.append(lp.detach())
+                    ep_val.append(val.detach())
+                all_old_lp.append(ep_lp)
+                all_old_val.append(ep_val)
             model.train()
 
-            # ── PPO update ───────────────────────────────────────────────────
-            _ppo_update(model, ref_model, optimizer, trajectories, old_log_probs_list, config)
+            # ── PPO epochs ───────────────────────────────────────────────────
+            for ppo_ep in range(config.ppo_epochs):
+                optimizer.zero_grad()
+                total_loss_val = 0.0
+                n_valid = sum(1 for t in all_turns if any(len(r) > 0 for _, r in t))
+
+                for turns, reward, old_lp, old_val in zip(
+                    all_turns, all_rewards, all_old_lp, all_old_val
+                ):
+                    if not any(len(r) > 0 for _, r in turns):
+                        continue
+
+                    loss = _compute_trajectory_loss(
+                        model, ref_model, turns, reward, old_lp, old_val, config
+                    )
+                    # Gradient accumulation: backward per-trajectory, normalize by batch size
+                    (loss / max(n_valid, 1)).backward()
+                    total_loss_val += loss.item()
+
+                torch.nn.utils.clip_grad_norm_(trainable_params, config.max_grad_norm)
+                optimizer.step()
+                print(f"  [PPO epoch {ppo_ep+1}/{config.ppo_epochs}] loss={total_loss_val:.4f}")
 
             global_step += 1
             if global_step % config.save_steps == 0:
