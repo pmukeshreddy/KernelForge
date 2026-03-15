@@ -30,6 +30,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
+from peft import LoraConfig
 
 try:
     from trl import AutoModelForCausalLMWithValueHead
@@ -72,6 +73,11 @@ class KernelForgeConfig:
     temperature: float = 0.7
     num_train_epochs: int = 1
     save_steps: int = 50
+
+    # LoRA settings (same target modules as SFT)
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
 
 
 # ---------------------------------------------------------------------------
@@ -281,18 +287,21 @@ def train(config: KernelForgeConfig = None):
     tokenizer = AutoTokenizer.from_pretrained(config.model_id, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
 
-    # Policy model with value head (actor + critic in one)
-    print(f"Loading policy model with value head: {config.model_id}...")
-    model = AutoModelForCausalLMWithValueHead.from_pretrained(
-        config.model_id,
-        device_map="auto",
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
+    # LoRA config — same target modules as SFT stage, value head excluded (trained fully)
+    lora_config = LoraConfig(
+        r=config.lora_r,
+        lora_alpha=config.lora_alpha,
+        lora_dropout=config.lora_dropout,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                        "gate_proj", "up_proj", "down_proj"],
+        bias="none",
+        task_type="CAUSAL_LM",
     )
 
-    # Reference model — frozen, used only for KL divergence penalty
-    print("Loading frozen reference model...")
-    ref_model = AutoModelForCausalLMWithValueHead.from_pretrained(
+    # Policy model with value head — LoRA adapters + value head are the only trained params
+    # ref_model=None: TRL uses the frozen base layers (pre-LoRA weights) as implicit reference
+    print(f"Loading policy model with value head + LoRA: {config.model_id}...")
+    model = AutoModelForCausalLMWithValueHead.from_pretrained(
         config.model_id,
         device_map="auto",
         torch_dtype=torch.bfloat16,
@@ -319,8 +328,9 @@ def train(config: KernelForgeConfig = None):
         args=ppo_config,
         processing_class=tokenizer,
         model=model,
-        ref_model=ref_model,
+        ref_model=None,       # None = use frozen base weights as reference (LoRA path)
         train_dataset=raw_dataset,
+        peft_config=lora_config,
     )
 
     # Use the underlying pretrained LM for generation (not the value-head wrapper)
