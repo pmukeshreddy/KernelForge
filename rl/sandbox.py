@@ -221,7 +221,16 @@ try:
         save(R); sys.exit(0)
         
 except Exception as e:
-    R["compiler_error"] = f"Runtime: {{traceback.format_exc()[-1500:]}}"
+    # Extract useful info from traceback without tensor data dumps.
+    # Tensor dumps appear at the END of the message; take the FIRST part instead.
+    tb = traceback.format_exc()
+    lines = tb.strip().split('\\n')
+    # Get the exception class + message (last non-empty line) truncated
+    exc_line = next((l.strip() for l in reversed(lines) if l.strip()), str(e))
+    exc_line = exc_line[:300]
+    # Get up to 3 File/line context lines
+    file_lines = [l.strip() for l in lines if l.strip().startswith('File ')][-3:]
+    R["compiler_error"] = "Runtime: " + "\\n".join(file_lines + [exc_line])
     save(R); sys.exit(0)
 
 # Timing (only if correct)

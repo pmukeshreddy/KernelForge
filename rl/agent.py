@@ -69,17 +69,39 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
     #    Lookbehind (?<!:) prevents double-expanding torch::Tensor → torch::torch::Tensor.
     cuda_code = re.sub(r'(?<!:)\bTensor\b', 'torch::Tensor', cuda_code)
 
-    # Find all torch::Tensor binding function signatures (definitions, not declarations)
+    # Find all torch::Tensor binding function signatures
     sig_pattern = r'(torch::Tensor\s+(\w+)\s*\([^)]*\))\s*\{'
     sig_matches = re.findall(sig_pattern, cuda_code)
 
     if not sig_matches:
-        # Fallback: declarations (semicolon-terminated)
-        sig_pattern_decl = r'(torch::Tensor\s+(\w+)\s*\([^)]*\))\s*;'
-        sig_matches = re.findall(sig_pattern_decl, cuda_code)
+        # Fallback 1: semicolon-terminated declarations
+        sig_matches = re.findall(r'(torch::Tensor\s+(\w+)\s*\([^)]*\))\s*;', cuda_code)
 
     if not sig_matches:
-        return None  # Can't parse - signal extraction failure
+        # Fallback 2: vector<torch::Tensor> return (multi-output kernels)
+        vec_matches = re.findall(
+            r'(std::vector<torch::Tensor>\s+(\w+)\s*\([^)]*\))\s*\{', cuda_code
+        )
+        if vec_matches:
+            sig_matches = vec_matches
+
+    if not sig_matches:
+        # Fallback 3: any non-kernel, non-device C++ function — take the first one
+        # that is NOT __global__ or __device__ and has recognisable tensor args
+        for m in re.finditer(
+            r'(?<!__global__\s)(?<!__device__\s)'
+            r'(\w[\w:<>*&\s]+\s+(\w+)\s*\((?:[^)]*torch::[^)]*)\))\s*\{',
+            cuda_code,
+        ):
+            full_sig, fname = m.group(1).strip(), m.group(2)
+            # Rewrite return type to torch::Tensor
+            fixed = re.sub(r'^[\w:<>*&\s]+(?=\s+\w+\s*\()', 'torch::Tensor', full_sig)
+            cuda_code = cuda_code[:m.start(1)] + fixed + cuda_code[m.start(1) + len(full_sig):]
+            sig_matches = [(fixed, fname)]
+            break
+
+    if not sig_matches:
+        return None
 
     func_signatures = [m[0] for m in sig_matches]
     func_names = [m[1] for m in sig_matches]
