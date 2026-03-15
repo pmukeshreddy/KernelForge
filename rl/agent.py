@@ -16,6 +16,49 @@ from reward import calculate_reward
 from sys_prompt import get_system_prompt
 
 
+def _fix_cuda_api(cuda_code: str) -> str:
+    """
+    Fix common PyTorch C++ API mismatches the SFT model learned incorrectly.
+    Applied before every sandbox compilation.
+    """
+    # at::Tensor → torch::Tensor (normalise namespace)
+    cuda_code = cuda_code.replace('at::Tensor', 'torch::Tensor')
+
+    # current_device(): torch::cuda:: and at::cuda:: namespaces don't have it
+    cuda_code = re.sub(
+        r'(?:torch|at)::cuda::current_device\(\)',
+        'c10::cuda::current_device()',
+        cuda_code,
+    )
+
+    # getCurrentCUDAStream(): drop stream arg from <<<>>> launches (default stream is fine)
+    cuda_code = re.sub(
+        r',\s*(?:at|c10|torch)::cuda::getCurrentCUDAStream\([^)]*\)\s*(>>>)',
+        r'\1',
+        cuda_code,
+    )
+    # getCurrentCUDAStream() used elsewhere → fix namespace + add include
+    if 'getCurrentCUDAStream' in cuda_code:
+        if '#include <ATen/cuda/CUDAContext.h>' not in cuda_code:
+            cuda_code = '#include <ATen/cuda/CUDAContext.h>\n' + cuda_code
+        cuda_code = re.sub(
+            r'(?:torch|c10)::cuda::getCurrentCUDAStream\(\)',
+            'at::cuda::getCurrentCUDAStream()',
+            cuda_code,
+        )
+
+    # __fabsf / __fabs / __sqrtf are host-only intrinsics; device code uses plain versions
+    for fn in ('fabsf', 'fabs', 'sqrtf', 'sqrt', 'expf', 'exp', 'logf', 'log'):
+        cuda_code = cuda_code.replace(f'__{fn}(', f'{fn}(')
+
+    # std:: math functions are not available in device code
+    cuda_code = re.sub(r'std::(max|min|abs|fabs)\s*\(', lambda m: {
+        'max': 'fmaxf(', 'min': 'fminf(', 'abs': 'fabsf(', 'fabs': 'fabsf('
+    }[m.group(1)], cuda_code)
+
+    return cuda_code
+
+
 def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
     """
     Wrap raw CUDA C++ code in a full load_inline Python script.
@@ -62,32 +105,8 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
     # Use the last binding function as the one to call from forward()
     binding_func = func_names[-1]
     
-    # 3. Fix common API version mismatches before compilation
-    # Normalise at::Tensor → torch::Tensor in the body too (not just signatures)
-    cuda_code = cuda_code.replace('at::Tensor', 'torch::Tensor')
-
-    # getCurrentCUDAStream: safest fix is to drop the stream arg from kernel launches
-    # so the kernel runs on the default CUDA stream (always works, zero overhead).
-    # Covers: <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>
-    #     and <<<grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>
-    cuda_code = re.sub(
-        r',\s*(?:at|c10)::cuda::getCurrentCUDAStream\([^)]*\)\s*(>>>)',
-        r'\1',
-        cuda_code,
-    )
-    # If the stream call appears elsewhere (e.g., stored in a variable), add include
-    if 'getCurrentCUDAStream' in cuda_code:
-        if '#include <ATen/cuda/CUDAContext.h>' not in cuda_code:
-            cuda_code = '#include <ATen/cuda/CUDAContext.h>\n' + cuda_code
-        cuda_code = re.sub(
-            r'(?:at|c10)::cuda::getCurrentCUDAStream\(\)',
-            'at::cuda::getCurrentCUDAStream()',
-            cuda_code,
-        )
-
-    # __fabsf / __fabs are host-only in modern CUDA; device code must use fabsf / fabs
-    cuda_code = cuda_code.replace('__fabsf(', 'fabsf(')
-    cuda_code = cuda_code.replace('__fabs(', 'fabs(')
+    # 3. Fix common PyTorch C++ API mismatches before compilation
+    cuda_code = _fix_cuda_api(cuda_code)
 
     # Use repr() for both strings — handles all special chars, backslashes,
     # and any quote sequences without manual escaping.
