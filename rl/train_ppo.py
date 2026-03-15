@@ -1,35 +1,42 @@
 """
-train_ppo.py - Stage 3 of the KernelForge Pipeline: Multi-Turn Agentic RL via GRPO.
+train_ppo.py - Stage 3 of the KernelForge Pipeline: Multi-Turn Agentic PPO.
 
-Each RL episode is a full ReAct loop:
-  Turn 1: Model generates CUDA kernel → Sandbox compiles + checks correctness → Profiler runs
-  Turn 2: Model sees profiler feedback → Generates improved kernel → Sandbox re-evaluates
-  ...
-  Final reward: best speedup (baseline_ms / kernel_ms) achieved across all turns.
+Each RL episode is a full ReAct loop that mirrors agent.py exactly:
+  - Model outputs raw CUDA C++ (prefill: "```cpp\\n#include <torch/extension.h>\\n")
+  - extract_cuda_code() finds the ```cpp block
+  - build_load_inline_wrapper() wraps it in Python for the sandbox
+  - Sandbox compiles, checks correctness, times execution
+  - Profiler (ncu) reports the hardware bottleneck
+  - Feedback is returned to the model for the next turn
+  - Final reward = best speedup (baseline_ms / kernel_ms) across all turns
 
-The full multi-turn trajectory is treated as a single flat token sequence for GRPO.
-Only agent-generated tokens contribute to the loss. Environment tokens (profiler
-feedback, error messages) stay in the conversation context but are masked out.
+All agent-generated tokens across turns are concatenated into a single
+response tensor. Environment tokens (profiler text, error messages) are
+context-only — they never enter the response tensor or the loss.
 
-Algorithm: GRPO with rollout_func (TRL experimental multi-turn API).
-  - num_generations rollouts are collected per prompt.
-  - Rewards are normalized within the group (zero-mean, unit-variance).
-  - KL penalty against the reference model prevents policy collapse.
+Algorithm: PPO with GAE via TRL PPOTrainer + AutoModelForCausalLMWithValueHead.
+  - The value head provides per-token baselines for advantage estimation (GAE).
+  - A frozen reference model enforces the KL penalty.
+  - Uses PPO clipped objective with adaptive KL coefficient.
 
-Reference:
-  "A Practitioner's Guide to Multi-Turn Agentic RL" (arXiv:2510.01132)
-  TRL GRPOTrainer rollout_func API: huggingface.co/docs/trl/main/en/openenv
+Why PPO over GRPO:
+  - GRPO uses group-normalized rewards as the baseline (no critic).
+  - PPO has a learned value function — better credit assignment for
+    sparse rewards in multi-turn trajectories (arXiv:2510.01132 shows
+    PPO significantly outperforms GRPO/RLOO on multi-turn sparse tasks).
 """
 
 import re
 from dataclasses import dataclass
-from typing import Any
 
 import torch
-import torch.nn.functional as F
 from datasets import load_dataset
-from trl import GRPOConfig, GRPOTrainer
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from transformers import AutoTokenizer
+from trl import AutoModelForCausalLMWithValueHead, PPOConfig, PPOTrainer
 
+from agent import build_load_inline_wrapper
 from profiler import profile_kernel
 from reward import calculate_reward
 from sandbox import evaluate
@@ -44,120 +51,124 @@ from sys_prompt import get_system_prompt
 class KernelForgeConfig:
     model_id: str = "mukeshreddy/kernelforge-sft-qwen3-8b"
     rft_dataset_path: str = "data/rft_dataset.json"
-    output_dir: str = "checkpoints/kernelforge_grpo"
+    output_dir: str = "checkpoints/kernelforge_ppo"
 
     # Episode settings
-    max_react_steps: int = 2          # turns per episode (generate → profiler → improve)
+    max_react_steps: int = 2       # turns per episode: generate → profiler → improve
 
-    # GRPO settings
-    num_generations: int = 4          # G: parallel rollouts per prompt for group normalization
-    per_device_train_batch_size: int = 1
-    gradient_accumulation_steps: int = 4
-    max_prompt_length: int = 512
-    max_completion_length: int = 4096  # long enough to cover concatenated multi-turn completions
+    # PPO hyperparameters
+    batch_size: int = 4            # prompts collected before each PPO update
+    mini_batch_size: int = 1       # mini-batch size inside PPO update
+    ppo_epochs: int = 4            # PPO update passes over each collected batch
     learning_rate: float = 5e-7
-    beta: float = 0.01                # KL penalty — small so long CUDA completions aren't over-penalized
-    num_train_epochs: int = 1
-    logging_steps: int = 1
-    save_steps: int = 50
+    init_kl_coef: float = 0.01     # initial KL penalty coefficient (adaptive)
+    target_kl: float = 6.0         # adaptive KL target — keeps model near SFT
+    gamma: float = 1.0             # discount factor (1.0 = no decay, reward at end)
+    lam: float = 0.95              # GAE lambda
+    cliprange: float = 0.2         # PPO policy clip epsilon
+    cliprange_value: float = 0.2   # value function clip epsilon
+    vf_coef: float = 0.1           # weight of value function loss
+
+    # Generation settings
+    max_new_tokens: int = 2048
+    temperature: float = 0.7
 
 
 # ---------------------------------------------------------------------------
-# Generation utilities
+# Format helpers — must match agent.py exactly
 # ---------------------------------------------------------------------------
 
-def _extract_code_block(text: str) -> str:
-    """Extract the Python code block from model output."""
-    match = re.search(r"```python(.*?)```", text, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    # Fallback: strip <think> blocks and return the rest
+# This prefill matches agent.py line 115
+PREFILL = "```cpp\n#include <torch/extension.h>\n"
+
+
+def extract_cuda_code(text: str) -> str:
+    """
+    Extract CUDA C++ from model response.
+    Mirrors KernelForgeAgent.extract_cuda_code() in agent.py exactly.
+    """
+    for lang in ["cpp", "cuda", r"c\+\+"]:
+        match = re.search(rf"```{lang}(.*?)```", text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+    # Fallback: strip <think> blocks, check if remainder looks like CUDA C++
     clean = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     clean = re.sub(r"<think>.*", "", clean, flags=re.DOTALL)
-    return clean.strip()
+    stripped = clean.strip()
+    if any(kw in stripped for kw in ["__global__", "torch::Tensor", "#include"]):
+        return stripped
+    return ""
 
+
+# ---------------------------------------------------------------------------
+# Generation — one turn of the ReAct loop
+# ---------------------------------------------------------------------------
 
 def _generate_turn(
-    model,
-    tokenizer,
+    trainer: PPOTrainer,
+    tokenizer: AutoTokenizer,
     messages: list[dict],
-    prefill: str,
-) -> tuple[list[int], list[float], str]:
+    config: KernelForgeConfig,
+) -> tuple[torch.Tensor, str]:
     """
-    Run one generation turn.
-
-    Args:
-        model: The policy model (trainer.model).
-        tokenizer: The tokenizer (trainer.processing_class).
-        messages: Current conversation history (list of role/content dicts).
-        prefill: Text to force-prepend to the assistant response.
+    Run one generation turn using trainer.generate() for correct device handling.
 
     Returns:
-        generated_ids  — token IDs for the agent's response (not the prompt).
-        token_logprobs — log π_θ(token_i | context) for each generated token.
-        decoded_text   — full decoded response string including prefill.
+        generated_ids — 1D CPU tensor of agent-generated token IDs only.
+        decoded_text  — full decoded response string (includes PREFILL).
     """
     text = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
-    text += prefill
+    text += PREFILL
 
-    inputs = tokenizer([text], return_tensors="pt").to(model.device)
-    prompt_len = inputs.input_ids.shape[1]
+    input_ids = tokenizer.encode(text, return_tensors="pt")
 
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=2048,
-            temperature=0.7,
-            do_sample=True,
-            pad_token_id=tokenizer.eos_token_id,
-            return_dict_in_generate=True,
-            output_scores=True,   # one raw logit tensor per generated token
-        )
+    # trainer.generate() handles device placement and works with the value-head model
+    output_ids = trainer.generate(
+        input_ids,
+        max_new_tokens=config.max_new_tokens,
+        temperature=config.temperature,
+        do_sample=True,
+        pad_token_id=tokenizer.eos_token_id,
+    )[0]  # returns list of tensors; [0] for single input
 
-    generated_ids = outputs.sequences[0][prompt_len:].tolist()
-
-    # Compute log π_θ from raw logits (temperature NOT applied — we want true model probs)
-    token_logprobs: list[float] = []
-    for idx, score in enumerate(outputs.scores):
-        lp = F.log_softmax(score[0], dim=-1)
-        token_logprobs.append(lp[generated_ids[idx]].item())
-
-    decoded = prefill + tokenizer.decode(generated_ids, skip_special_tokens=True)
-    return generated_ids, token_logprobs, decoded
+    prompt_len = input_ids.shape[1]
+    generated_ids = output_ids[prompt_len:].cpu()
+    decoded = PREFILL + tokenizer.decode(generated_ids, skip_special_tokens=True)
+    return generated_ids, decoded
 
 
 # ---------------------------------------------------------------------------
-# Episode (one full ReAct loop = one RL trajectory)
+# Episode — one full ReAct loop = one PPO trajectory
 # ---------------------------------------------------------------------------
 
 def _run_react_episode(
     prompt_text: str,
-    model,
-    tokenizer,
-    max_steps: int = 2,
-) -> tuple[list[int], list[int], list[float], float]:
+    trainer: PPOTrainer,
+    tokenizer: AutoTokenizer,
+    config: KernelForgeConfig,
+) -> tuple[torch.Tensor, torch.Tensor, float]:
     """
     Run one full ReAct episode.
 
-    The episode is a multi-turn conversation:
-      user   → "write a kernel for this PyTorch op"
-      agent  → generates kernel (Turn 1)
-      user   → profiler feedback OR error (environment observation)
-      agent  → generates improved kernel (Turn 2)
+    The format is identical to agent.py (KernelForgeAgent.run_react_loop):
+      user   → "write an optimized CUDA C++ kernel for this op"
+      agent  → generates raw C++ (prefill forces ```cpp format)
+      [wrap] → build_load_inline_wrapper() builds the Python/sandbox script
+      [eval] → sandbox compiles, checks correctness, times it
+      user   → profiler feedback OR error message
+      agent  → generates improved C++ kernel
       ...
 
-    Only agent-generated tokens are collected in completion_ids / logprobs.
-    Environment observations are added to messages for context but masked out.
+    Only agent-generated tokens go into response_tensor.
+    Environment tokens (errors, profiler) stay in messages for context only.
 
     Returns:
-        prompt_ids     — token IDs of the initial user prompt.
-        completion_ids — all agent-generated token IDs concatenated across turns.
-        logprobs       — per-token log probs for completion_ids.
-        reward         — best speedup (≥1.0 = faster than baseline, 0.0 = failed).
+        query_tensor    — 1D tensor: initial prompt token IDs (for PPOTrainer.step)
+        response_tensor — 1D tensor: all agent turns concatenated (for PPOTrainer.step)
+        reward          — float: best speedup across all turns
     """
-    prefill = "```python\nimport torch\n"
     system_prompt = get_system_prompt()
 
     messages = [
@@ -165,76 +176,86 @@ def _run_react_episode(
         {
             "role": "user",
             "content": (
-                "Please write a highly optimized custom CUDA kernel to replace "
-                "this PyTorch reference implementation. Output the complete "
-                "load_inline build script.\n\n"
+                "Write an optimized CUDA C++ kernel to replace this PyTorch implementation. "
+                "Output only the C++ code.\n\n"
                 f"Reference Program:\n```python\n{prompt_text}\n```"
             ),
         },
     ]
 
-    # Tokenize the initial prompt — used as prompt_ids for TRL loss masking
+    # Encode the initial prompt for PPOTrainer.step()
     initial_text = (
         tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        + prefill
+        + PREFILL
     )
-    prompt_ids = tokenizer([initial_text], return_tensors="pt").input_ids[0].tolist()
+    query_tensor = tokenizer.encode(initial_text, return_tensors="pt")[0]
 
-    all_completion_ids: list[int] = []
-    all_logprobs: list[float] = []
+    all_response_ids: list[int] = []
     best_reward = 0.0
 
-    for step in range(max_steps):
-        print(f"\n--- Step {step + 1}/{max_steps} ---")
+    for step in range(config.max_react_steps):
+        print(f"\n--- Step {step + 1}/{config.max_react_steps} ---")
         print("🧠 Generating Kernel...")
 
-        generated_ids, token_logprobs, response_text = _generate_turn(
-            model, tokenizer, messages, prefill
-        )
+        generated_ids, response_text = _generate_turn(trainer, tokenizer, messages, config)
 
-        # Accumulate ONLY agent tokens — environment tokens are never added here
-        all_completion_ids.extend(generated_ids)
-        all_logprobs.extend(token_logprobs)
+        # Accumulate ONLY agent-generated tokens — never environment tokens
+        all_response_ids.extend(generated_ids.tolist())
 
-        # Add agent response to conversation history
         messages.append({"role": "assistant", "content": response_text})
 
-        # Extract the load_inline Python script from the response
-        candidate_code = _extract_code_block(response_text)
-        if not candidate_code:
-            print("❌ No ```python block found. Requesting fix...")
+        # --- Same flow as agent.py ---
+
+        # Step 1: Extract CUDA C++ from the ```cpp block
+        cuda_code = extract_cuda_code(response_text)
+        if not cuda_code:
+            print("❌ No ```cpp block found.")
             messages.append({
                 "role": "user",
                 "content": (
-                    "Error: Could not find a ```python block in your response. "
-                    "Output the complete load_inline script inside a single ```python block."
+                    "Error: Could not find ```cpp block in your response. "
+                    "Output the CUDA C++ code in a ```cpp code block."
                 ),
             })
             continue
 
-        # Evaluate in sandbox (compile, correctness, timing)
+        # Step 2: Wrap raw C++ in load_inline Python script
+        candidate_code = build_load_inline_wrapper(cuda_code, prompt_text)
+        if not candidate_code:
+            print("❌ Could not parse torch::Tensor binding function.")
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Error: Could not find a `torch::Tensor` binding function. "
+                    "You must include a C++ function that returns `torch::Tensor` "
+                    "and calls your CUDA kernel."
+                ),
+            })
+            continue
+
+        # Step 3: Sandbox evaluation (compile, correctness, timing)
         print("🛠️  Compiling and Evaluating in Sandbox...")
         eval_result = evaluate(candidate_code, prompt_text)
 
         if not eval_result["correct"]:
-            error = eval_result.get("compiler_error", "Outputs do not match the reference.")
+            error = eval_result.get("compiler_error", "Outputs do not match reference.")
             print(f"❌ Evaluation Failed: {error.strip()[:120]}...")
             messages.append({
                 "role": "user",
                 "content": (
-                    f"Your kernel failed evaluation.\n\nError Log:\n```\n{error[:500]}\n```"
-                    "\n\nPlease fix the errors and rewrite the complete kernel."
+                    f"Your CUDA C++ code failed.\n\nError Log:\n```\n{error[:500]}\n```\n\n"
+                    "Analyze the root cause carefully. Fix the bug and output the corrected C++ code."
                 ),
             })
             continue
 
-        # Kernel passed — compute reward and prepare profiler feedback for next turn
+        # Step 4: Reward + profiler feedback
         reward = calculate_reward(eval_result)
         best_reward = max(best_reward, reward)
         runtime_ms = eval_result["runtime_ms"]
         print(f"✅ Sandbox Passed! Latency: {runtime_ms:.3f} ms | Reward: {reward:.2f}x")
 
-        if step < max_steps - 1:
+        if step < config.max_react_steps - 1:
             print("🔬 Profiling Hardware Metrics...")
             profiler_feedback = profile_kernel(candidate_code, prompt_text)
             messages.append({
@@ -243,78 +264,22 @@ def _run_react_episode(
                     f"Success! Your kernel ran in {runtime_ms:.3f} ms "
                     f"({reward:.2f}x speedup over baseline).\n\n"
                     f"Hardware Profiler Report:\n{profiler_feedback}\n\n"
-                    "Apply the optimization playbook strategies to push the speedup further."
+                    "Can you optimize the C++ kernel further? Output the improved ```cpp code."
                 ),
             })
 
     print(f"\n🏁 Episode Complete. Best Reward: {best_reward:.2f}x")
-    return prompt_ids, all_completion_ids, all_logprobs, best_reward
+
+    # If model generated nothing at all (should not happen), create a dummy token
+    if not all_response_ids:
+        all_response_ids = [tokenizer.eos_token_id]
+
+    response_tensor = torch.tensor(all_response_ids, dtype=torch.long)
+    return query_tensor, response_tensor, best_reward
 
 
 # ---------------------------------------------------------------------------
-# rollout_func — plugs into GRPOTrainer
-# ---------------------------------------------------------------------------
-
-def make_rollout_func(max_react_steps: int):
-    """
-    Factory that returns a rollout_func compatible with TRL's GRPOTrainer.
-
-    TRL experimental API (rollout_func signature):
-        fn(prompts: list[str], trainer: GRPOTrainer) -> dict[str, list]
-
-    Required return keys (consumed by GRPOTrainer for loss computation):
-        prompt_ids     — list[list[int]]
-        completion_ids — list[list[int]]
-        logprobs       — list[list[float]]
-
-    Extra return keys are forwarded as kwargs to reward_funcs:
-        reward         — list[float]  (pre-computed speedup from sandbox)
-    """
-    def rollout_func(prompts: list[str], trainer) -> dict[str, Any]:
-        model = trainer.model
-        tokenizer = trainer.processing_class
-
-        prompt_ids_batch: list[list[int]] = []
-        completion_ids_batch: list[list[int]] = []
-        logprobs_batch: list[list[float]] = []
-        rewards_batch: list[float] = []
-
-        for prompt_text in prompts:
-            p_ids, c_ids, lps, reward = _run_react_episode(
-                prompt_text, model, tokenizer, max_steps=max_react_steps
-            )
-            prompt_ids_batch.append(p_ids)
-            completion_ids_batch.append(c_ids)
-            logprobs_batch.append(lps)
-            rewards_batch.append(reward)
-
-        return {
-            "prompt_ids": prompt_ids_batch,
-            "completion_ids": completion_ids_batch,
-            "logprobs": logprobs_batch,
-            "reward": rewards_batch,
-        }
-
-    return rollout_func
-
-
-# ---------------------------------------------------------------------------
-# Reward function — just forwards the pre-computed reward from the rollout
-# ---------------------------------------------------------------------------
-
-def reward_from_rollout(completions, reward, **kwargs) -> list[float]:
-    """
-    Reward function for GRPOTrainer.
-
-    The actual reward (speedup ratio) was computed inside rollout_func by the
-    sandbox. We simply forward it here so GRPOTrainer can normalize it across
-    the group and compute advantages.
-    """
-    return list(reward)
-
-
-# ---------------------------------------------------------------------------
-# Training entry point
+# Training loop
 # ---------------------------------------------------------------------------
 
 def train(config: KernelForgeConfig = None):
@@ -329,61 +294,95 @@ def train(config: KernelForgeConfig = None):
         return
     print(f"Loaded {len(raw_dataset)} prompts.")
 
-    training_args = GRPOConfig(
-        output_dir=config.output_dir,
-        per_device_train_batch_size=config.per_device_train_batch_size,
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
-        num_generations=config.num_generations,
-        max_prompt_length=config.max_prompt_length,
-        max_completion_length=config.max_completion_length,
+    tokenizer = AutoTokenizer.from_pretrained(config.model_id)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Policy model with value head (PPO critic learns V(s) for GAE)
+    model = AutoModelForCausalLMWithValueHead.from_pretrained(
+        config.model_id,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+    )
+
+    # Frozen reference model for KL penalty
+    ref_model = AutoModelForCausalLMWithValueHead.from_pretrained(
+        config.model_id,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+    )
+
+    ppo_config = PPOConfig(
+        model_name=config.model_id,
         learning_rate=config.learning_rate,
-        beta=config.beta,
-        num_train_epochs=config.num_train_epochs,
-        logging_steps=config.logging_steps,
-        save_steps=config.save_steps,
-        bf16=True,
-        gradient_checkpointing=True,
-        # Avoid nested multiprocessing conflicts with the sandbox subprocess
-        dataloader_num_workers=0,
+        batch_size=config.batch_size,
+        mini_batch_size=config.mini_batch_size,
+        ppo_epochs=config.ppo_epochs,
+        kl_penalty="kl",
+        init_kl_coef=config.init_kl_coef,
+        target=config.target_kl,
+        gamma=config.gamma,
+        lam=config.lam,
+        cliprange=config.cliprange,
+        cliprange_value=config.cliprange_value,
+        vf_coef=config.vf_coef,
+        log_with=None,
     )
 
-    rollout_func = make_rollout_func(max_react_steps=config.max_react_steps)
+    trainer = PPOTrainer(ppo_config, model, ref_model, tokenizer)
 
-    print(f"Initializing GRPOTrainer (max_react_steps={config.max_react_steps}, "
-          f"num_generations={config.num_generations})...")
-
-    trainer = GRPOTrainer(
-        model=config.model_id,
-        reward_funcs=[reward_from_rollout],
-        args=training_args,
-        train_dataset=raw_dataset,
-        rollout_func=rollout_func,
+    dataloader = DataLoader(
+        raw_dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=0,  # avoid multiprocessing conflicts with sandbox subprocesses
     )
 
-    print("🚀 Launching multi-turn agentic RL training...")
-    trainer.train()
-    trainer.save_model(config.output_dir)
+    print(
+        f"🚀 Starting PPO training "
+        f"(max_react_steps={config.max_react_steps}, batch_size={config.batch_size})..."
+    )
+
+    for batch in tqdm(dataloader, desc="PPO Batches"):
+        prompts = batch["prompt"]
+
+        query_tensors = []
+        response_tensors = []
+        rewards = []
+
+        for prompt_text in prompts:
+            q, r, reward = _run_react_episode(prompt_text, trainer, tokenizer, config)
+            query_tensors.append(q)
+            response_tensors.append(r)
+            rewards.append(torch.tensor(reward, dtype=torch.float))
+
+        # PPO step: computes log probs (policy + ref), value estimates,
+        # GAE advantages, clipped policy loss + value loss, KL penalty
+        stats = trainer.step(query_tensors, response_tensors, rewards)
+        trainer.log_stats(stats, {"query": prompts}, rewards)
+
+    trainer.save_pretrained(config.output_dir)
     print(f"Model saved to {config.output_dir}")
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="KernelForge Multi-Turn GRPO Training")
+    parser = argparse.ArgumentParser(description="KernelForge Multi-Turn PPO Training")
     parser.add_argument("--dataset", type=str, default="data/rft_dataset.json")
-    parser.add_argument("--output_dir", type=str, default="checkpoints/kernelforge_grpo")
+    parser.add_argument("--output_dir", type=str, default="checkpoints/kernelforge_ppo")
     parser.add_argument("--max_react_steps", type=int, default=2)
-    parser.add_argument("--num_generations", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=5e-7)
-    parser.add_argument("--beta", type=float, default=0.01)
+    parser.add_argument("--init_kl_coef", type=float, default=0.01)
     args = parser.parse_args()
 
     config = KernelForgeConfig(
         rft_dataset_path=args.dataset,
         output_dir=args.output_dir,
         max_react_steps=args.max_react_steps,
-        num_generations=args.num_generations,
+        batch_size=args.batch_size,
         learning_rate=args.lr,
-        beta=args.beta,
+        init_kl_coef=args.init_kl_coef,
     )
     train(config)
