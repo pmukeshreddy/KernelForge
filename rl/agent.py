@@ -24,22 +24,24 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
     reference PyTorch code to get forward() arguments, then generates the
     complete Python wrapper with ModelNew class.
     """
-    # 1. Find all torch::Tensor binding function signatures (definitions, not declarations)
-    sig_pattern = r'(torch::Tensor\s+(\w+)\s*\([^)]*\))\s*\{'
+    # 1. Find all Tensor binding function signatures (definitions, not declarations)
+    # Match both torch::Tensor and at::Tensor (model sometimes uses either)
+    TENSOR_TYPE = r'(?:torch|at)::Tensor'
+    sig_pattern = rf'((?:torch|at)::Tensor\s+(\w+)\s*\([^)]*\))\s*\{{'
     sig_matches = re.findall(sig_pattern, cuda_code)
-    
+
     if not sig_matches:
-        # Fallback: try to find any function returning torch::Tensor
-        sig_pattern_decl = r'(torch::Tensor\s+(\w+)\s*\([^)]*\))\s*;'
+        # Fallback: declarations (semicolon-terminated)
+        sig_pattern_decl = rf'((?:torch|at)::Tensor\s+(\w+)\s*\([^)]*\))\s*;'
         sig_matches = re.findall(sig_pattern_decl, cuda_code)
-    
+
     if not sig_matches:
         return None  # Can't parse - signal extraction failure
-    
-    # sig_matches is [(full_sig, func_name), ...]
-    func_signatures = [m[0] for m in sig_matches]
+
+    # Normalise at::Tensor → torch::Tensor in signatures so load_inline is happy
+    func_signatures = [m[0].replace('at::Tensor', 'torch::Tensor') for m in sig_matches]
     func_names = [m[1] for m in sig_matches]
-    
+
     # Build cpp_source from signatures
     cpp_source = "; ".join(func_signatures) + ";"
     
