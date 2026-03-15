@@ -63,6 +63,8 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
     binding_func = func_names[-1]
     
     # 3. Fix common API version mismatches before compilation
+    # Normalise at::Tensor → torch::Tensor in the body too (not just signatures)
+    cuda_code = cuda_code.replace('at::Tensor', 'torch::Tensor')
 
     # getCurrentCUDAStream: safest fix is to drop the stream arg from kernel launches
     # so the kernel runs on the default CUDA stream (always works, zero overhead).
@@ -87,18 +89,18 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
     cuda_code = cuda_code.replace('__fabsf(', 'fabsf(')
     cuda_code = cuda_code.replace('__fabs(', 'fabs(')
 
-    # Escape CUDA code for safe embedding in Python triple-quoted string
-    safe_cuda = cuda_code.replace('\\', '\\\\').replace('"""', "'''")
-    # Escape cpp_source for single-quoted Python string
-    safe_cpp = cpp_source.replace('\\', '\\\\').replace('"', '\\"')
-    
+    # Use repr() for both strings — handles all special chars, backslashes,
+    # and any quote sequences without manual escaping.
+    cuda_source_expr = repr(cuda_code)
+    cpp_source_expr  = repr(cpp_source)
+
     # 4. Build the full Python wrapper
     wrapper = f'''import torch
 from torch.utils.cpp_extension import load_inline
 
-cuda_source = """{safe_cuda}"""
+cuda_source = {cuda_source_expr}
 
-cpp_source = "{safe_cpp}"
+cpp_source = {cpp_source_expr}
 
 ext = load_inline(
     name="custom_ext",
