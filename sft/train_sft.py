@@ -39,6 +39,8 @@ def main():
     # Load the generated SFT training pairs
     print(f"Loading SFT training data from {sft_data_file}")
     train_dataset = load_dataset("json", data_files=sft_data_file, split="train")
+    # Filter out KernelBench prompt-only entries (no SFT target)
+    train_dataset = train_dataset.filter(lambda x: bool(x.get("text", "").strip()))
     print(f"Loaded {len(train_dataset)} training examples")
     
     training_args = SFTConfig(

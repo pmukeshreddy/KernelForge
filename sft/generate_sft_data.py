@@ -146,19 +146,42 @@ def main():
     except Exception as e:
         print(f"Warning: Could not load CUDA-L1: {e}")
     
-    # === Source 2: KernelBench reference problems (for diversity) ===
-    # Load these as input-only; if we have CUDA-L1 solutions for them, great
-    # Otherwise they provide more PyTorch problems for the model to see
+    # === Source 2: KernelBench reference problems ===
+    # These are prompt-only entries (no cuda_kernel target).
+    # They flow into RFT and PPO as additional prompts for the RL agent to solve.
+    # The RL reward (sandbox speedup) is the supervision signal — no C++ target needed.
     print("Loading KernelBench dataset...")
+    kb_added = 0
     try:
-        kb1 = load_dataset("ScalingIntelligence/KernelBench", split="level_1")
-        kb2 = load_dataset("ScalingIntelligence/KernelBench", split="level_2")
-        kb3 = load_dataset("ScalingIntelligence/KernelBench", split="level_3")
-        
-        # KernelBench problems are already covered by CUDA-L1 (same benchmark)
-        # So we just log how many we have
-        kb_total = len(kb1) + len(kb2) + len(kb3)
-        print(f"KernelBench problems: {kb_total} (covered by CUDA-L1 solutions)")
+        kb_splits = {}
+        for level in ["level_1", "level_2", "level_3"]:
+            try:
+                kb_splits[level] = load_dataset("ScalingIntelligence/KernelBench", split=level)
+            except Exception as e:
+                print(f"  Warning: Could not load KernelBench {level}: {e}")
+
+        # Collect existing pytorch_code values to avoid duplicates with CUDA-L1
+        existing_codes = {p["pytorch_code"] for p in pairs}
+
+        for level, ds in kb_splits.items():
+            for row in ds:
+                code = row.get("code", "") or row.get("pytorch_code", "") or row.get("ref_code", "")
+                if not code or code in existing_codes:
+                    continue
+                # Prompt-only entry: no cuda_kernel, no text field for SFT
+                # cuda_kernel = "" signals RFT/PPO to treat this as a prompt-only problem
+                pairs.append({
+                    "source": f"kernelbench-{level}",
+                    "task_id": row.get("task_id", row.get("name", "")),
+                    "level_id": level,
+                    "pytorch_code": code,
+                    "cuda_kernel": "",
+                    "text": "",
+                })
+                existing_codes.add(code)
+                kb_added += 1
+
+        print(f"KernelBench problems added as RL prompts: {kb_added}")
     except Exception as e:
         print(f"Warning: Could not load KernelBench: {e}")
     
