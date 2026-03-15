@@ -134,13 +134,30 @@ try:
     ModelNew = model_new.ModelNew
     R["compiles"] = True
 except Exception as e:
-    # PyTorch RuntimeError contains the C++ compiler log in the string representation.
-    # We take the last 2000 characters to ensure we capture the actual semantic C++ errors 
-    # instead of just "ninja: build stopped"
+    # load_inline throws a RuntimeError whose string contains the entire ninja
+    # build log (thousands of chars of -isystem flags) followed by the actual
+    # CUDA/C++ error. Extract only the meaningful lines.
     err_str = str(e)
-    if len(err_str) > 2000:
-        err_str = "..." + err_str[-2000:]
-    R["compiler_error"] = err_str
+    error_lines = []
+    for line in err_str.split('\\n'):
+        s = line.strip()
+        if not s:
+            continue
+        # Skip pure build-flag lines
+        if s.startswith('-isystem') or s.startswith('-I/') or s.startswith('-D__'):
+            continue
+        if any(kw in s for kw in ['error:', 'Error:', 'undefined', 'FAILED',
+                                   'fatal error', 'note:', 'warning:', 'ninja:']):
+            # Strip leading temp-path noise, keep filename(line): error
+            if '.cu(' in s:
+                s = s[s.rfind('/', 0, s.find('.cu(')) + 1:]
+            error_lines.append(s)
+    if error_lines:
+        R["compiler_error"] = '\\n'.join(error_lines[-20:])
+    else:
+        # Fallback: last lines usually have "error: X" summary
+        last = [l.strip() for l in err_str.strip().split('\\n')[-15:] if l.strip()]
+        R["compiler_error"] = '\\n'.join(last)
     save(R); sys.exit(0)
 
 save(R)  # Save early so timeout knows compilation passed

@@ -224,11 +224,11 @@ def _run_react_episode(
 
         if not eval_result["correct"]:
             error = eval_result.get("compiler_error", "Outputs do not match reference.")
-            print(f"❌ Failed: {error.strip()[:120]}...")
+            print(f"❌ Failed:\n{error.strip()[:600]}")
             messages.append({
                 "role": "user",
                 "content": (
-                    f"Your kernel failed.\n\nError:\n```\n{error[:500]}\n```\n\n"
+                    f"Your kernel failed.\n\nError:\n```\n{error[:1500]}\n```\n\n"
                     "Fix the bug and output the corrected C++ code."
                 ),
             })
