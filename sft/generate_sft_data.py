@@ -42,7 +42,7 @@ def extract_cuda_cpp(custom_code: str) -> str:
     """
     # Try all common variable names used in CUDA-L1 custom_code
     # Some entries use cuda_source, others use cuda_code, cuda_src, etc.
-    for var in [r'cuda_source', r'cuda_code', r'cuda_src', r'cuda_kernel_code']:
+    for var in [r'cuda_source', r'cuda_code', r'cuda_src', r'cuda_kernel_code', r'cuda_kernel']:
         match = re.search(rf'{var}\s*=\s*"""(.*?)"""', custom_code, re.DOTALL)
         if match:
             break
