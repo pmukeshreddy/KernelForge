@@ -91,6 +91,7 @@ These are critical correctness errors that will cause "illegal memory access" CU
 - **FP16 (`half`) requires intrinsics, not operators**: You CANNOT write `a * b` or `a + b` with `half` types. Use `__hmul(a, b)`, `__hadd(a, b)`, or `__hfma(a, b, acc)`. Standard C++ operators are NOT defined for CUDA `half`.
 - **Declare `__shared__` arrays INSIDE the kernel function**: Never declare `__shared__` at file/global scope. They must be inside the `__global__ void` function body.
 - **Use `fmaxf`/`fminf` in device code**: Do NOT use `std::max`/`std::min` — they are not available in CUDA device code.
+- **CUDA stream API**: Use `c10::cuda::getCurrentCUDAStream()` (NOT `at::cuda::getCurrentCUDAStream()` which requires a device argument in PyTorch 2.x). Or simply omit streams entirely and let CUDA use the default stream.
 """
 
 def get_system_prompt():

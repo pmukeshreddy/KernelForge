@@ -54,7 +54,14 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
     # Use the last binding function as the one to call from forward()
     binding_func = func_names[-1]
     
-    # 3. Escape CUDA code for safe embedding in Python triple-quoted string
+    # 3. Fix common API version mismatches before compilation
+    # at::cuda::getCurrentCUDAStream() requires a device arg in PyTorch 2.x
+    cuda_code = cuda_code.replace(
+        "at::cuda::getCurrentCUDAStream()",
+        "c10::cuda::getCurrentCUDAStream()"
+    )
+
+    # Escape CUDA code for safe embedding in Python triple-quoted string
     safe_cuda = cuda_code.replace('\\', '\\\\').replace('"""', "'''")
     # Escape cpp_source for single-quoted Python string
     safe_cpp = cpp_source.replace('\\', '\\\\').replace('"', '\\"')
