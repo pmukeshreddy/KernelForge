@@ -40,11 +40,15 @@ def extract_cuda_cpp(custom_code: str) -> str:
     We want ONLY the content inside cuda_source = \"\"\"...\"\"\".
     Returns empty string if extraction fails or the result is not valid C++.
     """
-    # Match cuda_source = """...""" (triple double-quotes)
-    match = re.search(r'cuda_source\s*=\s*"""(.*?)"""', custom_code, re.DOTALL)
-    if not match:
-        # Fallback: try triple single-quotes
-        match = re.search(r"cuda_source\s*=\s*'''(.*?)'''", custom_code, re.DOTALL)
+    # Try all common variable names used in CUDA-L1 custom_code
+    # Some entries use cuda_source, others use cuda_code, cuda_src, etc.
+    for var in [r'cuda_source', r'cuda_code', r'cuda_src', r'cuda_kernel_code']:
+        match = re.search(rf'{var}\s*=\s*"""(.*?)"""', custom_code, re.DOTALL)
+        if match:
+            break
+        match = re.search(rf"{var}\s*=\s*'''(.*?)'''", custom_code, re.DOTALL)
+        if match:
+            break
     if not match:
         return ""
 
