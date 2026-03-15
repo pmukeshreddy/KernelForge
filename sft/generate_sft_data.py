@@ -6,17 +6,60 @@ Sources:
 2. KernelBench (ScalingIntelligence/KernelBench) - 250 PyTorch reference problems
 
 Combines both into a single JSONL file for SFT training.
+
+Target format: raw CUDA C++ only (the content inside cuda_source = \"\"\"...\"\"\").
+Python wrappers, load_inline boilerplate, PYBIND11, and ModelNew classes are
+discarded. Entries where a clean kernel cannot be extracted are filtered out.
 """
 import json
 import os
+import re
 import glob
 from huggingface_hub import snapshot_download
-from datasets import load_dataset, concatenate_datasets
+from datasets import load_dataset
 
 SYSTEM = """<|im_start|>system
 You are an expert GPU kernel developer. Rewrite PyTorch operations into optimized CUDA C++ code with __global__ kernels, proper thread indexing, shared memory, and memory coalescing. Output only the CUDA C++ code.
 <|im_end|>
 """
+
+def extract_cuda_cpp(custom_code: str) -> str:
+    """
+    Extract raw CUDA C++ from a load_inline Python script.
+
+    CUDA-L1 custom_code looks like:
+        cuda_source = \"\"\"
+        #include <torch/extension.h>
+        __global__ void my_kernel(...) { ... }
+        torch::Tensor run_cuda(...) { ... }
+        \"\"\"
+        cpp_source = "..."
+        ext = load_inline(...)
+        class ModelNew(...): ...
+
+    We want ONLY the content inside cuda_source = \"\"\"...\"\"\".
+    Returns empty string if extraction fails or the result is not valid C++.
+    """
+    # Match cuda_source = """...""" (triple double-quotes)
+    match = re.search(r'cuda_source\s*=\s*"""(.*?)"""', custom_code, re.DOTALL)
+    if not match:
+        # Fallback: try triple single-quotes
+        match = re.search(r"cuda_source\s*=\s*'''(.*?)'''", custom_code, re.DOTALL)
+    if not match:
+        return ""
+
+    cpp = match.group(1).strip()
+
+    # Must contain a real CUDA kernel and a torch::Tensor binding function
+    if "__global__" not in cpp:
+        return ""
+    if "torch::Tensor" not in cpp:
+        return ""
+    if "#include" not in cpp:
+        return ""
+
+    return cpp
+
 
 def make_training_text(pytorch_code, cuda_code, ops_desc=None):
     """Create full training prompt with input + target."""
@@ -68,26 +111,32 @@ def main():
             
             print(f"  {gpu_name}: {len(entries)} entries")
             
+            skipped = 0
             for entry in entries:
                 ref = entry.get("ref_code", "")
                 custom = entry.get("custom_code", "")
-                
+
                 if not ref or not custom:
+                    skipped += 1
                     continue
-                
-                # Check custom_code has real CUDA constructs
-                if not any(kw in custom for kw in ["__global__", "__device__", "blockIdx", "threadIdx"]):
+
+                # Extract raw C++ from inside cuda_source = """..."""
+                cuda_cpp = extract_cuda_cpp(custom)
+                if not cuda_cpp:
+                    skipped += 1
                     continue
-                
-                text = make_training_text(ref, custom)
+
+                text = make_training_text(ref, cuda_cpp)
                 pairs.append({
                     "source": f"cuda-l1-{gpu_name}",
                     "task_id": entry.get("task_id", ""),
                     "level_id": entry.get("level_id", ""),
                     "pytorch_code": ref,
-                    "cuda_kernel": custom,
+                    "cuda_kernel": cuda_cpp,
                     "text": text
                 })
+            if skipped:
+                print(f"    {gpu_name}: skipped {skipped} entries (no clean kernel)")
         
         print(f"CUDA-L1 pairs with CUDA constructs: {len(pairs)}")
     except Exception as e:
