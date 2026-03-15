@@ -113,11 +113,13 @@ def _generate_from_context(
     Returns generated_ids (agent tokens only) and decoded text including prefill.
     """
     input_ids = context_ids.unsqueeze(0).to(next(model.parameters()).device)
+    attention_mask = torch.ones_like(input_ids)
     prompt_len = input_ids.shape[1]
 
     with torch.no_grad():
         outputs = model.generate(
             input_ids,
+            attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             do_sample=True,

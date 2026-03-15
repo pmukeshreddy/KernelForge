@@ -61,11 +61,29 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
     binding_func = func_names[-1]
     
     # 3. Fix common API version mismatches before compilation
-    # at::cuda::getCurrentCUDAStream() requires a device arg in PyTorch 2.x
-    cuda_code = cuda_code.replace(
-        "at::cuda::getCurrentCUDAStream()",
-        "c10::cuda::getCurrentCUDAStream()"
+
+    # getCurrentCUDAStream: safest fix is to drop the stream arg from kernel launches
+    # so the kernel runs on the default CUDA stream (always works, zero overhead).
+    # Covers: <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>
+    #     and <<<grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>
+    cuda_code = re.sub(
+        r',\s*(?:at|c10)::cuda::getCurrentCUDAStream\([^)]*\)\s*(>>>)',
+        r'\1',
+        cuda_code,
     )
+    # If the stream call appears elsewhere (e.g., stored in a variable), add include
+    if 'getCurrentCUDAStream' in cuda_code:
+        if '#include <ATen/cuda/CUDAContext.h>' not in cuda_code:
+            cuda_code = '#include <ATen/cuda/CUDAContext.h>\n' + cuda_code
+        cuda_code = re.sub(
+            r'(?:at|c10)::cuda::getCurrentCUDAStream\(\)',
+            'at::cuda::getCurrentCUDAStream()',
+            cuda_code,
+        )
+
+    # __fabsf / __fabs are host-only in modern CUDA; device code must use fabsf / fabs
+    cuda_code = cuda_code.replace('__fabsf(', 'fabsf(')
+    cuda_code = cuda_code.replace('__fabs(', 'fabs(')
 
     # Escape CUDA code for safe embedding in Python triple-quoted string
     safe_cuda = cuda_code.replace('\\', '\\\\').replace('"""', "'''")
