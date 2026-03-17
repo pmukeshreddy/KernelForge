@@ -526,7 +526,8 @@ def train(config: GRPOConfig = None):
         model = PeftModel.from_pretrained(base_model, config.adapter_path, is_trainable=True)
         
         # Enable gradient checkpointing to save VRAM
-        model.base_model.model.model.gradient_checkpointing_enable()
+        model.enable_input_require_grads()
+        model.gradient_checkpointing_enable()
     
         n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         n_total = sum(p.numel() for p in model.parameters())
@@ -677,7 +678,7 @@ def train(config: GRPOConfig = None):
                         "train/loss": total_loss_val,
                         "train/batch_mean_reward": batch_mean,
                         "train/learning_rate": config.learning_rate,
-                        "train/policy_entropy": mean_entropy,
+                        "train/mean_neg_logprob": mean_entropy,
                         "train/degenerate_groups": n_degenerate,
                         "epoch": epoch + (global_step / max(1, len(train_prompts) // config.batch_size))
                     }, step=global_step)

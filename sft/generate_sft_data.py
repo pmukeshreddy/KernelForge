@@ -12,7 +12,10 @@ discarded. Entries where a clean kernel cannot be extracted are filtered out.
 Entries are verified with `nvcc -c` before inclusion.
 """
 import json
+import os
 import re
+import subprocess
+import tempfile
 import unicodedata
 from datasets import load_dataset
 
