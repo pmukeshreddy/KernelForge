@@ -173,6 +173,13 @@ try:
     ref_model = Model(*get_init_inputs()).to(dev).eval()
     new_model = ModelNew(*get_init_inputs()).to(dev).eval()
     
+    # Align parameters so both models use the same randomly initialized weights natively
+    try:
+        new_model.load_state_dict(ref_model.state_dict())
+    except Exception as e:
+        R["compiler_error"] = f"Failed to align parameters: {e}"
+        save(R); sys.exit(0)
+    
     # 2. Dynamic Security Check (Thread Count)
     # Exclude the main thread and any Pytorch internal daemon threads gracefully
     base_threads = threading.active_count()
