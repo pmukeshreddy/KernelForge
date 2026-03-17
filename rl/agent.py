@@ -78,6 +78,21 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
     reference PyTorch code to get forward() arguments, then generates the
     complete Python wrapper with ModelNew class.
     """
+    # 0. Strip PYBIND11_MODULE block — load_inline generates its own, having two causes linker errors.
+    lines = cuda_code.split('\n')
+    result, skip, brace_depth = [], False, 0
+    for line in lines:
+        if not skip and 'PYBIND11_MODULE' in line:
+            skip = True
+            brace_depth = 0
+        if skip:
+            brace_depth += line.count('{') - line.count('}')
+            if brace_depth <= 0 and '{' in cuda_code:
+                skip = False
+            continue
+        result.append(line)
+    cuda_code = '\n'.join(result)
+
     # 1. Normalise all Tensor type spellings to torch::Tensor before any parsing.
     cuda_code = re.sub(r'\bat::Tensor\b', 'torch::Tensor', cuda_code)
     # Bare 'Tensor' (no namespace): lookbehind prevents double-expanding torch::Tensor.
