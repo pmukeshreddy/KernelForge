@@ -17,183 +17,23 @@ import argparse
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import PeftModel
-
-from sys_prompt import get_system_prompt
-
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-DEFAULT_CONFIG = {
-    "model_id": "Qwen/Qwen3-14B",
-    "adapter_path": "../sft/sft_qwen3_14b_lora",
-    "traces_path": "data/redi_traces.jsonl",
-    "output_dir": "checkpoints/kernelforge_redi",
-    "learning_rate": 5e-6,
-    "num_epochs": 2,
-    "batch_size": 4,
-    "max_grad_norm": 1.0,
-    "max_seq_len": 3072,
-    "save_steps": 100,
-}
-
-PREFILL = "```cpp\n#include <torch/extension.h>\n"
-
-
-# ---------------------------------------------------------------------------
-# Data loading
-# ---------------------------------------------------------------------------
-
-def load_traces(path: str) -> list[dict]:
-    """Load REDI traces and filter out entries with no code."""
-    traces = []
-    with open(path) as f:
-        for line in f:
-            if line.strip():
-                t = json.loads(line)
-                # Must have cuda_code for training
-                if t.get("cuda_code", "").strip():
-                    traces.append(t)
-    return traces
-
-
-def balance_traces(traces: list[dict]) -> list[dict]:
-    """
-    Roughly balance positive and negative traces.
-    Oversample the minority class to match the majority.
-    """
-    pos = [t for t in traces if t["label"] == 1]
-    neg = [t for t in traces if t["label"] == -1]
-
-    if not pos or not neg:
-        return traces
-
-    if len(pos) < len(neg):
-        # Oversample positives
-        factor = len(neg) // len(pos)
-        pos = pos * factor + random.sample(pos, min(len(neg) % len(pos), len(pos)))
-    elif len(neg) < len(pos):
-        # Oversample negatives
-        factor = len(pos) // len(neg)
-        neg = neg * factor + random.sample(neg, min(len(pos) % len(neg), len(neg)))
-
-    balanced = pos + neg
-    random.shuffle(balanced)
-    return balanced
-
-
-def build_chat_text(pytorch_code: str, cuda_code: str, tokenizer) -> str:
-    """
-    Reconstruct the chat format used during generation.
-    System + User prompt + Assistant response with the full Python ModelNew.
-    """
-    system_prompt = get_system_prompt()
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {
-            "role": "user",
-            "content": (
-                "Write an optimized CUDA kernel to replace this PyTorch "
-                "implementation.\n\n"
-                f"Reference Program:\n```python\n{pytorch_code}\n```"
-            ),
-        },
-        {
-            "role": "assistant",
-            "content": f"```python\n{cuda_code}\n```",
-        },
-    ]
-    return tokenizer.apply_chat_template(messages, tokenize=False)
-
-
-# ---------------------------------------------------------------------------
-# Training
-# ---------------------------------------------------------------------------
-
-def compute_redi_loss(
-    model,
-    tokenizer,
-    trace: dict,
-    max_seq_len: int = 3072,
-) -> torch.Tensor:
-    """
-    Compute REDI loss for one trace.
-    loss = -weight * mean(token_log_probs of assistant response)
-    Positive traces weighted by actual speedup reward (3x >> 1.01x).
-    Negative traces weighted at 1.0.
-    """
-    device = next(model.parameters()).device
-    label = trace["label"]  # +1 or -1
-    if label == 1:
-        weight = max(trace.get("reward", 1.0), 0.1)  # floor avoids zero grad on slow-but-correct
-    else:
-        weight = 1.0
-
-    # Build full chat and tokenize
-    full_text = build_chat_text(trace["pytorch_code"], trace["cuda_code"], tokenizer)
-    tokens = tokenizer(full_text, return_tensors="pt", truncation=True,
-                       max_length=max_seq_len)
-    input_ids = tokens.input_ids[0].to(device)
-
-    # Find where the assistant response starts
-    # Tokenize everything EXCEPT the assistant message to find the boundary
-    system_prompt = get_system_prompt()
-    prompt_messages = [
-        {"role": "system", "content": system_prompt},
-        {
-            "role": "user",
-            "content": (
-                "Write an optimized CUDA kernel to replace this PyTorch "
-                "implementation.\n\n"
-                f"Reference Program:\n```python\n{trace['pytorch_code']}\n```"
-            ),
-        },
-    ]
-    prompt_text = tokenizer.apply_chat_template(
-        prompt_messages, tokenize=False, add_generation_prompt=True
-    )
-    prompt_len = len(tokenizer(prompt_text, truncation=True, max_length=max_seq_len).input_ids)
-
-    if prompt_len >= len(input_ids):
-        # Response got truncated away entirely
-        return torch.tensor(0.0, device=device, requires_grad=True)
-
-    # Forward pass
-    outputs = model(input_ids=input_ids.unsqueeze(0))
-    logits = outputs.logits[0]  # [T, V]
-
-    # Token-level log probs on the response tokens only
-    resp_logits = logits[prompt_len - 1 : -1]  # [R, V] — predict next token
-    resp_targets = input_ids[prompt_len:]       # [R]
-    R = min(len(resp_logits), len(resp_targets))
-
-    if R == 0:
-        return torch.tensor(0.0, device=device, requires_grad=True)
-
-    resp_logits = resp_logits[:R]
-    resp_targets = resp_targets[:R]
-
-    log_probs = F.log_softmax(resp_logits, dim=-1)
-    token_log_probs = log_probs[range(R), resp_targets]
-
-    # REDI loss: -label * weight * mean(log_probs)
-    # positive: weight=speedup reward (3x kernel gets 3x gradient vs 1x)
-    # negative: weight=1.0 (uniform penalty)
-    loss = -label * weight * token_log_probs.mean()
-
-    return loss
-
-
-import subprocess
-import tempfile
-from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
 
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
+
+class StopTokenCriteria(StoppingCriteria):
+    def __init__(self, stop_token_ids):
+        self.stop_token_ids = stop_token_ids
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+        # Check if the last sequence of tokens matches any of our stop token sequences
+        for stop_seq in self.stop_token_ids:
+            if input_ids.shape[-1] >= len(stop_seq):
+                if torch.all(input_ids[0, -len(stop_seq):] == stop_seq):
+                    return True
+        return False
 
 def evaluate_compile_rate(model, tokenizer, eval_prompts: list[dict], max_seq_len: int = 3072) -> float:
     """
@@ -207,6 +47,10 @@ def evaluate_compile_rate(model, tokenizer, eval_prompts: list[dict], max_seq_le
     model.eval()
     device = next(model.parameters()).device
     successes = 0
+    
+    # Define stop tokens for "```" to prevent hallucinating markdown into the C++ file
+    stop_tokens = tokenizer("```", add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+    stopping_criteria = StoppingCriteriaList([StopTokenCriteria([stop_tokens[0]])])
 
     with tempfile.TemporaryDirectory() as tmpdir:
         for i, trace in enumerate(tqdm(eval_prompts, desc="Evaluating", leave=False)):
@@ -235,28 +79,16 @@ def evaluate_compile_rate(model, tokenizer, eval_prompts: list[dict], max_seq_le
                     max_new_tokens=1500,
                     pad_token_id=tokenizer.eos_token_id,
                     do_sample=False, # greedy for Pass@1 eval
+                    stopping_criteria=stopping_criteria
                 )
             
             # Extract only the generated response
             gen_ids = output_ids[0][inputs.input_ids.shape[1]:]
             response_text = PREFILL + tokenizer.decode(gen_ids, skip_special_tokens=True)
             
-            # Extract ```cpp blocks
-            cuda_code = ""
-            if "```cpp" in response_text:
-                parts = response_text.split("```cpp")
-                if len(parts) > 1:
-                    cuda_code = parts[1].split("```")[0].strip()
-            elif "```c++" in response_text:
-                parts = response_text.split("```c++")
-                if len(parts) > 1:
-                    cuda_code = parts[1].split("```")[0].strip()
-            
-            if not cuda_code:
-                # Debug why no C++ was extracted
-                if i == 0:
-                    print(f"\n[Eval Error Debug] Failed to extract C++ code. Raw response:\n{response_text[:500]}...\n")
-                continue
+            # The model was forced to start with PREFILL, so response_text IS the C++ block
+            # Just strip off the trailing ``` if it generated it
+            cuda_code = response_text.split("```")[0].strip()
                 
             # Test Compile
             cu_file = os.path.join(tmpdir, f"test_{i}.cu")
