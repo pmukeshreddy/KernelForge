@@ -177,7 +177,7 @@ try:
     try:
         new_model.load_state_dict(ref_model.state_dict())
     except Exception as e:
-        R["compiler_error"] = f"Failed to align parameters: {e}"
+        R["compiler_error"] = "Failed to align parameters: " + str(e)
         save(R); sys.exit(0)
     
     # 2. Dynamic Security Check (Thread Count)
