@@ -19,6 +19,7 @@ import re
 import random
 from dataclasses import dataclass
 
+import math
 import torch
 import torch.nn.functional as F
 import wandb
@@ -64,9 +65,10 @@ class GRPOConfig:
     group_size: int = 16              # G trajectories per prompt (Kevin uses 16, gives more stable advantage estimates)
 
     # GRPO + DAPO hyperparameters
-    grpo_epochs: int = 4              # gradient updates per batch
+    grpo_epochs: int = 2              # gradient updates per batch
     batch_size: int = 4               # prompts per batch
     learning_rate: float = 1e-6
+    warmup_steps: int = 10            # cosine schedule warmup (noisy advantages early in training)
     cliprange_low: float = 0.2        # standard lower clip
     cliprange_high: float = 0.28      # DAPO Clip-Higher (asymmetric)
     max_grad_norm: float = 1.0
@@ -570,6 +572,18 @@ def train(config: GRPOConfig = None):
 
     os.makedirs(config.output_dir, exist_ok=True)
 
+    # Cosine LR schedule with linear warmup — stabilizes early steps when advantages are noisy
+    total_steps = max(1, (len(train_prompts) // config.batch_size) * config.num_train_epochs)
+    warmup_steps = config.warmup_steps
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))  # floor at 10% of peak lr
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
     print(
         f"\n🚀 Multi-Turn GRPO+DAPO Training\n"
         f"   group_size={config.group_size}, max_react_steps={config.max_react_steps}, "
@@ -663,6 +677,7 @@ def train(config: GRPOConfig = None):
 
                 torch.nn.utils.clip_grad_norm_(trainable_params, config.max_grad_norm)
                 optimizer.step()
+                scheduler.step()
                 
                 if not config.mock_mode:
                     # Compute mean policy entropy from old log probs as collapse indicator
@@ -677,9 +692,9 @@ def train(config: GRPOConfig = None):
                     wandb.log({
                         "train/loss": total_loss_val,
                         "train/batch_mean_reward": batch_mean,
-                        "train/learning_rate": config.learning_rate,
                         "train/mean_neg_logprob": mean_entropy,
                         "train/degenerate_groups": n_degenerate,
+                        "train/learning_rate": scheduler.get_last_lr()[0],
                         "epoch": epoch + (global_step / max(1, len(train_prompts) // config.batch_size))
                     }, step=global_step)
 
