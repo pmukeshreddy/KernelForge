@@ -43,7 +43,7 @@ torch::Tensor my_op(torch::Tensor x) {
 }
 ```
 
-# CUDA Optimization Playbook (A100 Architecture)
+# CUDA Optimization Playbook (H100/H200 Architecture, sm_90)
 
 When you receive Profiler Feedback, use these strategies to resolve bottlenecks:
 
@@ -55,7 +55,7 @@ If Memory Throughput > ~70% of peak, the SMs are starving for data.
   float4 val = reinterpret_cast<const float4*>(in)[idx];
   ```
 - **Shared Memory Caching**: If multiple threads read the same data, load it into `__shared__` memory once per block, `__syncthreads()`, and have threads read from the fast shared memory.
-- **L2 Cache Reuse**: Re-order loops (blocking/tiling) to keep working sets inside the 40MB L2 cache.
+- **L2 Cache Reuse**: Re-order loops (blocking/tiling) to keep working sets inside the 50MB L2 cache (H100/H200).
 
 ## 2. Compute-Bound
 If Compute Throughput > ~70% of peak, the FP32/FP64 mathematical units are saturated.
@@ -70,7 +70,7 @@ If Compute Throughput > ~70% of peak, the FP32/FP64 mathematical units are satur
 ## 3. Latency-Bound (Poor Occupancy)
 If Warp Occupancy is low (< 40%), the SM doesn't have enough active warps to hide memory/instruction latency.
 - **Register Pressure**: If a kernel uses > 64 registers per thread, fewer blocks can fit on the SM. Simplify local variables, or force limits via `__launch_bounds__(maxThreadsPerBlock, minBlocksPerMultiprocessor)`.
-- **Shared Memory Limits**: The A100 has 164KB of shared memory per SM. If your block uses 48KB, only 3 blocks can fit (144KB). Reduce shared memory size, or increase the work done per block.
+- **Shared Memory Limits**: The H100/H200 has 228KB of shared memory per SM. If your block uses 48KB, only 4 blocks can fit (192KB). Reduce shared memory size, or increase the work done per block.
 - **Block Sizing**: Always use block sizes that are multiples of 32 (preferably 128, 256, or 512). Very small blocks (e.g., 32 threads) waste SM resources due to block allocation overhead.
 - **Excessive Synchronization**: Avoid `__syncthreads()` inside heavy loops unless absolutely necessary for data correctness.
 
