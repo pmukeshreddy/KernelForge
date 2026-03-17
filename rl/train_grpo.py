@@ -368,6 +368,10 @@ def _run_group_episodes(
 
         # 3. Parallel Evaluation
         # First, extract code quickly
+        # DEBUG: print first response to see what model is actually generating
+        if step == 0 and response_texts:
+            print(f"\n  [DEBUG] Sample response (first 400 chars):\n  {repr(response_texts[0][:400])}\n")
+
         candidates = []
         error_msgs = []
         for resp in response_texts:
@@ -376,7 +380,7 @@ def _run_group_episodes(
                 candidates.append(None)
                 error_msgs.append("Error: No ```cpp block found. Output CUDA C++ in a ```cpp code block.")
                 continue
-            
+
             cand_code = build_load_inline_wrapper(cuda_code, prompt_text)
             if not cand_code:
                 candidates.append(None)
