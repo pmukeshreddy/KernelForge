@@ -83,9 +83,15 @@ class GRPOConfig:
     wandb_project: str = "kernelforge-rl"
     wandb_run_name: str = "grpo-qwen-14b"
 
-    # Reward shaping
-    reward_failure: float = -1.0
-    reward_no_code: float = -1.0
+    # Reward shaping (graduated — creates gradient signal at every failure stage)
+    reward_no_code: float = -1.0      # no ```cpp block found at all
+    reward_compile_fail: float = -0.5 # code found but fails to compile or wrap
+    reward_wrong_output: float = -0.1 # compiles but produces wrong outputs
+    reward_correct_base: float = 0.3  # base bonus for any correct kernel (Kevin's approach)
+
+    # Dynamic Sampling: skip degenerate groups where all rewards are identical
+    dynamic_sampling: bool = True
+    max_resample_attempts: int = 3
 
 
 # ---------------------------------------------------------------------------
@@ -239,18 +245,22 @@ def _run_group_episodes(
             length_penalty = -0.001 * gen_len
             
             if eval_res is None:
-                # Syntax or wrapper error
-                base_r = config.reward_no_code if error_msgs[batch_idx].startswith("Error: No ```cpp") else config.reward_failure
+                # No code block or no binding function found
+                base_r = config.reward_no_code if error_msgs[batch_idx].startswith("Error: No ```cpp") else config.reward_compile_fail
                 per_turn_rewards_list[traj_idx].append(base_r + length_penalty)
                 messages_list[traj_idx].append({
                     "role": "user",
                     "content": error_msgs[batch_idx],
                 })
                 continue
-                
+
             if not eval_res["correct"]:
-                # Logic or compilation error
-                per_turn_rewards_list[traj_idx].append(config.reward_failure + length_penalty)
+                # Distinguish compile failure from wrong output — different gradient signal
+                if not eval_res.get("compiles", False):
+                    base_r = config.reward_compile_fail   # -0.5: compiled but linker/nvcc error
+                else:
+                    base_r = config.reward_wrong_output   # -0.1: compiled, ran, but wrong answer
+                per_turn_rewards_list[traj_idx].append(base_r + length_penalty)
                 error = eval_res.get("compiler_error", "Outputs do not match.")
                 messages_list[traj_idx].append({
                     "role": "user",
@@ -261,8 +271,8 @@ def _run_group_episodes(
                 })
                 continue
 
-            # Success
-            reward = calculate_reward(eval_res) + length_penalty
+            # Success: base bonus + speedup (Kevin's approach — separates correct-but-slow from failures)
+            reward = config.reward_correct_base + calculate_reward(eval_res) + length_penalty
             per_turn_rewards_list[traj_idx].append(reward)
             runtime_ms = eval_res["runtime_ms"]
             print(f"    ✅ Traj {traj_idx+1} Step {step+1}: {runtime_ms:.3f}ms, {reward:.2f}x")
@@ -586,15 +596,28 @@ def train(config: GRPOConfig = None):
             all_group_turns:   list[list[list[TurnData]]] = []  # [B][G][turns]
             all_group_rewards: list[list[float]] = []            # [B][G]
 
+            n_degenerate = 0
             for p_idx, prompt_text in enumerate(batch):
                 print(f"\n[Prompt {p_idx+1}/{len(batch)}] Generating {config.group_size} trajectories (batched/parallel)...")
                 group_turns, group_rewards = _run_group_episodes(prompt_text, model, tokenizer, config)
+
+                # Dynamic Sampling: if all rewards are identical, resample (DAPO)
+                if config.dynamic_sampling:
+                    for attempt in range(1, config.max_resample_attempts):
+                        reward_std = torch.tensor(group_rewards).std().item()
+                        if reward_std > 1e-4:
+                            break
+                        n_degenerate += 1
+                        print(f"  [Dynamic Sampling] Degenerate group (std={reward_std:.6f}), resampling attempt {attempt+1}/{config.max_resample_attempts}...")
+                        group_turns, group_rewards = _run_group_episodes(prompt_text, model, tokenizer, config)
+
                 all_group_turns.append(group_turns)
                 all_group_rewards.append(group_rewards)
 
                 mean_r = sum(group_rewards) / len(group_rewards)
                 best_r = max(group_rewards)
-                print(f"  Group: mean={mean_r:.2f}, best={best_r:.2f}")
+                reward_std = torch.tensor(group_rewards).std().item()
+                print(f"  Group: mean={mean_r:.2f}, best={best_r:.2f}, std={reward_std:.3f}")
 
             batch_mean = sum(
                 sum(rs) / len(rs) for rs in all_group_rewards
@@ -640,10 +663,21 @@ def train(config: GRPOConfig = None):
                 optimizer.step()
                 
                 if not config.mock_mode:
+                    # Compute mean policy entropy from old log probs as collapse indicator
+                    all_lp_vals = [
+                        lp for group in all_old_lps
+                        for turn_lps in group
+                        for lp in turn_lps
+                        if len(lp) > 0
+                    ]
+                    mean_entropy = float(-torch.cat(all_lp_vals).mean()) if all_lp_vals else 0.0
+
                     wandb.log({
                         "train/loss": total_loss_val,
                         "train/batch_mean_reward": batch_mean,
                         "train/learning_rate": config.learning_rate,
+                        "train/policy_entropy": mean_entropy,
+                        "train/degenerate_groups": n_degenerate,
                         "epoch": epoch + (global_step / max(1, len(prompts) // config.batch_size))
                     }, step=global_step)
 
@@ -681,11 +715,12 @@ if __name__ == "__main__":
     parser.add_argument("--group_size", type=int, default=16)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-6)
-    parser.add_argument("--grpo_epochs", type=int, default=4)
+    parser.add_argument("--grpo_epochs", type=int, default=2, help="Gradient updates per rollout (2 reduces staleness vs original 4)")
     parser.add_argument("--wandb_project", type=str, default="kernelforge-rl")
     parser.add_argument("--wandb_name", type=str, default="grpo-qwen-14b")
     parser.add_argument("--resume", action="store_true", help="Resume from output_dir if it exists")
     parser.add_argument("--mock_mode", action="store_true")
+    parser.add_argument("--no_dynamic_sampling", action="store_true", help="Disable DAPO dynamic sampling")
     args = parser.parse_args()
 
     cfg = GRPOConfig(
@@ -701,6 +736,7 @@ if __name__ == "__main__":
         mock_mode=args.mock_mode,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_name,
+        dynamic_sampling=not args.no_dynamic_sampling,
     )
     
     # Simple resume logic: swap base model for output_dir if resuming
