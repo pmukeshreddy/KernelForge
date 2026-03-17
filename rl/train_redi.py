@@ -258,8 +258,18 @@ def evaluate_compile_rate(model, tokenizer, eval_prompts: list[dict], max_seq_le
             gen_ids = output_ids[0][inputs.input_ids.shape[1]:]
             response_text = PREFILL + tokenizer.decode(gen_ids, skip_special_tokens=True)
             
-            # Extract ```cpp blocks
-            cuda_code = response_text.split("```")[0].strip()
+            # Extract ```cpp blocks cleanly
+            cuda_code = response_text
+            if "```cpp" in cuda_code:
+                parts = cuda_code.split("```cpp")
+                if len(parts) > 1:
+                    cuda_code = parts[1].split("```")[0].strip()
+            elif "```c++" in cuda_code:
+                parts = cuda_code.split("```c++")
+                if len(parts) > 1:
+                    cuda_code = parts[1].split("```")[0].strip()
+            else:
+                cuda_code = cuda_code.split("```")[0].strip()
             
             if not cuda_code:
                 # Debug why no C++ was extracted
