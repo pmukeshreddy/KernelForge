@@ -739,7 +739,7 @@ def train(config: GRPOConfig = None):
 
     # Launch SGLang server if enabled
     if not config.mock_mode and config.use_sglang:
-        if not SGLANG_AVAILABLE:
+        if not SGLANG_AVAILABLE and not config.sglang_python:
             raise RuntimeError("use_sglang=True but sglang is not installed. Run: pip install sglang")
         import atexit
         global _sglang_server
