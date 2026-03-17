@@ -44,7 +44,9 @@ def profile_kernel(kernel_code: str, reference_code: str, timeout: int = 120) ->
         # Run ncu targeting specific metrics via CSV output
         env = os.environ.copy()
         env["PYTHONPATH"] = tmpdir
-        env["TORCH_EXTENSIONS_DIR"] = os.path.join(tmpdir, "torch_ext")
+        cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".kf_compilation_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        env["TORCH_EXTENSIONS_DIR"] = cache_dir
         if "TORCH_CUDA_ARCH_LIST" not in env:
             env["TORCH_CUDA_ARCH_LIST"] = "9.0"
 
