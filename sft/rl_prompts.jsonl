@@ -1,0 +1,1 @@
+{"pytorch_code": "import torch\n\nclass Model(torch.nn.Module):\n    def forward(self, x):\n        return torch.relu(x)\n\ndef get_inputs():\n    return [torch.randn(16, 16384)]\n\ndef get_init_inputs():\n    return []\n"}
