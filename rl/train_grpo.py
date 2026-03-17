@@ -21,6 +21,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+import wandb
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
@@ -304,7 +305,7 @@ def _run_group_episodes(
         total = sum(
             (config.reward_discount ** t) * r
             for t, r in enumerate(r_list)
-        ) if r_list else config.reward_failure
+        ) if r_list else config.reward_compile_fail
         group_rewards.append(total)
 
     return turns_list, group_rewards
