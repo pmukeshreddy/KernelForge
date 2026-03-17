@@ -871,7 +871,7 @@ def train(config: GRPOConfig = None):
 
             global_step += 1
             
-            if global_step % config.eval_steps == 0 or global_step == 1:
+            if global_step % config.eval_steps == 0:
                 eval_metrics = _run_evaluation(model, tokenizer, config, val_prompts)
                 if not config.mock_mode:
                     wandb.log(eval_metrics, step=global_step)
