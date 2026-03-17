@@ -224,6 +224,9 @@ def evaluate_compile_rate(model, tokenizer, eval_prompts: list[dict], max_seq_le
             ]
             
             prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            # Force the model to start writing the C++ block using the global PREFILL
+            prompt_text += PREFILL
+            
             inputs = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=1500).to(device)
             
             with torch.no_grad():
@@ -236,7 +239,7 @@ def evaluate_compile_rate(model, tokenizer, eval_prompts: list[dict], max_seq_le
             
             # Extract only the generated response
             gen_ids = output_ids[0][inputs.input_ids.shape[1]:]
-            response_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+            response_text = PREFILL + tokenizer.decode(gen_ids, skip_special_tokens=True)
             
             # Extract ```cpp blocks
             cuda_code = ""
