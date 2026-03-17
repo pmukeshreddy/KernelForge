@@ -187,6 +187,99 @@ def compute_redi_loss(
     return loss
 
 
+import subprocess
+import tempfile
+from tqdm import tqdm
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+def evaluate_compile_rate(model, tokenizer, eval_prompts: list[dict], max_seq_len: int = 3072) -> float:
+    """
+    Generates CUDA code for the evaluation prompts and attempts to compile it using nvcc.
+    Returns the Pass@1 compile rate (%).
+    """
+    if not eval_prompts:
+        return 0.0
+
+    print("\n[Eval] Running Compile Rate Pass@1 Evaluation...")
+    model.eval()
+    device = next(model.parameters()).device
+    successes = 0
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for i, trace in enumerate(tqdm(eval_prompts, desc="Evaluating", leave=False)):
+            system_prompt = get_system_prompt()
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": (
+                        "Write an optimized CUDA kernel to replace this PyTorch "
+                        "implementation.\n\n"
+                        f"Reference Program:\n```python\n{trace['pytorch_code']}\n```"
+                    ),
+                },
+            ]
+            
+            prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            inputs = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=1500).to(device)
+            
+            with torch.no_grad():
+                output_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=1500,
+                    pad_token_id=tokenizer.eos_token_id,
+                    do_sample=False, # greedy for Pass@1 eval
+                )
+            
+            # Extract only the generated response
+            gen_ids = output_ids[0][inputs.input_ids.shape[1]:]
+            response_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+            
+            # Extract ```cpp blocks
+            cuda_code = ""
+            if "```cpp" in response_text:
+                parts = response_text.split("```cpp")
+                if len(parts) > 1:
+                    cuda_code = parts[1].split("```")[0].strip()
+            elif "```c++" in response_text:
+                parts = response_text.split("```c++")
+                if len(parts) > 1:
+                    cuda_code = parts[1].split("```")[0].strip()
+            
+            if not cuda_code:
+                continue
+                
+            # Test Compile
+            cu_file = os.path.join(tmpdir, f"test_{i}.cu")
+            obj_file = os.path.join(tmpdir, f"test_{i}.o")
+            with open(cu_file, "w") as f:
+                f.write(cuda_code)
+                
+            # PyTorch includes needed for compilation
+            torch_inc = "-I/usr/local/lib/python3.10/dist-packages/torch/include"
+            torch_inc2 = "-I/usr/local/lib/python3.10/dist-packages/torch/include/torch/csrc/api/include"
+            
+            try:
+                # Add basic torch headers to nvcc include path just in case
+                cmd = ["nvcc", "-c", cu_file, "-o", obj_file, torch_inc, torch_inc2, "-std=c++17"]
+                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+                if result.returncode == 0:
+                    successes += 1
+            except Exception as e:
+                pass
+
+    model.train()
+    pass_rate = (successes / len(eval_prompts)) * 100
+    print(f"[Eval] Compile Rate (Pass@1): {pass_rate:.1f}% ({successes}/{len(eval_prompts)})")
+    return pass_rate
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+
 def train(config: dict = None):
     if config is None:
         config = DEFAULT_CONFIG.copy()
@@ -199,6 +292,19 @@ def train(config: dict = None):
 
     traces = balance_traces(raw_traces)
     print(f"Balanced traces: {len(traces)}")
+    
+    # Load Evaluation Prompts
+    eval_prompts = []
+    if config.get("eval_path") and os.path.exists(config["eval_path"]):
+        print(f"Loading eval prompts from {config['eval_path']}...")
+        with open(config["eval_path"]) as f:
+            for line in f:
+                if line.strip():
+                    eval_prompts.append(json.loads(line))
+        # Just grab 20 random prompts for fast eval
+        if len(eval_prompts) > 20:
+            eval_prompts = random.sample(eval_prompts, 20)
+        print(f"Loaded {len(eval_prompts)} eval prompts for Compile Rate testing.")
 
     tokenizer = AutoTokenizer.from_pretrained(config["model_id"], trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
@@ -229,47 +335,56 @@ def train(config: dict = None):
     print(f"\n🚀 REDI Training")
     print(f"   epochs={config['num_epochs']}, batch_size={batch_size}, lr={config['learning_rate']}")
 
+    # Initial Eval
+    if eval_prompts:
+        evaluate_compile_rate(model, tokenizer, eval_prompts)
+
     global_step = 0
+    total_steps = (len(traces) // batch_size) * config["num_epochs"]
 
-    for epoch in range(config["num_epochs"]):
-        random.shuffle(traces)
-        epoch_loss = 0.0
-        n_batches = 0
+    with tqdm(total=total_steps, desc="Training") as pbar:
+        for epoch in range(config["num_epochs"]):
+            random.shuffle(traces)
+            epoch_loss = 0.0
+            n_batches = 0
 
-        for batch_start in range(0, len(traces), batch_size):
-            batch = traces[batch_start : batch_start + batch_size]
+            for batch_start in range(0, len(traces), batch_size):
+                batch = traces[batch_start : batch_start + batch_size]
 
-            optimizer.zero_grad()
-            batch_loss_val = 0.0
-            n_valid = 0
+                optimizer.zero_grad()
+                batch_loss_val = 0.0
+                n_valid = 0
 
-            for trace in batch:
-                loss = compute_redi_loss(model, tokenizer, trace, max_seq_len)
-                if loss.requires_grad:
-                    (loss / len(batch)).backward()
-                    batch_loss_val += loss.item()
-                    n_valid += 1
+                for trace in batch:
+                    loss = compute_redi_loss(model, tokenizer, trace, max_seq_len)
+                    if loss.requires_grad:
+                        (loss / len(batch)).backward()
+                        batch_loss_val += loss.item()
+                        n_valid += 1
 
-            if n_valid > 0:
-                torch.nn.utils.clip_grad_norm_(trainable_params, config["max_grad_norm"])
-                optimizer.step()
+                if n_valid > 0:
+                    torch.nn.utils.clip_grad_norm_(trainable_params, config["max_grad_norm"])
+                    optimizer.step()
 
-            epoch_loss += batch_loss_val
-            n_batches += 1
-            global_step += 1
+                epoch_loss += batch_loss_val
+                n_batches += 1
+                global_step += 1
+                
+                avg_loss = epoch_loss / max(n_batches, 1)
+                pbar.update(1)
+                pbar.set_postfix({"loss": f"{avg_loss:.4f}"})
 
-            if global_step % 20 == 0:
-                avg = epoch_loss / max(n_batches, 1)
-                print(f"  [Epoch {epoch+1} | Step {global_step}] avg_loss={avg:.4f}")
+                if global_step % config["save_steps"] == 0:
+                    ckpt = f"{config['output_dir']}/step_{global_step}"
+                    model.save_pretrained(ckpt)
+                    tokenizer.save_pretrained(ckpt)
+                    tqdm.write(f"  Checkpoint → {ckpt}")
+                    
+                    if eval_prompts:
+                        evaluate_compile_rate(model, tokenizer, eval_prompts)
 
-            if global_step % config["save_steps"] == 0:
-                ckpt = f"{config['output_dir']}/step_{global_step}"
-                model.save_pretrained(ckpt)
-                tokenizer.save_pretrained(ckpt)
-                print(f"  Checkpoint → {ckpt}")
-
-        avg_loss = epoch_loss / max(n_batches, 1)
-        print(f"Epoch {epoch+1} complete. avg_loss={avg_loss:.4f}")
+    if eval_prompts:
+        evaluate_compile_rate(model, tokenizer, eval_prompts)
 
     model.save_pretrained(config["output_dir"])
     tokenizer.save_pretrained(config["output_dir"])
@@ -279,6 +394,7 @@ def train(config: dict = None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="REDI Training")
     parser.add_argument("--traces", type=str, default="data/redi_traces.jsonl")
+    parser.add_argument("--eval_data", type=str, default="../sft/sft_training_pairs.jsonl")
     parser.add_argument("--output_dir", type=str, default="checkpoints/kernelforge_redi")
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-14B")
     parser.add_argument("--adapter", type=str, default="../sft/sft_qwen3_14b_lora")
@@ -292,6 +408,7 @@ if __name__ == "__main__":
         "model_id": args.model,
         "adapter_path": args.adapter,
         "traces_path": args.traces,
+        "eval_path": args.eval_data,
         "output_dir": args.output_dir,
         "learning_rate": args.lr,
         "num_epochs": args.epochs,
