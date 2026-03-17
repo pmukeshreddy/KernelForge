@@ -164,6 +164,15 @@ def launch_sglang_server(model_path: str, adapter_path: str, port: int, tp: int,
         merged = PeftModel.from_pretrained(base, adapter_path).merge_and_unload()
         merged.save_pretrained(merged_path)
         AutoTokenizer.from_pretrained(model_path, trust_remote_code=True).save_pretrained(merged_path)
+        # Fix Qwen3 tokenizer_config.json: extra_special_tokens saved as list, SGLang needs dict
+        import json as _json
+        tok_cfg_path = os.path.join(merged_path, "tokenizer_config.json")
+        with open(tok_cfg_path) as _f:
+            tok_cfg = _json.load(_f)
+        if isinstance(tok_cfg.get("extra_special_tokens"), list):
+            tok_cfg["extra_special_tokens"] = {}
+            with open(tok_cfg_path, "w") as _f:
+                _json.dump(tok_cfg, _f, indent=2)
         del base, merged
         torch.cuda.empty_cache()
         print(f"[SGLang] Merge complete.")
