@@ -46,7 +46,7 @@ def profile_kernel(kernel_code: str, reference_code: str, timeout: int = 120) ->
         env["PYTHONPATH"] = tmpdir
         env["TORCH_EXTENSIONS_DIR"] = os.path.join(tmpdir, "torch_ext")
         if "TORCH_CUDA_ARCH_LIST" not in env:
-            env["TORCH_CUDA_ARCH_LIST"] = "8.0"
+            env["TORCH_CUDA_ARCH_LIST"] = "9.0"
 
         # Explicitly profile the custom kernel, not PyTorch overhead
         metrics = [
