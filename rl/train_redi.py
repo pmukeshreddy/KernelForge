@@ -256,30 +256,20 @@ def evaluate_compile_rate(model, tokenizer, eval_prompts: list[dict], max_seq_le
             
             # Extract only the generated response
             gen_ids = output_ids[0][inputs.input_ids.shape[1]:]
-            response_text = PREFILL + tokenizer.decode(gen_ids, skip_special_tokens=True)
+            response_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
             
-            # Extract ```cpp blocks cleanly
-            cuda_code = response_text
-            if "```cpp" in cuda_code:
-                parts = cuda_code.split("```cpp")
-                if len(parts) > 1:
-                    cuda_code = parts[1].split("```")[0].strip()
-            elif "```c++" in cuda_code:
-                parts = cuda_code.split("```c++")
-                if len(parts) > 1:
-                    cuda_code = parts[1].split("```")[0].strip()
-            else:
-                cuda_code = cuda_code.split("```")[0].strip()
+            # The prompt already ended with PREFILL ("```cpp\n#include <torch/extension.h>\n"), 
+            # so the model's generated text is the CONTINUATION of that C++ code.
+            # We must prepend PREFILL back to make it a valid, complete C++ file.
+            cuda_code = PREFILL + response_text
             
-            if not cuda_code:
-                # Debug why no C++ was extracted
-                if i == 0:
-                    print(f"\n[Eval Error Debug] Failed to extract C++ code. Raw response:\n{response_text[:500]}...\n")
-                continue
-                
-            # Print the successfully extracted code to verify
+            # Extract only the actual C++ code if the model generated closing backticks
+            if "```" in response_text:
+                cuda_code = (PREFILL + response_text).split("```")[0].strip()
+            
             if i == 0:
-                print(f"\n[Eval Debug] Successfully extracted C++ code (first 500 chars):\n{cuda_code[:500]}...\n")
+                print(f"\n[Eval Debug] Full Prompt:\n{prompt_text}\n")
+                print(f"[Eval Debug] Successfully extracted C++ code (first 500 chars):\n{cuda_code[:500]}...\n")
                 
             # Test Compile
             cu_file = os.path.join(tmpdir, f"test_{i}.cu")
