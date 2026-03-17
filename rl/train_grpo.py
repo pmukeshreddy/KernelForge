@@ -226,26 +226,28 @@ def sync_weights_to_sglang(model, port: int):
 def _generate_with_sglang(context_texts: list[str], config: "GRPOConfig") -> list[str]:
     """
     Generate completions for a batch of prompts via the SGLang server.
+    Sends all prompts in one batch request — SGLang processes them in parallel.
     RadixAttention automatically caches the shared system prompt prefix.
     """
     import requests
-    responses = []
-    for ctx in context_texts:
-        payload = {
-            "text": ctx,
-            "sampling_params": {
-                "max_new_tokens": config.max_new_tokens,
-                "temperature": config.temperature,
-            },
-        }
-        resp = requests.post(
-            f"http://localhost:{config.sglang_port}/generate",
-            json=payload,
-            timeout=120,
-        )
-        resp.raise_for_status()
-        responses.append(resp.json()["text"])
-    return responses
+    payload = {
+        "text": context_texts,
+        "sampling_params": {
+            "max_new_tokens": config.max_new_tokens,
+            "temperature": config.temperature,
+        },
+    }
+    resp = requests.post(
+        f"http://localhost:{config.sglang_port}/generate",
+        json=payload,
+        timeout=300,
+    )
+    resp.raise_for_status()
+    result = resp.json()
+    # SGLang returns a list when input is a list
+    if isinstance(result, list):
+        return [r["text"] for r in result]
+    return [result["text"]]
 
 
 # ---------------------------------------------------------------------------
