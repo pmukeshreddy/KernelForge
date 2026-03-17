@@ -305,7 +305,7 @@ def _run_group_episodes(
         for i in active_indices:
             ctx = tokenizer.apply_chat_template(
                 messages_list[i], tokenize=False, add_generation_prompt=True
-            ) + PREFILL
+            )
             context_texts.append(ctx)
 
         # 2. Generation — SGLang server or fallback to model.generate()
@@ -350,7 +350,7 @@ def _run_group_episodes(
                 gen_text = generated_texts[batch_idx]
                 gen_ids = tokenizer(gen_text, return_tensors="pt").input_ids[0]
 
-                resp_text = PREFILL + gen_text
+                resp_text = gen_text
                 response_texts.append(resp_text)
                 
                 # Save history
