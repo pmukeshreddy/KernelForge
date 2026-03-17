@@ -23,6 +23,8 @@ import sys
 import argparse
 from typing import Optional
 
+import re
+
 from agent import build_load_inline_wrapper, _fix_cuda_api
 from reward import calculate_reward
 from sandbox import evaluate
@@ -36,6 +38,31 @@ def _sanitize(text: str) -> str:
         .replace('\u201c', '"').replace('\u201d', '"')
         .replace('\u2013', '-').replace('\u2014', '--')
         .encode('ascii', 'replace').decode('ascii'))
+
+
+def _strip_pybind(cuda_code: str) -> str:
+    """Remove PYBIND11_MODULE(...) blocks from CUDA code.
+    
+    SakanaAI kernels include their own PYBIND11_MODULE, but load_inline
+    generates one automatically. Having two causes duplicate symbol linker errors.
+    """
+    # Remove PYBIND11_MODULE block with balanced braces
+    result = []
+    i = 0
+    lines = cuda_code.split('\n')
+    skip = False
+    brace_depth = 0
+    for line in lines:
+        if not skip and 'PYBIND11_MODULE' in line:
+            skip = True
+            brace_depth = 0
+        if skip:
+            brace_depth += line.count('{') - line.count('}')
+            if brace_depth <= 0 and '{' in cuda_code:
+                skip = False
+            continue
+        result.append(line)
+    return '\n'.join(result)
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +80,9 @@ def _process_entry(
     print(f"[{idx+1}/{total}] ({level_id}) Wrapping and evaluating...", flush=True)
     pytorch_code = _sanitize(pytorch_code)
     cuda_kernel = _sanitize(cuda_kernel)
+
+    # Strip PYBIND11_MODULE — load_inline generates its own
+    cuda_kernel = _strip_pybind(cuda_kernel)
 
     trace = {
         "pytorch_code": pytorch_code,

@@ -1,8 +1,10 @@
 """Debug script: show what wrapper code is generated for the first entry and full error."""
 import json
 import sys
+import re
 from agent import build_load_inline_wrapper, _fix_cuda_api
 from sandbox import evaluate
+from collect_redi_data import _strip_pybind
 
 dataset = sys.argv[1] if len(sys.argv) > 1 else "../sft/sft_training_pairs.jsonl"
 
@@ -25,6 +27,12 @@ print("\n" + "=" * 60)
 print("CUDA KERNEL (first 800 chars):")
 print("=" * 60)
 print(cuda_kernel[:800])
+
+print("\n" + "=" * 60)
+print("STRIPPING PYBIND11_MODULE...")
+print("=" * 60)
+cuda_kernel = _strip_pybind(cuda_kernel)
+print(f"After strip (last 200 chars): ...{cuda_kernel[-200:]}")
 
 print("\n" + "=" * 60)
 print("BUILDING WRAPPER...")
