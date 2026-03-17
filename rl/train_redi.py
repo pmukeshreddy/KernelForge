@@ -85,29 +85,60 @@ def balance_traces(traces: list[dict]) -> list[dict]:
     return balanced
 
 
-def build_chat_text(pytorch_code: str, cuda_code: str, tokenizer) -> str:
-    """
-    Reconstruct the chat format used during generation.
-    System + User prompt + Assistant response with the full Python ModelNew.
-    """
-    system_prompt = get_system_prompt()
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {
-            "role": "user",
-            "content": (
-                "Write an optimized CUDA kernel to replace this PyTorch "
-                "implementation.\n\n"
-                f"Reference Program:\n```python\n{pytorch_code}\n```"
-            ),
-        },
-        {
-            "role": "assistant",
-            "content": f"```python\n{cuda_code}\n```",
-        },
-    ]
-    return tokenizer.apply_chat_template(messages, tokenize=False)
+# ---------------------------------------------------------------------------
+# SFT Format Compatibility
+# ---------------------------------------------------------------------------
+# The model was fine-tuned on raw text matching this exact format, not standard chat templates.
 
+SYSTEM = """<|im_start|>system
+You are an expert NVIDIA CUDA Systems Engineer.
+Your objective is to write optimized CUDA C++ kernels to replace PyTorch operations.
+
+# Constraints
+- Write valid CUDA C++ with `#include <torch/extension.h>` and `#include <cuda_runtime.h>`.
+- Write a `__global__ void` kernel with proper thread indexing.
+- Write a C++ binding function returning `torch::Tensor` using PyTorch C++ API.
+- Input tensors are `float32` by default. Use `float*` pointers and `data_ptr<float>()`.
+- Do NOT use cuBLAS, cuDNN, or CUTLASS.
+
+# Output Format
+Output EXACTLY ONE ```cpp code block containing your kernel and binding function.
+
+# Common Bugs to Avoid
+- Use `fmaxf`/`fminf` in device code, NOT `std::max`/`std::min`.
+- Max 1024 threads per block. For 2D blocks: blockDim.x * blockDim.y <= 1024.
+- Declare `__shared__` arrays INSIDE the kernel function body.
+- Use `torch::empty_like(input)` to preserve tensor shape and dtype.
+<|im_end|>
+"""
+
+FORMAT_EXAMPLE = """Here is an example of the expected output format:
+
+```cpp
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void add_kernel(const float* a, const float* b, float* out, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) out[idx] = a[idx] + b[idx];
+}
+
+torch::Tensor add_cuda(torch::Tensor a, torch::Tensor b) {
+    auto out = torch::empty_like(a);
+    int n = a.numel();
+    add_kernel<<<(n + 255) / 256, 256>>>(
+        a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), n);
+    return out;
+}
+```
+
+Now write the kernel for the following operation:
+"""
+
+def _make_prompt_text(pytorch_code: str) -> str:
+    user_msg = FORMAT_EXAMPLE + f"```python\n{pytorch_code}\n```"
+    # Matches exactly what model saw: system + user + assistant start
+    return SYSTEM + f"<|im_start|>user\n{user_msg}<|im_end|>\n<|im_start|>assistant\n{PREFILL}"
 
 # ---------------------------------------------------------------------------
 # Training
@@ -132,29 +163,17 @@ def compute_redi_loss(
     else:
         weight = 1.0
 
-    # Build full chat and tokenize
-    full_text = build_chat_text(trace["pytorch_code"], trace["cuda_code"], tokenizer)
-    tokens = tokenizer(full_text, return_tensors="pt", truncation=True,
-                       max_length=max_seq_len)
+    # Build full chat and tokenize exactly as training did
+    prompt_text = _make_prompt_text(trace["pytorch_code"])
+    # The full text is prompt + the rest of the generated C++ code + end token
+    # We strip PREFILL from cuda_code because it's already in the prompt
+    cuda_tail = trace["cuda_code"].replace(PREFILL, "", 1)
+    full_text = prompt_text + cuda_tail + "\n```<|im_end|>\n"
+    
+    tokens = tokenizer(full_text, return_tensors="pt", truncation=True, max_length=max_seq_len)
     input_ids = tokens.input_ids[0].to(device)
 
     # Find where the assistant response starts
-    # Tokenize everything EXCEPT the assistant message to find the boundary
-    system_prompt = get_system_prompt()
-    prompt_messages = [
-        {"role": "system", "content": system_prompt},
-        {
-            "role": "user",
-            "content": (
-                "Write an optimized CUDA kernel to replace this PyTorch "
-                "implementation.\n\n"
-                f"Reference Program:\n```python\n{trace['pytorch_code']}\n```"
-            ),
-        },
-    ]
-    prompt_text = tokenizer.apply_chat_template(
-        prompt_messages, tokenize=False, add_generation_prompt=True
-    )
     prompt_len = len(tokenizer(prompt_text, truncation=True, max_length=max_seq_len).input_ids)
 
     if prompt_len >= len(input_ids):
@@ -180,8 +199,6 @@ def compute_redi_loss(
     token_log_probs = log_probs[range(R), resp_targets]
 
     # REDI loss: -label * weight * mean(log_probs)
-    # positive: weight=speedup reward (3x kernel gets 3x gradient vs 1x)
-    # negative: weight=1.0 (uniform penalty)
     loss = -label * weight * token_log_probs.mean()
 
     return loss
@@ -225,23 +242,7 @@ def evaluate_compile_rate(model, tokenizer, eval_prompts: list[dict], max_seq_le
 
     with tempfile.TemporaryDirectory() as tmpdir:
         for i, trace in enumerate(tqdm(eval_prompts, desc="Evaluating", leave=False)):
-            system_prompt = get_system_prompt()
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": (
-                        "Write an optimized CUDA kernel to replace this PyTorch "
-                        "implementation.\n\n"
-                        f"Reference Program:\n```python\n{trace['pytorch_code']}\n```"
-                    ),
-                },
-            ]
-            
-            prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            # Force the model to start writing the C++ block using the global PREFILL
-            prompt_text += PREFILL
-            
+            prompt_text = _make_prompt_text(trace["pytorch_code"])
             inputs = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=1500).to(device)
             
             with torch.no_grad():
