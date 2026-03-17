@@ -324,9 +324,9 @@ def train(config: dict = None):
             for line in f:
                 if line.strip():
                     eval_prompts.append(json.loads(line))
-        # Just grab 1 random prompt for fast eval testing
-        if len(eval_prompts) > 1:
-            eval_prompts = random.sample(eval_prompts, 1)
+        # Just grab 5 random prompts for fast eval testing
+        if len(eval_prompts) > 5:
+            eval_prompts = random.sample(eval_prompts, 5)
         print(f"Loaded {len(eval_prompts)} eval prompts for Compile Rate testing.")
 
     tokenizer = AutoTokenizer.from_pretrained(config["model_id"], trust_remote_code=True)
