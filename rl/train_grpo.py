@@ -679,7 +679,7 @@ def train(config: GRPOConfig = None):
                         "train/learning_rate": config.learning_rate,
                         "train/policy_entropy": mean_entropy,
                         "train/degenerate_groups": n_degenerate,
-                        "epoch": epoch + (global_step / max(1, len(prompts) // config.batch_size))
+                        "epoch": epoch + (global_step / max(1, len(train_prompts) // config.batch_size))
                     }, step=global_step)
 
                 print(f"  [GRPO epoch {grpo_ep+1}/{config.grpo_epochs}] loss={total_loss_val:.4f}")
