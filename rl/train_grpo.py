@@ -403,10 +403,11 @@ def _run_group_episodes(
         print(f"done ({time.time()-t_eval:.1f}s) | compiled={n_compiled}/{n_valid}")
         # DEBUG: show first compile error to diagnose
         if n_compiled == 0 and step == 0:
-            for res in eval_results:
+            for i, (res, resp) in enumerate(zip(eval_results, response_texts)):
                 if res is not None and not res.get("compiles", False):
                     err = res.get("compiler_error", "no error field")
-                    print(f"  [DEBUG] Compiler error sample:\n  {err[:600]}")
+                    print(f"  [DEBUG] Full response[{i}]:\n{resp}\n")
+                    print(f"  [DEBUG] Compiler error:\n{err[:800]}")
                     break
 
         # 4. Process results and update trajectories
