@@ -395,7 +395,7 @@ class KernelForgeAgent:
             messages.append({"role": "assistant", "content": full_response})
             
             # 2. Extract CUDA C++ Code
-            cuda_code = self.extract_cuda_code(full_response)
+            cuda_code = _extract_cuda_code(full_response)
             if not cuda_code:
                 print("❌ Failed to extract C++ code block. Requesting fix...")
                 print(f"--- FAILED GENERATED TEXT ---\n{response[:500]}\n-----------------------------")
