@@ -258,16 +258,18 @@ def evaluate_compile_rate(model, tokenizer, eval_prompts: list[dict], max_seq_le
             with open(cu_file, "w") as f:
                 f.write(cuda_code)
                 
-            # PyTorch includes needed for compilation
-            torch_inc = "-I/usr/local/lib/python3.10/dist-packages/torch/include"
-            torch_inc2 = "-I/usr/local/lib/python3.10/dist-packages/torch/include/torch/csrc/api/include"
+            # Dynamically get PyTorch includes so it handles .venv correctly
+            from torch.utils.cpp_extension import include_paths
+            inc_flags = [f"-I{p}" for p in include_paths()]
             
             try:
-                # Add basic torch headers to nvcc include path just in case
-                cmd = ["nvcc", "-c", cu_file, "-o", obj_file, torch_inc, torch_inc2, "-std=c++17"]
-                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+                cmd = ["nvcc", "-c", cu_file, "-o", obj_file] + inc_flags + ["-std=c++17"]
+                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
                 if result.returncode == 0:
                     successes += 1
+                elif successes == 0 and i == 0:
+                    # Print the first error for debugging
+                    print(f"\n[Eval Error Debug] nvcc failed:\n{result.stderr.decode('utf-8')[:500]}")
             except Exception as e:
                 pass
 
