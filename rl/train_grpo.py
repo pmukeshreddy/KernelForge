@@ -310,7 +310,7 @@ def _run_group_episodes(
 
         # 2. Generation — SGLang server or fallback to model.generate()
         if not config.mock_mode:
-            if config.use_sglang and SGLANG_AVAILABLE:
+            if config.use_sglang and (SGLANG_AVAILABLE or config.sglang_python):
                 # SGLang path: RadixAttention caches the shared prompt prefix across all G rollouts
                 t_gen = time.time()
                 print(f"  [Turn {step+1}/{config.max_react_steps}] Generating {len(active_indices)} responses...", end=" ", flush=True)
@@ -863,7 +863,7 @@ def train(config: GRPOConfig = None):
                 scheduler.step()
 
             # Sync updated LoRA weights to SGLang server after all GRPO epochs
-            if not config.mock_mode and config.use_sglang and SGLANG_AVAILABLE:
+            if not config.mock_mode and config.use_sglang and (SGLANG_AVAILABLE or config.sglang_python):
                 sync_weights_to_sglang(model, config.sglang_port)
                 
                 if not config.mock_mode:
