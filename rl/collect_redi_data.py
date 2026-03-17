@@ -187,7 +187,7 @@ def collect_traces(
             )
 
         # Write traces as they complete
-        with open(output_path, "w") as f:
+        with open(output_path, "a") as f:
             for future in futures:
                 trace = future.result()
                 if trace["label"] == 1:
