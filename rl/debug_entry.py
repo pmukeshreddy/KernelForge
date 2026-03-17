@@ -19,9 +19,10 @@ pytorch_code = entry["pytorch_code"]
 cuda_kernel = entry["cuda_kernel"]
 
 print("=" * 60)
-print("PYTORCH CODE (first 500 chars):")
+print("PYTORCH CODE + INIT INPUTS:")
 print("=" * 60)
-print(pytorch_code[:500])
+print(pytorch_code)
+
 
 print("\n" + "=" * 60)
 print("CUDA KERNEL (first 800 chars):")
