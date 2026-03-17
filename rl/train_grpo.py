@@ -237,7 +237,7 @@ def _generate_with_sglang(context_texts: list[str], config: "GRPOConfig") -> lis
         "sampling_params": {
             "max_new_tokens": config.max_new_tokens,
             "temperature": config.temperature,
-            "stop": ["```\n\n", "<|im_end|>"],  # stop after code block closes
+            "stop": ["<|im_end|>"],  # stop at end of assistant turn
         },
     }
     resp = requests.post(
