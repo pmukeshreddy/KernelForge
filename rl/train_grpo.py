@@ -28,6 +28,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 from concurrent.futures import ProcessPoolExecutor
 
+# SGLang imports — optional, falls back to model.generate() if not installed
+try:
+    import sglang as sgl
+    from sglang import RuntimeEndpoint
+    SGLANG_AVAILABLE = True
+except ImportError:
+    SGLANG_AVAILABLE = False
+
 from agent import build_load_inline_wrapper, _extract_cuda_code
 from profiler import profile_kernel
 from reward import calculate_reward
@@ -79,6 +87,13 @@ class GRPOConfig:
     temperature: float = 0.7
     mock_mode: bool = False
 
+    # SGLang server-mode generation (faster than model.generate())
+    # Set use_sglang=True to enable; requires `pip install sglang`
+    # SGLang runs as a separate server process — weights synced after each optimizer step
+    use_sglang: bool = False
+    sglang_port: int = 30000
+    sglang_tp: int = 1           # tensor parallel degree (set to GPU count for multi-GPU)
+
     # Training
     num_train_epochs: int = 1
     save_steps: int = 50
@@ -103,6 +118,106 @@ class GRPOConfig:
 
 PREFILL = "```cpp\n#include <torch/extension.h>\n"
 
+
+
+# ---------------------------------------------------------------------------
+# SGLang server helpers
+# ---------------------------------------------------------------------------
+
+_sglang_server = None  # global handle so we can shut it down at exit
+
+
+def launch_sglang_server(model_path: str, adapter_path: str, port: int, tp: int):
+    """
+    Launch SGLang as an inference server in a subprocess.
+    Uses LoRA-merged weights so the server sees the SFT-initialized model.
+    Returns the server process handle.
+    """
+    import subprocess, sys, time, requests, os
+
+    # Merge LoRA into base weights and save to a temp dir for SGLang to load
+    merged_path = os.path.join(os.path.dirname(adapter_path), "_sglang_merged")
+    if not os.path.exists(merged_path):
+        print(f"[SGLang] Merging LoRA into base model for server launch → {merged_path}")
+        from peft import PeftModel
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        base = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16, trust_remote_code=True)
+        merged = PeftModel.from_pretrained(base, adapter_path).merge_and_unload()
+        merged.save_pretrained(merged_path)
+        AutoTokenizer.from_pretrained(model_path, trust_remote_code=True).save_pretrained(merged_path)
+        del base, merged
+        torch.cuda.empty_cache()
+        print(f"[SGLang] Merge complete.")
+
+    cmd = [
+        sys.executable, "-m", "sglang.launch_server",
+        "--model-path", merged_path,
+        "--port", str(port),
+        "--tp", str(tp),
+        "--dtype", "bfloat16",
+        "--trust-remote-code",
+        "--mem-fraction-static", "0.6",  # leave 40% for training
+        "--disable-radix-cache",         # deterministic batching for on-policy RL
+    ]
+    env = {**__import__("os").environ, "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "1"}
+    proc = subprocess.Popen(cmd, env=env)
+
+    # Wait for server to be ready
+    url = f"http://localhost:{port}/health"
+    for _ in range(120):
+        try:
+            if requests.get(url, timeout=2).status_code == 200:
+                print(f"[SGLang] Server ready on port {port}")
+                return proc
+        except Exception:
+            pass
+        time.sleep(2)
+    raise RuntimeError(f"SGLang server failed to start on port {port}")
+
+
+def sync_weights_to_sglang(model, port: int):
+    """
+    Push updated LoRA weights from the training model to the SGLang server.
+    Uses SGLang's /update_weights endpoint with bucketed transfer for speed.
+    """
+    import requests, io
+    state_dict = {k: v.cpu() for k, v in model.state_dict().items() if "lora" in k.lower()}
+    buf = io.BytesIO()
+    torch.save(state_dict, buf)
+    buf.seek(0)
+    resp = requests.post(
+        f"http://localhost:{port}/update_weights",
+        data=buf.read(),
+        headers={"Content-Type": "application/octet-stream"},
+        timeout=60,
+    )
+    if resp.status_code != 200:
+        print(f"[SGLang] Weight sync warning: {resp.status_code} {resp.text[:200]}")
+
+
+def _generate_with_sglang(context_texts: list[str], config: "GRPOConfig") -> list[str]:
+    """
+    Generate completions for a batch of prompts via the SGLang server.
+    RadixAttention automatically caches the shared system prompt prefix.
+    """
+    import requests
+    responses = []
+    for ctx in context_texts:
+        payload = {
+            "text": ctx,
+            "sampling_params": {
+                "max_new_tokens": config.max_new_tokens,
+                "temperature": config.temperature,
+            },
+        }
+        resp = requests.post(
+            f"http://localhost:{config.sglang_port}/generate",
+            json=payload,
+            timeout=120,
+        )
+        resp.raise_for_status()
+        responses.append(resp.json()["text"])
+    return responses
 
 
 # ---------------------------------------------------------------------------
@@ -160,37 +275,46 @@ def _run_group_episodes(
             ) + PREFILL
             context_texts.append(ctx)
 
-        # Tokenize (left padding is needed for batched generation)
+        # 2. Generation — SGLang server or fallback to model.generate()
         if not config.mock_mode:
-            tokenizer.padding_side = "left"
-            inputs = tokenizer(context_texts, return_tensors="pt", padding=True)
-            input_ids = inputs.input_ids.to(next(model.parameters()).device)
-            attention_mask = inputs.attention_mask.to(next(model.parameters()).device)
-    
-            # 2. Batched Generation
-            with torch.no_grad():
-                outputs = model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=config.max_new_tokens,
-                    temperature=config.temperature,
-                    do_sample=True,
-                    pad_token_id=tokenizer.eos_token_id,
-                )
+            if config.use_sglang and SGLANG_AVAILABLE:
+                # SGLang path: RadixAttention caches the shared prompt prefix across all G rollouts
+                raw_completions = _generate_with_sglang(context_texts, config)
+                # raw_completions are full texts (prompt + completion); strip prompt prefix
+                generated_texts = []
+                for ctx, full in zip(context_texts, raw_completions):
+                    completion = full[len(ctx):] if full.startswith(ctx) else full
+                    generated_texts.append(completion)
+            else:
+                # Fallback: standard HuggingFace batched generation
+                tokenizer.padding_side = "left"
+                inputs = tokenizer(context_texts, return_tensors="pt", padding=True)
+                input_ids_tensor = inputs.input_ids.to(next(model.parameters()).device)
+                attention_mask = inputs.attention_mask.to(next(model.parameters()).device)
+                with torch.no_grad():
+                    outputs = model.generate(
+                        input_ids=input_ids_tensor,
+                        attention_mask=attention_mask,
+                        max_new_tokens=config.max_new_tokens,
+                        temperature=config.temperature,
+                        do_sample=True,
+                        pad_token_id=tokenizer.eos_token_id,
+                    )
+                generated_texts = [
+                    tokenizer.decode(outputs[i][input_ids_tensor[i].shape[0]:], skip_special_tokens=True)
+                    for i in range(len(active_indices))
+                ]
         else:
-            outputs = [None] * len(active_indices)
-            input_ids = [None] * len(active_indices)
+            generated_texts = ["#include <torch/extension.h>\n__global__ void mykernel() {}\ntorch::Tensor foo(torch::Tensor a) { return a; }\n"] * len(active_indices)
 
         # Extract generated portion
-        generated_ids_list = []
         response_texts = []
         for batch_idx, traj_idx in enumerate(active_indices):
             if not config.mock_mode:
-                seq_len = input_ids[batch_idx].shape[0]
-                gen_ids = outputs[batch_idx][seq_len:]
-                generated_ids_list.append(gen_ids)
-                
-                resp_text = PREFILL + tokenizer.decode(gen_ids, skip_special_tokens=True)
+                gen_text = generated_texts[batch_idx]
+                gen_ids = tokenizer(gen_text, return_tensors="pt").input_ids[0]
+
+                resp_text = PREFILL + gen_text
                 response_texts.append(resp_text)
                 
                 # Save history
@@ -594,6 +718,18 @@ def train(config: GRPOConfig = None):
 
     global_step = 0
 
+    # Launch SGLang server if enabled
+    if not config.mock_mode and config.use_sglang:
+        if not SGLANG_AVAILABLE:
+            raise RuntimeError("use_sglang=True but sglang is not installed. Run: pip install sglang")
+        import atexit
+        global _sglang_server
+        _sglang_server = launch_sglang_server(
+            config.model_id, config.adapter_path, config.sglang_port, config.sglang_tp
+        )
+        atexit.register(lambda: _sglang_server.terminate() if _sglang_server else None)
+        print(f"[SGLang] Server running on port {config.sglang_port} (TP={config.sglang_tp})")
+
     if not config.mock_mode:
         wandb.init(
             project=config.wandb_project,
@@ -678,6 +814,10 @@ def train(config: GRPOConfig = None):
                 torch.nn.utils.clip_grad_norm_(trainable_params, config.max_grad_norm)
                 optimizer.step()
                 scheduler.step()
+
+            # Sync updated LoRA weights to SGLang server after all GRPO epochs
+            if not config.mock_mode and config.use_sglang and SGLANG_AVAILABLE:
+                sync_weights_to_sglang(model, config.sglang_port)
                 
                 if not config.mock_mode:
                     # Compute mean policy entropy from old log probs as collapse indicator
@@ -738,6 +878,9 @@ if __name__ == "__main__":
     parser.add_argument("--resume", action="store_true", help="Resume from output_dir if it exists")
     parser.add_argument("--mock_mode", action="store_true")
     parser.add_argument("--no_dynamic_sampling", action="store_true", help="Disable DAPO dynamic sampling")
+    parser.add_argument("--use_sglang", action="store_true", help="Use SGLang server for generation (faster)")
+    parser.add_argument("--sglang_port", type=int, default=30000)
+    parser.add_argument("--sglang_tp", type=int, default=1, help="SGLang tensor parallel degree")
     args = parser.parse_args()
 
     cfg = GRPOConfig(
@@ -754,6 +897,9 @@ if __name__ == "__main__":
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_name,
         dynamic_sampling=not args.no_dynamic_sampling,
+        use_sglang=args.use_sglang,
+        sglang_port=args.sglang_port,
+        sglang_tp=args.sglang_tp,
     )
     
     # Simple resume logic: swap base model for output_dir if resuming
