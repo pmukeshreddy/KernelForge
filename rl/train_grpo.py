@@ -88,9 +88,10 @@ class GRPOConfig:
     mock_mode: bool = False
 
     # SGLang server-mode generation (faster than model.generate())
-    # Set use_sglang=True to enable; requires `pip install sglang`
-    # SGLang runs as a separate server process — weights synced after each optimizer step
+    # SGLang MUST be installed in a separate venv to avoid dependency conflicts.
+    # Set SGLANG_PYTHON=/path/to/sglang_env/bin/python before running, or pass --sglang_python.
     use_sglang: bool = False
+    sglang_python: str = ""      # path to SGLang venv python; falls back to $SGLANG_PYTHON
     sglang_port: int = 30000
     sglang_tp: int = 1           # tensor parallel degree (set to GPU count for multi-GPU)
 
@@ -127,13 +128,31 @@ PREFILL = "```cpp\n#include <torch/extension.h>\n"
 _sglang_server = None  # global handle so we can shut it down at exit
 
 
-def launch_sglang_server(model_path: str, adapter_path: str, port: int, tp: int):
+def launch_sglang_server(model_path: str, adapter_path: str, port: int, tp: int,
+                         sglang_python: str = None):
     """
     Launch SGLang as an inference server in a subprocess.
     Uses LoRA-merged weights so the server sees the SFT-initialized model.
+
+    SGLang must be installed in a separate venv to avoid dependency conflicts
+    with the training stack. Pass sglang_python to point at that environment's
+    Python, e.g. /root/sglang_env/bin/python. Defaults to the env variable
+    SGLANG_PYTHON, then falls back to the current interpreter (not recommended).
+
     Returns the server process handle.
     """
     import subprocess, sys, time, requests, os
+
+    # Resolve which Python to use for the SGLang subprocess
+    python_bin = (
+        sglang_python
+        or os.environ.get("SGLANG_PYTHON")
+        or sys.executable
+    )
+    if python_bin == sys.executable:
+        print("[SGLang] WARNING: using training venv Python for SGLang server. "
+              "Set SGLANG_PYTHON=/path/to/sglang_env/bin/python to avoid "
+              "dependency conflicts.")
 
     # Merge LoRA into base weights and save to a temp dir for SGLang to load
     merged_path = os.path.join(os.path.dirname(adapter_path), "_sglang_merged")
@@ -150,7 +169,7 @@ def launch_sglang_server(model_path: str, adapter_path: str, port: int, tp: int)
         print(f"[SGLang] Merge complete.")
 
     cmd = [
-        sys.executable, "-m", "sglang.launch_server",
+        python_bin, "-m", "sglang.launch_server",
         "--model-path", merged_path,
         "--port", str(port),
         "--tp", str(tp),
@@ -725,7 +744,8 @@ def train(config: GRPOConfig = None):
         import atexit
         global _sglang_server
         _sglang_server = launch_sglang_server(
-            config.model_id, config.adapter_path, config.sglang_port, config.sglang_tp
+            config.model_id, config.adapter_path, config.sglang_port, config.sglang_tp,
+            sglang_python=config.sglang_python or None,
         )
         atexit.register(lambda: _sglang_server.terminate() if _sglang_server else None)
         print(f"[SGLang] Server running on port {config.sglang_port} (TP={config.sglang_tp})")
@@ -879,6 +899,7 @@ if __name__ == "__main__":
     parser.add_argument("--mock_mode", action="store_true")
     parser.add_argument("--no_dynamic_sampling", action="store_true", help="Disable DAPO dynamic sampling")
     parser.add_argument("--use_sglang", action="store_true", help="Use SGLang server for generation (faster)")
+    parser.add_argument("--sglang_python", type=str, default="", help="Path to SGLang venv python (e.g. /root/sglang_env/bin/python). Can also set SGLANG_PYTHON env var.")
     parser.add_argument("--sglang_port", type=int, default=30000)
     parser.add_argument("--sglang_tp", type=int, default=1, help="SGLang tensor parallel degree")
     args = parser.parse_args()
@@ -898,6 +919,7 @@ if __name__ == "__main__":
         wandb_run_name=args.wandb_name,
         dynamic_sampling=not args.no_dynamic_sampling,
         use_sglang=args.use_sglang,
+        sglang_python=args.sglang_python,
         sglang_port=args.sglang_port,
         sglang_tp=args.sglang_tp,
     )
