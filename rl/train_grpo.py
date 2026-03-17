@@ -312,7 +312,10 @@ def _run_group_episodes(
         if not config.mock_mode:
             if config.use_sglang and SGLANG_AVAILABLE:
                 # SGLang path: RadixAttention caches the shared prompt prefix across all G rollouts
+                t_gen = time.time()
+                print(f"  [Turn {step+1}/{config.max_react_steps}] Generating {len(active_indices)} responses...", end=" ", flush=True)
                 raw_completions = _generate_with_sglang(context_texts, config)
+                print(f"done ({time.time()-t_gen:.1f}s)")
                 # raw_completions are full texts (prompt + completion); strip prompt prefix
                 generated_texts = []
                 for ctx, full in zip(context_texts, raw_completions):
@@ -384,8 +387,10 @@ def _run_group_episodes(
             error_msgs.append(None)
 
         # Run valid candidates in process pool
+        n_valid = sum(1 for c in candidates if c is not None)
         eval_results = [None] * len(active_indices)
-        
+        t_eval = time.time()
+        print(f"  [Turn {step+1}] Evaluating {n_valid}/{len(active_indices)} valid kernels...", end=" ", flush=True)
         with ProcessPoolExecutor(max_workers=min(G, 16)) as pool:
             eval_results = list(pool.map(
                 _worker_run_eval,
@@ -395,6 +400,7 @@ def _run_group_episodes(
         # Compile rate for this step (helps decide whether to run slow NCU)
         n_compiled = sum(1 for res in eval_results if res is not None and res.get("compiles", res.get("correct", False)))
         compile_rate = n_compiled / max(1, len(active_indices))
+        print(f"done ({time.time()-t_eval:.1f}s) | compiled={n_compiled}/{n_valid}")
 
         # 4. Process results and update trajectories
         for batch_idx, traj_idx in enumerate(active_indices):
