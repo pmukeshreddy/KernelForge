@@ -8,11 +8,11 @@ from collect_redi_data import _strip_pybind
 
 dataset = sys.argv[1] if len(sys.argv) > 1 else "../sft/sft_training_pairs.jsonl"
 
-# Read first level_1 entry
+# Read first level_2 entry
 with open(dataset) as f:
     for line in f:
         entry = json.loads(line)
-        if entry.get("level_id") == "level_1" and entry.get("cuda_kernel", "").strip():
+        if entry.get("level_id") == "level_2" and entry.get("cuda_kernel", "").strip():
             break
 
 pytorch_code = entry["pytorch_code"]
