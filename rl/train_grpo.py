@@ -20,7 +20,9 @@ import random
 from dataclasses import dataclass
 
 import math
+import time
 import torch
+from tqdm import tqdm
 import torch.nn.functional as F
 import wandb
 from datasets import load_dataset
@@ -83,7 +85,7 @@ class GRPOConfig:
     reward_discount: float = 0.4      # multi-turn γ (Kevin's value)
 
     # Generation
-    max_new_tokens: int = 2048
+    max_new_tokens: int = 800
     temperature: float = 0.7
     mock_mode: bool = False
 
@@ -235,6 +237,7 @@ def _generate_with_sglang(context_texts: list[str], config: "GRPOConfig") -> lis
         "sampling_params": {
             "max_new_tokens": config.max_new_tokens,
             "temperature": config.temperature,
+            "stop": ["```\n\n", "<|im_end|>"],  # stop after code block closes
         },
     }
     resp = requests.post(
@@ -768,6 +771,9 @@ def train(config: GRPOConfig = None):
             config=config.__dict__,
         )
 
+    total_steps = config.num_train_epochs * (len(train_prompts) // config.batch_size)
+    step_bar = tqdm(total=total_steps, desc="GRPO", unit="step", dynamic_ncols=True)
+
     for epoch in range(config.num_train_epochs):
         epoch_prompts = train_prompts.copy()
         random.shuffle(epoch_prompts)
@@ -780,6 +786,7 @@ def train(config: GRPOConfig = None):
             all_group_rewards: list[list[float]] = []            # [B][G]
 
             n_degenerate = 0
+            t0 = time.time()
             for p_idx, prompt_text in enumerate(batch):
                 print(f"\n[Prompt {p_idx+1}/{len(batch)}] Generating {config.group_size} trajectories (batched/parallel)...")
                 group_turns, group_rewards = _run_group_episodes(prompt_text, model, tokenizer, config)
@@ -805,7 +812,10 @@ def train(config: GRPOConfig = None):
             batch_mean = sum(
                 sum(rs) / len(rs) for rs in all_group_rewards
             ) / len(all_group_rewards)
-            print(f"\n[Epoch {epoch+1} | Step {global_step+1}] batch_mean_reward={batch_mean:.3f}")
+            elapsed = time.time() - t0
+            step_bar.set_postfix(reward=f"{batch_mean:.3f}", step_time=f"{elapsed:.0f}s")
+            step_bar.update(1)
+            print(f"\n[Epoch {epoch+1} | Step {global_step+1}/{total_steps}] reward={batch_mean:.3f}  step_time={elapsed:.0f}s")
 
             torch.cuda.empty_cache()
 
