@@ -250,6 +250,9 @@ def evaluate_compile_rate(model, tokenizer, eval_prompts: list[dict], max_seq_le
                     cuda_code = parts[1].split("```")[0].strip()
             
             if not cuda_code:
+                # Debug why no C++ was extracted
+                if i == 0:
+                    print(f"\n[Eval Error Debug] Failed to extract C++ code. Raw response:\n{response_text[:500]}...\n")
                 continue
                 
             # Test Compile
@@ -303,9 +306,9 @@ def train(config: dict = None):
             for line in f:
                 if line.strip():
                     eval_prompts.append(json.loads(line))
-        # Just grab 5 random prompts for fast eval (generation takes ~80s/it)
-        if len(eval_prompts) > 5:
-            eval_prompts = random.sample(eval_prompts, 5)
+        # Just grab 1 random prompt for fast eval testing
+        if len(eval_prompts) > 1:
+            eval_prompts = random.sample(eval_prompts, 1)
         print(f"Loaded {len(eval_prompts)} eval prompts for Compile Rate testing.")
 
     tokenizer = AutoTokenizer.from_pretrained(config["model_id"], trust_remote_code=True)
