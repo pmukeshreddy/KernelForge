@@ -266,10 +266,12 @@ def evaluate_compile_rate(model, tokenizer, eval_prompts: list[dict], max_seq_le
                 
             # Dynamically get PyTorch includes so it handles .venv correctly
             from torch.utils.cpp_extension import include_paths
+            import sysconfig
             inc_flags = [f"-I{p}" for p in include_paths()]
+            python_inc = f"-I{sysconfig.get_path('include')}"
             
             try:
-                cmd = ["nvcc", "-c", cu_file, "-o", obj_file] + inc_flags + ["-std=c++17"]
+                cmd = ["nvcc", "-c", cu_file, "-o", obj_file] + inc_flags + [python_inc, "-std=c++17", "-O3", "-w"]
                 result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
                 if result.returncode == 0:
                     successes += 1
