@@ -22,15 +22,11 @@ You will be provided with a reference PyTorch implementation. You must write an 
 - The input tensors are `float32` by default. Use `float*` pointers and `data_ptr<float>()` unless specified otherwise.
 
 # Output Format
-CRITICAL: Output EXACTLY ONE ```python code block containing the complete ModelNew implementation.
-The block must include: the CUDA source string, load_inline call, and the ModelNew class.
+CRITICAL: Output EXACTLY ONE ```cpp code block containing ONLY the raw CUDA C++ kernel and binding function.
+Do NOT output Python, do NOT include load_inline, do NOT include a ModelNew class.
+The Python wrapper is generated automatically — your job is only the C++.
 
-```python
-import torch
-import torch.nn as nn
-from torch.utils.cpp_extension import load_inline
-
-cuda_source = \'\'\'
+```cpp
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 
@@ -45,30 +41,6 @@ torch::Tensor my_op(torch::Tensor x) {
     my_kernel<<<(n+255)/256, 256>>>(x.data_ptr<float>(), out.data_ptr<float>(), n);
     return out;
 }
-\'\'\'
-
-ext = load_inline(name="my_ext", cuda_sources=cuda_source,
-                  cpp_sources="torch::Tensor my_op(torch::Tensor x);",
-                  functions=["my_op"], verbose=False)
-
-class ModelNew(nn.Module):
-    def __init__(self):
-        super().__init__()
-    def forward(self, x):
-        return ext.my_op(x)
-```
-
-# Weight Initialization for Stateful Models
-If the reference model has parameters (weights, bias), ModelNew.__init__ MUST initialize them
-using the EXACT same PyTorch init calls in the EXACT same order as the reference Model.
-This ensures weights match under deterministic seeding.
-
-Example — if reference has `self.linear = nn.Linear(in, out)`, ModelNew should do:
-```python
-self.weight = nn.Parameter(torch.empty(out, in))
-self.bias = nn.Parameter(torch.empty(out))
-nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-# ... match Linear's exact init sequence
 ```
 
 # CUDA Optimization Playbook (A100 Architecture)
