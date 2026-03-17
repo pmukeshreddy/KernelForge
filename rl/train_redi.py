@@ -277,6 +277,10 @@ def evaluate_compile_rate(model, tokenizer, eval_prompts: list[dict], max_seq_le
                     print(f"\n[Eval Error Debug] Failed to extract C++ code. Raw response:\n{response_text[:500]}...\n")
                 continue
                 
+            # Print the successfully extracted code to verify
+            if i == 0:
+                print(f"\n[Eval Debug] Successfully extracted C++ code (first 500 chars):\n{cuda_code[:500]}...\n")
+                
             # Test Compile
             cu_file = os.path.join(tmpdir, f"test_{i}.cu")
             obj_file = os.path.join(tmpdir, f"test_{i}.o")
