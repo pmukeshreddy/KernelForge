@@ -83,13 +83,39 @@ def _fix_cuda_api(cuda_code: str) -> str:
         return core + ';'
     cuda_code = '\n'.join(_fix_math_line(l) for l in cuda_code.splitlines())
 
-    # Bug 2 — extra closing paren after TORCH_CHECK / AT_CHECK macro calls
-    # e.g. TORCH_CHECK(x.is_contiguous(), "msg"))  → remove the extra )
-    cuda_code = re.sub(
-        r'((?:TORCH_CHECK|AT_CHECK)\s*\([^;]+\))\)',
-        r'\1',
-        cuda_code,
-    )
+    # Bug 2 — extra closing paren after TORCH_CHECK / AT_CHECK macro calls.
+    # Use balanced-paren scanner so we never cross into adjacent calls.
+    def _fix_torch_check_parens(code: str) -> str:
+        out, i = [], 0
+        for macro in ('TORCH_CHECK', 'AT_CHECK'):
+            pass  # processed in loop below
+        pat = re.compile(r'(?:TORCH_CHECK|AT_CHECK)\s*\(')
+        while i < len(code):
+            m = pat.search(code, i)
+            if not m:
+                out.append(code[i:]); break
+            out.append(code[i:m.start()])
+            depth, j = 0, m.start()
+            while j < len(code):
+                if code[j] == '(':   depth += 1
+                elif code[j] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        # Include the matching ')'
+                        out.append(code[m.start():j + 1])
+                        j += 1
+                        # Skip exactly one spurious extra ')'
+                        while j < len(code) and code[j] in ' \t':
+                            j += 1
+                        if j < len(code) and code[j] == ')':
+                            j += 1  # drop it
+                        i = j
+                        break
+                j += 1
+            else:
+                out.append(code[m.start():]); i = len(code)
+        return ''.join(out)
+    cuda_code = _fix_torch_check_parens(cuda_code)
 
     # Bug 3 — .ptr<T>() is not a PyTorch C++ API method; correct is .data_ptr<T>()
     cuda_code = re.sub(r'\.ptr\s*<', '.data_ptr<', cuda_code)
@@ -383,6 +409,12 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
         # 'input' / 'inp' are common C++ names for the primary input tensor — pass through
         if effective in ('input', 'inp', 'in_tensor') and forward_args_list:
             return forward_args_list[0]
+
+        # log_X where X is a forward arg: log_predictions → torch.log(predictions)
+        if effective.startswith('log_'):
+            base = effective[4:]
+            if base in forward_set:
+                return f'torch.log({base})'
 
         # Scalar/tuple attributes stored in nn module.
         # stride/padding/dilation/kernel_size are tuples → index [0].
