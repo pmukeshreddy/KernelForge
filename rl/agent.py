@@ -170,23 +170,22 @@ def _split_args(raw: str) -> list:
     return args
 
 
+
 def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
     """
-    Wrap raw CUDA C++ code in a full load_inline Python script.
+    Wrap raw CUDA C++ code in a Python script that compiles via load().
 
     Strategy:
-      1. Parse PYBIND11_MODULE BEFORE stripping it — m.def() gives us the
-         exact C++ function names SakanaAI already verified work.
-      2. Strip the block (load_inline generates its own pybind11 bindings).
-      3. Find the signature of each exported function by name to extract
-         typed arg lists.
-      4. Type-aware argument mapping: torch::Tensor args vs scalars vs streams
-         are handled differently rather than guessing from names alone.
+      - Write the .cu file to disk unchanged (PYBIND11_MODULE preserved).
+      - Compile with torch.utils.cpp_extension.load() — no cpp_sources to
+        generate, no load_inline declaration hacks.  The PYBIND11_MODULE the
+        model/SakanaAI wrote IS the binding; no parsing needed for compilation.
+      - Parse PYBIND11_MODULE only to learn which function to call from
+        ModelNew.forward() and what typed args it takes.
     """
 
-    # ── Step 1: Extract exports from PYBIND11_MODULE before stripping ────────
-    # m.def("python_name", &cpp_func, ...) → we want cpp_func names (exact)
-    pybind_exports = []   # ordered list of cpp function names
+    # ── Step 1: Parse PYBIND11_MODULE for exported function names ────────────
+    pybind_exports = []   # [(python_name, cpp_func_name)]
     pyb_m = re.search(r'PYBIND11_MODULE\s*\(', cuda_code)
     if pyb_m:
         try:
@@ -205,115 +204,21 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
                         for dm in re.finditer(
                             r'm\.def\s*\(\s*"(\w+)"\s*,\s*&\s*(\w+)', block
                         ):
-                            pybind_exports.append(dm.group(2))  # C++ func name
+                            pybind_exports.append((dm.group(1), dm.group(2)))
                         break
                 i += 1
 
-    # ── Step 2: Strip PYBIND11_MODULE block ──────────────────────────────────
-    lines = cuda_code.split('\n')
-    result, skip, brace_depth = [], False, 0
-    for line in lines:
-        if not skip and 'PYBIND11_MODULE' in line:
-            skip = True
-            brace_depth = 0
-        if skip:
-            brace_depth += line.count('{') - line.count('}')
-            if brace_depth <= 0 and '{' in cuda_code:
-                skip = False
-            continue
-        result.append(line)
-    cuda_code = '\n'.join(result)
-
-    # ── Step 3: Normalise tensor type spellings ───────────────────────────────
-    cuda_code = re.sub(r'\bat::Tensor\b', 'torch::Tensor', cuda_code)
-    cuda_code = re.sub(r'(?<!:)\bTensor\b', 'torch::Tensor', cuda_code)
-
-    # ── Step 4: Find function signatures ─────────────────────────────────────
-    # Helper: extract a balanced-paren signature given the opening '(' position
-    def _extract_sig(code: str, paren_start: int) -> str | None:
-        depth, i = 0, paren_start
-        while i < len(code):
-            if code[i] == '(':
-                depth += 1
-            elif code[i] == ')':
-                depth -= 1
-                if depth == 0:
-                    rest = code[i + 1:i + 80].lstrip()
-                    if rest[:1] in ('{', ';') or re.match(
-                        r'(?:const|noexcept|override)\s*[{;]', rest
-                    ):
-                        return code[paren_start:i + 1]
-                    return None
-            i += 1
-        return None
-
-    # Find the start of a declaration for func_name: walk back from the '('
-    # to pick up the return type (everything since last ';' / '}' / newline).
-    def _find_sig_by_name(code: str, func_name: str):
-        pat = re.compile(rf'\b{re.escape(func_name)}\s*\(')
-        for m in pat.finditer(code):
-            paren_start = m.end() - 1
-            sig_inner = _extract_sig(code, paren_start)
-            if sig_inner is None:
-                continue
-            # Walk back from m.start() to find the start of the return type.
-            # Stop at ';' or '}' only — NOT '\n', so multi-line return types like
-            #   std::vector<torch::Tensor>\nforward(...) are captured correctly.
-            k = m.start() - 1
-            while k >= 0 and code[k] not in (';', '}'):
-                k -= 1
-            decl_start = k + 1
-            decl = code[decl_start:m.end() - 1 + len(sig_inner)].strip()
-            # Skip CUDA kernel definitions (__global__ / __device__ functions)
-            if re.match(r'__(?:global|device|host)__', decl):
-                continue
-            return decl
-        return None
-
-    if pybind_exports:
-        # Use the exact names SakanaAI already verified
-        sig_matches = []
-        for fn in pybind_exports:
-            decl = _find_sig_by_name(cuda_code, fn)
-            if decl:
-                sig_matches.append((decl, fn))
-        if not sig_matches:
-            # Names found in PYBIND11_MODULE but definitions not found — fall through
-            pybind_exports = []
-
     if not pybind_exports:
-        # Fallback: scan for torch::Tensor return-type functions
-        def _scan_tensor_returns(code: str):
-            found = []
-            ret_pat = re.compile(
-                r'(?:std::(?:vector|tuple)\s*<[^>]*(?:torch|at)::Tensor[^>]*>\s*'
-                r'|torch::Tensor\s+)'
-                r'(\w+)\s*\('
-            )
-            skip_names = {'__global__', '__device__', '__host__',
-                          'TORCH_CHECK', 'AT_CHECK', 'AT_ASSERTM', 'torch', 'at', 'std'}
-            for m in ret_pat.finditer(code):
-                fn = m.group(1)
-                if fn in skip_names:
-                    continue
-                sig_inner = _extract_sig(code, m.end() - 1)
-                if sig_inner:
-                    decl = code[m.start():m.end() - 1 + len(sig_inner)].strip()
-                    found.append((decl, fn))
-            return found
-        sig_matches = _scan_tensor_returns(cuda_code)
-
-    if not sig_matches:
-        print(f"[WRAPPER DEBUG] No binding found. First 300 chars:\n{cuda_code[:300]}")
+        print(f"[WRAPPER DEBUG] No PYBIND11_MODULE found. First 300 chars:\n{cuda_code[:300]}")
         return None
 
-    func_signatures = [s[0] for s in sig_matches]
-    func_names      = [s[1] for s in sig_matches]
-    print(f"[WRAPPER DEBUG] Bindings: {func_names} (via {'pybind11 exports' if pybind_exports else 'return-type scan'})")
+    binding_func = pybind_exports[-1][1]
+    print(f"[WRAPPER DEBUG] PYBIND11_MODULE exports: {pybind_exports}, calling: {binding_func}")
 
-    cpp_source = "; ".join(func_signatures) + ";"
+    # ── Step 2: Fix CUDA API issues ───────────────────────────────────────────
+    cuda_code = _fix_cuda_api(cuda_code)
 
-    # ── Step 5: Parse ref_code for forward() / __init__() signatures ─────────
+    # ── Step 3: Parse ref_code for forward() / __init__() signatures ─────────
     def _extract_def_args(code: str, def_name: str) -> str:
         m = re.search(rf'def {def_name}\s*\(', code)
         if not m:
@@ -344,27 +249,30 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
         for a in _split_args(init_raw) if a.strip()
     ) if init_raw else ""
 
-    print(f"[WRAPPER DEBUG] forward args: {repr(fwd_args_clean)}")
-
     forward_args_list = [a.strip() for a in fwd_args_clean.split(',') if a.strip()]
     forward_set       = set(forward_args_list)
-    binding_func      = func_names[-1]
+    print(f"[WRAPPER DEBUG] forward args: {repr(fwd_args_clean)}")
 
-    # ── Step 6: Parse typed args from the chosen binding signature ───────────
-    # Returns list of (type_str, name_str) for the last (primary) binding.
-    last_sig = func_signatures[-1]
-    typed_args = []   # [(type_str, name_str)]
-    pm = re.search(r'\w+\s*\(', last_sig)
-    if pm:
-        ps = pm.end() - 1
-        depth, i = 0, ps
-        while i < len(last_sig):
-            if last_sig[i] == '(':
+    # ── Step 4: Parse typed args from the binding function signature ──────────
+    cuda_code_norm = re.sub(r'\bat::Tensor\b', 'torch::Tensor', cuda_code)
+    cuda_code_norm = re.sub(r'(?<!:)\bTensor\b', 'torch::Tensor', cuda_code_norm)
+
+    typed_args = []
+    sig_pat = re.compile(
+        r'(?:std::(?:vector|tuple)\s*<[^>]*torch::Tensor[^>]*>\s*'
+        r'|torch::Tensor\s+)'
+        + rf'{re.escape(binding_func)}\s*\('
+    )
+    sig_m = sig_pat.search(cuda_code_norm)
+    if sig_m:
+        ps, depth, i = sig_m.end() - 1, 0, sig_m.end() - 1
+        while i < len(cuda_code_norm):
+            if cuda_code_norm[i] == '(':
                 depth += 1
-            elif last_sig[i] == ')':
+            elif cuda_code_norm[i] == ')':
                 depth -= 1
                 if depth == 0:
-                    for param in _split_args(last_sig[ps + 1:i]):
+                    for param in _split_args(cuda_code_norm[ps + 1:i]):
                         param = param.split('=')[0].strip()
                         toks  = re.findall(r'\b\w[\w:]*\b', param)
                         if not toks:
@@ -374,16 +282,12 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
                                     'int64_t', 'size_t', 'uint32_t', 'int32_t',
                                     'unsigned', 'long', 'short', 'auto'):
                             continue
-                        idx       = param.rfind(name)
-                        type_part = param[:idx].strip().rstrip('*& ')
+                        type_part = param[:param.rfind(name)].strip().rstrip('*& ')
                         typed_args.append((type_part, name))
                     break
             i += 1
 
-    # ── Step 7: Fix CUDA API before compilation ───────────────────────────────
-    cuda_code = _fix_cuda_api(cuda_code)
-
-    # ── Step 8: Type-aware argument resolver ──────────────────────────────────
+    # ── Step 5: Build __init__ body and arg resolver ──────────────────────────
     def _extract_init_body(code: str) -> str:
         m = re.search(r'^([ \t]*)def __init__\s*\(', code, re.MULTILINE)
         if not m:
@@ -418,61 +322,39 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
         return '\n'.join(body_lines)
 
     def _resolve_arg(type_str: str, name: str, init_body: str) -> str:
-        """Map one C++ arg (with its type) to a Python expression."""
-        t = type_str.lower().replace(' ', '')
-
-        # ── Type: CUDA stream → default stream (0) ───────────────────────────
-        if 'cudastream' in t:
-            return '0'
-
-        # ── Type: null / optional → None ────────────────────────────────────
-        if name in ('nullptr', 'null', 'none'):
-            return 'None'
-
-        # ── Determine if this is a tensor type ───────────────────────────────
-        is_tensor = 'torch::tensor' in t or 'at::tensor' in t
-
-        # Strip decorative suffixes to get the semantic name
+        t   = type_str.lower().replace(' ', '')
         eff = name
         for sfx in ('_obj', '_opt', '_tensor'):
             if eff.endswith(sfx):
                 eff = eff[:-len(sfx)]
                 break
 
-        # ── Tensor: forward arg passthrough ──────────────────────────────────
-        # 'input'/'inp' are conventional C++ aliases for the first forward arg.
+        if 'cudastream' in t:
+            return '0'
+        if eff in ('nullptr', 'null', 'none'):
+            return 'None'
+
+        is_tensor = 'torch::tensor' in t or 'at::tensor' in t
         canonical = forward_args_list[0] if forward_args_list else 'x'
+
         if is_tensor and eff in forward_set:
             return eff
         if is_tensor and eff in ('input', 'inp', 'in_tensor'):
             return canonical
-
-        # ── Tensor: output buffer → allocate from first forward arg ──────────
-        OUTPUT_NAMES = {'output', 'out', 'result', 'out_tensor', 'output_tensor'}
-        if is_tensor and eff in OUTPUT_NAMES:
+        if is_tensor and eff in ('output', 'out', 'result', 'out_tensor', 'output_tensor'):
             return f'torch.empty_like({canonical})'
 
-        # ── Scalar: CUDA impl details that should never be self.* ─────────────
         if re.match(r'^num_(streams?|threads?|blocks?|warps?)$', eff):
-            m = re.search(rf'\b{re.escape(name)}\s*=\s*(\d+)', last_sig)
-            return m.group(1) if m else '4'
-
-        # ── log_X where X is a forward arg ───────────────────────────────────
+            dm = re.search(rf'\b{re.escape(name)}\s*=\s*(\d+)', cuda_code_norm)
+            return dm.group(1) if dm else '4'
         if eff.startswith('log_') and eff[4:] in forward_set:
             return f'torch.log({eff[4:]})'
 
-        # ── Attribute lookups against init_body ──────────────────────────────
-        # Direct self.eff match
         if re.search(rf'\bself\.{re.escape(eff)}\b', init_body):
             return f'self.{eff}'
+        if eff.endswith('s') and re.search(rf'\bself\.{re.escape(eff[:-1])}\b', init_body):
+            return f'self.{eff[:-1]}'
 
-        # Plural → singular
-        if eff.endswith('s'):
-            s = eff[:-1]
-            if re.search(rf'\bself\.{re.escape(s)}\b', init_body):
-                return f'self.{s}'
-
-        # nn.Sequential / ModuleList → list comprehension for weights/biases
         seq = re.search(r'\bself\.(\w+)\s*=\s*nn\.(?:Sequential|ModuleList)\b', init_body)
         if seq:
             container = f'self.{seq.group(1)}'
@@ -481,87 +363,72 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
             if eff in ('biases', 'bias'):
                 return f'[l.bias for l in {container} if hasattr(l, "bias")]'
 
-        # First nn module in init for attribute access
         nn_m = re.search(r'\bself\.(\w+)\s*=\s*nn\.', init_body)
         mod  = nn_m.group(1) if nn_m else None
 
         TENSOR_ATTRS = ('weight', 'bias', 'running_mean', 'running_var',
                         'weight_g', 'weight_v', 'scale', 'gamma', 'beta')
         TUPLE_ATTRS  = ('stride', 'padding', 'dilation', 'output_padding', 'kernel_size')
+        SCALAR_ATTRS = ('eps', 'momentum', 'num_features', 'num_groups',
+                        'in_features', 'out_features', 'num_heads', 'p', 'groups')
 
         if mod:
-            # Tensor attribute on nn module
             if eff in TENSOR_ATTRS:
                 return f'self.{mod}.{eff}'
-
-            # Scalar/tuple attribute (stride, padding, …) — _si handles int-or-tuple
             if eff in TUPLE_ATTRS:
                 return f'_si(self.{mod}.{eff})'
-            if eff == 'groups':
-                return f'self.{mod}.groups'
-
-            # Decomposed 2D/3D: stride_h → _si(self.conv.stride, 0)
+            if eff in SCALAR_ATTRS:
+                return f'self.{mod}.{eff}'
             for sfx, idx in (('_h', 0), ('_w', 1), ('_d', 2)):
-                if eff.endswith(sfx):
-                    base = eff[:-len(sfx)]
-                    if base in TUPLE_ATTRS:
-                        return f'_si(self.{mod}.{base}, {idx})'
-
-            # Pattern: conv_weight → self.conv.weight
+                if eff.endswith(sfx) and eff[:-len(sfx)] in TUPLE_ATTRS:
+                    return f'_si(self.{mod}.{eff[:-len(sfx)]}, {idx})'
             for attr in TENSOR_ATTRS:
                 if eff.endswith('_' + attr):
-                    module = eff[:-len(attr) - 1]
-                    if re.search(rf'\bself\.{re.escape(module)}\b', init_body):
-                        return f'self.{module}.{attr}'
+                    mod2 = eff[:-len(attr) - 1]
+                    if re.search(rf'\bself\.{re.escape(mod2)}\b', init_body):
+                        return f'self.{mod2}.{attr}'
 
-        # Fallback — best-effort self.eff
         return f'self.{eff}'
 
-    # ── Step 9: Build the call-site argument list ─────────────────────────────
-    # Extract init body once (needed for resolving extra args)
+    # ── Step 6: Build call args ───────────────────────────────────────────────
     init_body = _extract_init_body(ref_code)
-
-    call_args = []
-    for type_str, name in typed_args:
-        if name in forward_set:
-            call_args.append(name)
-        else:
-            call_args.append(_resolve_arg(type_str, name, init_body))
-
-    extra_args = [n for _, n in typed_args if n not in forward_set]
-    has_extra  = bool(extra_args)
+    call_args = [
+        name if name in forward_set else _resolve_arg(t, name, init_body)
+        for t, name in typed_args
+    ]
+    has_extra = any(n not in forward_set for _, n in typed_args)
 
     print(f"[WRAPPER DEBUG] typed_args: {[(t[:30], n) for t, n in typed_args]}")
     print(f"[WRAPPER DEBUG] call_args:  {call_args}")
 
-    # ── Step 10: Emit the wrapper ─────────────────────────────────────────────
-    code_hash = hashlib.md5((cuda_code + cpp_source).encode()).hexdigest()[:12]
+    # ── Step 7: Emit wrapper — write .cu to disk, compile with load() ─────────
+    code_hash        = hashlib.md5(cuda_code.encode()).hexdigest()[:12]
     import random as _random
-    mod_name = f"kf_ext_{code_hash}_{_random.randint(0, 0xFFFFFF):06x}"
-
+    mod_name         = f"kf_ext_{code_hash}_{_random.randint(0, 0xFFFFFF):06x}"
     cuda_source_expr = repr(cuda_code)
-    cpp_source_expr  = repr(cpp_source)
     init_sig         = (", " + init_args_clean) if init_args_clean else ""
     call_str         = ", ".join(call_args)
 
     ext_block = f'''import torch
 import torch.nn as nn
-from torch.utils.cpp_extension import load_inline
+import os
+from torch.utils.cpp_extension import load
 
-# _si: safely index a value that may be int or tuple/list
 def _si(v, i=0):
     return v[i] if isinstance(v, (tuple, list)) else v
 
-cuda_source = {cuda_source_expr}
-cpp_source  = {cpp_source_expr}
+_cuda_source = {cuda_source_expr}
+_cu_dir  = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".kf_cu_cache")
+os.makedirs(_cu_dir, exist_ok=True)
+_cu_path = os.path.join(_cu_dir, "{mod_name}.cu")
+with open(_cu_path, "w") as _f:
+    _f.write(_cuda_source)
 
-ext = load_inline(
+ext = load(
     name="{mod_name}",
-    cpp_sources=cpp_source,
-    cuda_sources=cuda_source,
-    functions={func_names},
-    extra_cflags=["-O3"],
+    sources=[_cu_path],
     extra_cuda_cflags=["-O3", "--use_fast_math"],
+    verbose=False,
 )
 '''
 
@@ -586,7 +453,6 @@ class ModelNew(torch.nn.Module):
     wrapper = ext_block + model_block
     print(f"[WRAPPER DEBUG] ModelNew:\n{wrapper[wrapper.find('class ModelNew'):]}")
     return wrapper
-
 
 def _extract_cuda_code(response: str) -> str:
     """Extract the CUDA C++ code block from the LLM's response."""
