@@ -65,6 +65,33 @@ def _fix_cuda_api(cuda_code: str) -> str:
         cuda_code,
     )
 
+    # Bug 1 — extra closing paren in device math expressions
+    # e.g. "return x * tanhf(logf(1.0f + expf(x))));" → strip excess ) before ;
+    def _fix_unbalanced_parens(line: str) -> str:
+        excess = line.count(')') - line.count('(')
+        if excess <= 0:
+            return line
+        core = line.rstrip()
+        semi = ''
+        if core.endswith(';'):
+            core, semi = core[:-1], ';'
+        for _ in range(excess):
+            if core.endswith(')'):
+                core = core[:-1]
+        return core + semi
+    cuda_code = '\n'.join(_fix_unbalanced_parens(l) for l in cuda_code.splitlines())
+
+    # Bug 2 — extra closing paren after TORCH_CHECK / AT_CHECK macro calls
+    # e.g. TORCH_CHECK(x.is_contiguous(), "msg"))  → remove the extra )
+    cuda_code = re.sub(
+        r'((?:TORCH_CHECK|AT_CHECK)\s*\([^;]+\))\)',
+        r'\1',
+        cuda_code,
+    )
+
+    # Bug 3 — .ptr<T>() is not a PyTorch C++ API method; correct is .data_ptr<T>()
+    cuda_code = re.sub(r'\.ptr\s*<', '.data_ptr<', cuda_code)
+
     # __host__ or __device__ on torch::Tensor binding functions is invalid.
     # The binding function must be a plain host function callable from Python.
     # Remove __host__, __device__, __forceinline__ prefixes before torch::Tensor returns.
