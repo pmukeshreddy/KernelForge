@@ -207,6 +207,7 @@ def main():
                         help="KernelBench prompts for post-training eval")
     parser.add_argument("--output_dir", default="./sft_qwen3_14b_lora")
     parser.add_argument("--eval_workers", type=int, default=16)
+    parser.add_argument("--eval_batch_size", type=int, default=8)
     parser.add_argument("--n_kernelbench_eval", type=int, default=50,
                         help="Number of KernelBench prompts to eval after training")
     parser.add_argument("--seed", type=int, default=42)
@@ -320,7 +321,8 @@ def main():
     # 1. Held-out test set from SakanaAI (same distribution as training)
     test_items = [(p["pytorch_code"], f"sakana/{p.get('task_id','?')}") for p in test_pairs]
     run_eval(eval_model, tokenizer, test_items,
-             workers=args.eval_workers, tag="held-out SakanaAI test")
+             workers=args.eval_workers, tag="held-out SakanaAI test",
+             batch_size=args.eval_batch_size)
 
     # 2. KernelBench prompts (different distribution — unseen tasks)
     kb_items = []
@@ -330,7 +332,8 @@ def main():
         kb_sample = random.sample(kb_prompts, min(args.n_kernelbench_eval, len(kb_prompts)))
         kb_items = [(p["pytorch_code"], f"kb/{p.get('task_id','?')}") for p in kb_sample]
         run_eval(eval_model, tokenizer, kb_items,
-                 workers=args.eval_workers, tag="KernelBench (unseen)")
+                 workers=args.eval_workers, tag="KernelBench (unseen)",
+                 batch_size=args.eval_batch_size)
     else:
         print(f"\nSkipping KernelBench eval — {args.rl_prompts} not found")
 
