@@ -137,6 +137,9 @@ def main():
                         help="Max candidates per SakanaAI level to consider (~5000 total)")
     parser.add_argument("--no_pipeline_check", action="store_true",
                         help="Skip Gate 2. Faster but includes unverified kernels.")
+    parser.add_argument("--gate2_sample", type=int, default=0,
+                        help="Run Gate 2 on N random samples only (quality check). "
+                             "All Gate 1 pairs are written to output regardless.")
     parser.add_argument("--workers", type=int, default=16,
                         help="Parallel workers for Gate 2 evaluation (default 16)")
     parser.add_argument("--output", default="./sft_training_pairs.jsonl")
@@ -148,8 +151,12 @@ def main():
     print("=" * 60)
     print("SFT data generation")
     print("  Gate 1: SakanaAI Correct=True")
-    print(f"  Gate 2: GRPO pipeline eval ({args.workers} parallel workers)"
-          if run_pipeline_check else "  Gate 2: SKIPPED (--no_pipeline_check)")
+    if not run_pipeline_check:
+        print("  Gate 2: SKIPPED (--no_pipeline_check)")
+    elif args.gate2_sample > 0:
+        print(f"  Gate 2: SAMPLE {args.gate2_sample} for quality check ({args.workers} workers)")
+    else:
+        print(f"  Gate 2: GRPO pipeline eval ({args.workers} parallel workers)")
     print("=" * 60)
 
     # ── Step 1: Collect all Gate 1 candidates (fast — no compilation) ────
@@ -198,7 +205,39 @@ def main():
     pairs = []
     g2_pass = g2_fail = 0
 
-    if run_pipeline_check:
+    if run_pipeline_check and args.gate2_sample > 0:
+        # Sample mode — Gate 2 on N random candidates for quality estimate only.
+        # All Gate 1 candidates are included in the output.
+        import random
+        sample = random.sample(candidates, min(args.gate2_sample, len(candidates)))
+        print(f"\nStep 2/2: Gate 2 quality check on {len(sample)} random samples "
+              f"({args.workers} workers)...")
+        t0 = time.time()
+        pairs_input = [(c[0], c[1]) for c in sample]
+        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+            results = list(tqdm(
+                pool.map(_grpo_eval_worker, pairs_input, chunksize=1),
+                total=len(pairs_input),
+                unit="kernel",
+                desc="Gate 2 sample",
+            ))
+        g2_pass = sum(1 for ok, _ in results if ok)
+        g2_fail = len(results) - g2_pass
+        elapsed = time.time() - t0
+        print(f"Gate 2 sample: {g2_pass}/{len(sample)} pass "
+              f"({g2_pass / len(sample) * 100:.1f}% pass rate) in {elapsed:.0f}s")
+        print(f"Estimated clean pairs in full set: "
+              f"~{int(len(candidates) * g2_pass / len(sample))}/{len(candidates)}")
+        print("Writing all Gate 1 candidates to output...")
+        for cuda_code, pytorch_code, meta in candidates:
+            pairs.append({
+                **meta,
+                "pytorch_code": pytorch_code,
+                "cuda_kernel": cuda_code,
+                "text": make_training_text(pytorch_code, cuda_code),
+            })
+
+    elif run_pipeline_check:
         print(f"\nStep 2/2: Gate 2 — GRPO pipeline eval on {len(candidates)} candidates "
               f"({args.workers} workers)...")
 
