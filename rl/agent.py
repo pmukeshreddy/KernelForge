@@ -256,12 +256,17 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
             sig_inner = _extract_sig(code, paren_start)
             if sig_inner is None:
                 continue
-            # Walk back from m.start() to find the start of the return type
+            # Walk back from m.start() to find the start of the return type.
+            # Stop at ';' or '}' only — NOT '\n', so multi-line return types like
+            #   std::vector<torch::Tensor>\nforward(...) are captured correctly.
             k = m.start() - 1
-            while k >= 0 and code[k] not in (';', '}', '\n'):
+            while k >= 0 and code[k] not in (';', '}'):
                 k -= 1
             decl_start = k + 1
             decl = code[decl_start:m.end() - 1 + len(sig_inner)].strip()
+            # Skip CUDA kernel definitions (__global__ / __device__ functions)
+            if re.match(r'__(?:global|device|host)__', decl):
+                continue
             return decl
         return None
 
@@ -443,7 +448,7 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
             return canonical
 
         # ── Tensor: output buffer → allocate from first forward arg ──────────
-        OUTPUT_NAMES = {'output', 'out', 'result', 'out_tensor', 'output_tensor', 'y', 'z'}
+        OUTPUT_NAMES = {'output', 'out', 'result', 'out_tensor', 'output_tensor'}
         if is_tensor and eff in OUTPUT_NAMES:
             return f'torch.empty_like({canonical})'
 
