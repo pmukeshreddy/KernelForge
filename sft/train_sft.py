@@ -199,6 +199,8 @@ def main():
     parser.add_argument("--n_kernelbench_eval", type=int, default=50,
                         help="Number of KernelBench prompts to eval after training")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--no_train", action="store_true",
+                        help="Skip training, load existing LoRA from --output_dir and run eval only")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -226,70 +228,87 @@ def main():
     eval_dataset  = Dataset.from_list(val_pairs)
 
     # ── Load model + tokenizer ─────────────────────────────────────────────
-    print(f"\nLoading tokenizer: {args.model_id}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True, use_fast=False)
-    tokenizer.pad_token = tokenizer.eos_token
+    if args.no_train:
+        # Load base model + existing LoRA adapter
+        from peft import PeftModel
+        print(f"\nLoading tokenizer from {args.output_dir}")
+        tokenizer = AutoTokenizer.from_pretrained(args.output_dir, trust_remote_code=True, use_fast=False)
+        tokenizer.pad_token = tokenizer.eos_token
+        print(f"Loading base model: {args.model_id}")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_id,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+            attn_implementation="flash_attention_2",
+        )
+        print(f"Loading LoRA adapter from {args.output_dir}")
+        model = PeftModel.from_pretrained(model, args.output_dir)
+        eval_model = model
+    else:
+        print(f"\nLoading tokenizer: {args.model_id}")
+        tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True, use_fast=False)
+        tokenizer.pad_token = tokenizer.eos_token
 
-    print(f"Loading model: {args.model_id}")
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_id,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
-        attn_implementation="flash_attention_2",
-    )
+        print(f"Loading model: {args.model_id}")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_id,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+            attn_implementation="flash_attention_2",
+        )
 
-    lora_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        lora_dropout=0.05,
-        target_modules="all-linear",
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
+        lora_config = LoraConfig(
+            r=16,
+            lora_alpha=32,
+            lora_dropout=0.05,
+            target_modules="all-linear",
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
 
-    # ── Train ──────────────────────────────────────────────────────────────
-    training_args = SFTConfig(
-        output_dir="./sft_output",
-        per_device_train_batch_size=2,
-        gradient_accumulation_steps=8,
-        num_train_epochs=3,
-        learning_rate=1e-4,
-        warmup_ratio=0.1,
-        logging_steps=5,
-        save_strategy="epoch",
-        eval_strategy="epoch",
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
-        bf16=True,
-        gradient_checkpointing=True,
-        dataset_text_field="text",
-        packing=True,
-        report_to="none",
-    )
+        training_args = SFTConfig(
+            output_dir="./sft_output",
+            per_device_train_batch_size=2,
+            gradient_accumulation_steps=8,
+            num_train_epochs=3,
+            learning_rate=1e-4,
+            warmup_ratio=0.1,
+            logging_steps=5,
+            save_strategy="epoch",
+            eval_strategy="epoch",
+            load_best_model_at_end=True,
+            metric_for_best_model="eval_loss",
+            greater_is_better=False,
+            bf16=True,
+            gradient_checkpointing=True,
+            dataset_text_field="text",
+            packing=True,
+            report_to="none",
+        )
 
-    trainer = SFTTrainer(
-        model=model,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        args=training_args,
-    )
+        trainer = SFTTrainer(
+            model=model,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            args=training_args,
+        )
 
-    print("\nStarting SFT training...")
-    trainer.train()
+        print("\nStarting SFT training...")
+        trainer.train()
 
-    # Save LoRA adapter (do NOT merge — GRPO needs separate base + adapter)
-    print(f"\nSaving LoRA adapter to {args.output_dir}")
-    trainer.model.save_pretrained(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
+        print(f"\nSaving LoRA adapter to {args.output_dir}")
+        trainer.model.save_pretrained(args.output_dir)
+        tokenizer.save_pretrained(args.output_dir)
+        eval_model = trainer.model
 
     # ── Post-training eval ─────────────────────────────────────────────────
     # 1. Held-out test set from SakanaAI (same distribution as training)
     test_items = [(p["pytorch_code"], f"sakana/{p.get('task_id','?')}") for p in test_pairs]
-    run_eval(trainer.model, tokenizer, test_items,
+    run_eval(eval_model, tokenizer, test_items,
              workers=args.eval_workers, tag="held-out SakanaAI test")
 
     # 2. KernelBench prompts (different distribution — unseen tasks)
@@ -299,7 +318,7 @@ def main():
             kb_prompts = [json.loads(l) for l in f]
         kb_sample = random.sample(kb_prompts, min(args.n_kernelbench_eval, len(kb_prompts)))
         kb_items = [(p["pytorch_code"], f"kb/{p.get('task_id','?')}") for p in kb_sample]
-        run_eval(trainer.model, tokenizer, kb_items,
+        run_eval(eval_model, tokenizer, kb_items,
                  workers=args.eval_workers, tag="KernelBench (unseen)")
     else:
         print(f"\nSkipping KernelBench eval — {args.rl_prompts} not found")
