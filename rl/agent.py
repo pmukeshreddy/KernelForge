@@ -168,36 +168,46 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
     # Bare 'Tensor' (no namespace): lookbehind prevents double-expanding torch::Tensor.
     cuda_code = re.sub(r'(?<!:)\bTensor\b', 'torch::Tensor', cuda_code)
 
-    # Find all torch::Tensor binding function signatures
-    sig_pattern = r'(torch::Tensor\s+(\w+)\s*\([^)]*\))\s*\{'
-    sig_matches = re.findall(sig_pattern, cuda_code)
-
-    if not sig_matches:
-        # Fallback 1: semicolon-terminated declarations
-        sig_matches = re.findall(r'(torch::Tensor\s+(\w+)\s*\([^)]*\))\s*;', cuda_code)
-
-    if not sig_matches:
-        # Fallback 2: vector<torch::Tensor> return (multi-output kernels)
-        vec_matches = re.findall(
-            r'(std::vector<torch::Tensor>\s+(\w+)\s*\([^)]*\))\s*\{', cuda_code
+    # Find all binding function signatures using balanced-paren matching.
+    # This handles multi-line signatures and nested parens in default args
+    # (e.g. stride=std::vector<int64_t>(), n=static_cast<int>(x.size(0))).
+    def _find_binding_functions(code: str):
+        """
+        Scan for torch::Tensor / std::vector<torch::Tensor> / std::tuple<...>
+        binding functions. Uses balanced-paren matching so nested parens in
+        argument lists (default values, casts) don't truncate the signature.
+        Returns list of (declaration_str, func_name).
+        """
+        found = []
+        ret_pat = re.compile(
+            r'(?:std::(?:vector|tuple)\s*<[^>]+>\s*|torch::Tensor\s+)'
+            r'(\w+)\s*\('
         )
-        if vec_matches:
-            sig_matches = vec_matches
+        for m in ret_pat.finditer(code):
+            func_name = m.group(1)
+            # Skip CUDA qualifiers / well-known non-binding names
+            if func_name in ('__global__', '__device__', '__host__',
+                             'TORCH_CHECK', 'AT_CHECK', 'AT_ASSERTM',
+                             'torch', 'at', 'std'):
+                continue
+            paren_start = m.end() - 1  # points at the opening '('
+            depth, i = 0, paren_start
+            while i < len(code):
+                if code[i] == '(':
+                    depth += 1
+                elif code[i] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        # Only accept definitions '{' or declarations ';'
+                        rest = code[i + 1:i + 80].lstrip()
+                        if rest[:1] in ('{', ';') or re.match(r'(?:const|noexcept|override)\s*[{;]', rest):
+                            decl = code[m.start():i + 1].strip()
+                            found.append((decl, func_name))
+                        break
+                i += 1
+        return found
 
-    if not sig_matches:
-        # Fallback 3: any non-kernel, non-device C++ function — take the first one
-        # that is NOT __global__ or __device__ and has recognisable tensor args
-        for m in re.finditer(
-            r'(?<!__global__\s)(?<!__device__\s)'
-            r'(\w[\w:<>*&\s]+\s+(\w+)\s*\((?:[^)]*torch::[^)]*)\))\s*\{',
-            cuda_code,
-        ):
-            full_sig, fname = m.group(1).strip(), m.group(2)
-            # Rewrite return type to torch::Tensor
-            fixed = re.sub(r'^[\w:<>*&\s]+(?=\s+\w+\s*\()', 'torch::Tensor', full_sig)
-            cuda_code = cuda_code[:m.start(1)] + fixed + cuda_code[m.start(1) + len(full_sig):]
-            sig_matches = [(fixed, fname)]
-            break
+    sig_matches = _find_binding_functions(cuda_code)
 
     if not sig_matches:
         print(f"[WRAPPER DEBUG] No torch::Tensor binding found. First 300 chars of cuda_code:\n{cuda_code[:300]}")
@@ -251,15 +261,27 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
     # Use the last binding function as the one to call from forward()
     binding_func = func_names[-1]
 
-    # 3. Parse binding function arg names to detect stateful models
+    # 3. Parse binding function arg names to detect stateful models.
+    # Use balanced-paren extraction on the last signature to handle nested parens
+    # in default values (e.g. stride=std::vector<int64_t>()).
     last_sig = func_signatures[-1]
-    param_list_match = re.search(r'\w+\s*\(([^)]*)\)\s*$', last_sig.split('{')[0])
     binding_arg_names = []
-    if param_list_match:
-        for param in param_list_match.group(1).split(','):
-            words = re.findall(r'\b\w+\b', param.strip())
-            if words:
-                binding_arg_names.append(words[-1])
+    paren_m = re.search(r'\w+\s*\(', last_sig)
+    if paren_m:
+        ps = paren_m.end() - 1
+        depth, i = 0, ps
+        while i < len(last_sig):
+            if last_sig[i] == '(':  depth += 1
+            elif last_sig[i] == ')':
+                depth -= 1
+                if depth == 0:
+                    raw_params = last_sig[ps + 1:i]
+                    for param in _split_args(raw_params):
+                        words = re.findall(r'\b\w+\b', param.split('=')[0].strip())
+                        if words:
+                            binding_arg_names.append(words[-1])
+                    break
+            i += 1
 
     forward_args_list = [a.strip() for a in fwd_args_clean.split(',') if a.strip()]
     forward_set = set(forward_args_list)
