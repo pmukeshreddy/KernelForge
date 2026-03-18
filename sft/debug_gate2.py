@@ -138,7 +138,7 @@ def main():
         print(f"{'─'*60}")
         for label, detail in entries[:2]:
             print(f"\n  [{label}]")
-            print(f"  {detail[:400]}")
+            print(detail)
 
 
 if __name__ == "__main__":
