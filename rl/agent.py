@@ -368,11 +368,18 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
 
     def _map_extra_arg(arg: str, init_body: str) -> str:
         """Map a C++ binding arg name to the correct Python self.* accessor."""
-        # Strip _obj suffix (SakanaAI naming: weight_obj, bias_obj, x_obj, ...)
-        effective = arg[:-4] if arg.endswith('_obj') else arg
+        # Strip known decorative suffixes: _obj, _opt, _tensor
+        effective = arg
+        for sfx in ('_obj', '_opt', '_tensor'):
+            if effective.endswith(sfx):
+                effective = effective[:-len(sfx)]
+                break
 
-        # If effective name is a forward arg, pass it through directly (not self.*)
-        if effective in forward_set:
+        # If effective name is a forward arg, pass it through directly (not self.*).
+        # Only do this when there's no nn module — stateful models should NOT have
+        # forward args duplicated as extra C++ args (causes (x, x, weight, ...) bugs).
+        has_nn_module = bool(re.search(r'\bself\.(\w+)\s*=\s*nn\.', init_body))
+        if effective in forward_set and not has_nn_module:
             return effective
 
         # Direct match: self.bias, self.weight, etc.
@@ -417,11 +424,11 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
                 return f'torch.log({base})'
 
         # Scalar/tuple attributes stored in nn module.
-        # stride/padding/dilation/kernel_size are tuples → index [0].
-        # groups is a plain int → no index.
+        # Use _si() helper (added to wrapper) which handles both int and tuple:
+        #   _si(v, i=0) → v[i] if tuple/list else v
         tuple_attrs = ('stride', 'padding', 'dilation', 'output_padding', 'kernel_size')
         if effective in tuple_attrs and mod_name:
-            return f'self.{mod_name}.{effective}[0]'
+            return f'_si(self.{mod_name}.{effective})'
         if effective == 'groups' and mod_name:
             return f'self.{mod_name}.groups'
 
@@ -431,9 +438,9 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
             if effective.endswith(suffix):
                 base_attr = effective[:-len(suffix)]
                 if base_attr in tuple_attrs and mod_name:
-                    return f'self.{mod_name}.{base_attr}[{idx}]'
+                    return f'_si(self.{mod_name}.{base_attr}, {idx})'
                 if base_attr == 'kernel_size' and mod_name:
-                    return f'self.{mod_name}.kernel_size[{idx}]'
+                    return f'_si(self.{mod_name}.kernel_size, {idx})'
 
         # Pattern: conv_weight -> self.conv.weight, bn_running_mean -> self.bn.running_mean
         known_attrs = tensor_attrs
@@ -449,6 +456,10 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
     ext_block = f'''import torch
 import torch.nn as nn
 from torch.utils.cpp_extension import load_inline
+
+# Helper: safely index a value that may be int or tuple/list
+def _si(v, i=0):
+    return v[i] if isinstance(v, (tuple, list)) else v
 
 cuda_source = {cuda_source_expr}
 
