@@ -13,6 +13,7 @@ import os
 import random
 import sys
 import re
+from tqdm import tqdm
 import torch
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -148,37 +149,47 @@ def run_eval(model, tokenizer, eval_items: list, workers: int = 16, tag: str = "
     tokenizer.padding_side = "left"
     model.eval()
 
+    # Generation with tqdm
     generated = []
-    for i in range(0, len(eval_items), batch_size):
-        batch = eval_items[i:i + batch_size]
-        prompts = [make_prompt(pytorch_code) for pytorch_code, _ in batch]
-        inputs = tokenizer(prompts, return_tensors="pt", padding=True,
-                           truncation=True, max_length=4096).to(model.device)
-        prompt_len = inputs["input_ids"].shape[1]
-        with torch.no_grad():
-            out = model.generate(
-                **inputs,
-                max_new_tokens=2048,
-                do_sample=False,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-        for j, (pytorch_code, label) in enumerate(batch):
-            text = tokenizer.decode(out[j][prompt_len:], skip_special_tokens=True)
-            model_new_py = _extract_python_block(text) or None
-            generated.append((model_new_py, pytorch_code, label))
-        print(f"  Generated {min(i+batch_size, len(eval_items))}/{len(eval_items)}", end="\r")
+    n_batches = (len(eval_items) + batch_size - 1) // batch_size
+    with tqdm(total=len(eval_items), desc="Generate", unit="problem") as bar:
+        for i in range(0, len(eval_items), batch_size):
+            batch = eval_items[i:i + batch_size]
+            prompts = [make_prompt(pytorch_code) for pytorch_code, _ in batch]
+            inputs = tokenizer(prompts, return_tensors="pt", padding=True,
+                               truncation=True, max_length=4096).to(model.device)
+            prompt_len = inputs["input_ids"].shape[1]
+            with torch.no_grad():
+                out = model.generate(
+                    **inputs,
+                    max_new_tokens=2048,
+                    do_sample=False,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+            for j, (pytorch_code, label) in enumerate(batch):
+                text = tokenizer.decode(out[j][prompt_len:], skip_special_tokens=True)
+                model_new_py = _extract_python_block(text) or None
+                generated.append((model_new_py, pytorch_code, label))
+            bar.update(len(batch))
 
-    # Parallel sandbox verification
+    # Parallel sandbox verification with live pass rate
     n_pass = n_fail = 0
     with ProcessPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_eval_worker, item): item for item in generated}
-        for fut in futures:
-            ok, label, err = fut.result()
-            if ok:
-                n_pass += 1
-            else:
-                n_fail += 1
-                print(f"  FAIL [{label}]: {(err or '')[:120]}")
+        with tqdm(total=len(generated), desc="Verify", unit="kernel") as bar:
+            for fut in as_completed(futures):
+                ok, label, err = fut.result()
+                if ok:
+                    n_pass += 1
+                else:
+                    n_fail += 1
+                total_so_far = n_pass + n_fail
+                bar.set_postfix(
+                    passed=n_pass,
+                    failed=n_fail,
+                    pass_rate=f"{n_pass/total_so_far*100:.0f}%"
+                )
+                bar.update(1)
 
     total = n_pass + n_fail
     print(f"\n{tag} Pass@1: {n_pass}/{total} = {n_pass/max(1,total)*100:.1f}%")
