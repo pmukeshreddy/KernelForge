@@ -113,7 +113,7 @@ def make_training_text(pytorch_code: str, model_new_py: str) -> str:
     )
 
 
-# ── Claude API: generate model_new.py ─────────────────────────────────────
+# ── Claude API: batch generate model_new.py with caching ──────────────────
 
 CLAUDE_SYSTEM = """\
 You are an expert NVIDIA CUDA engineer.
@@ -142,6 +142,25 @@ Verified CUDA C++ kernel (Correct=True, already tested by SakanaAI):
 Generate the complete model_new.py:
 """
 
+CACHE_FILE = os.path.join(os.path.dirname(__file__), ".claude_cache.json")
+
+
+def _cache_key(cuda_code: str, pytorch_code: str) -> str:
+    import hashlib
+    return hashlib.md5((cuda_code + pytorch_code).encode()).hexdigest()
+
+
+def _load_cache() -> dict:
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def _save_cache(cache: dict):
+    with open(CACHE_FILE, "w") as f:
+        json.dump(cache, f)
+
 
 def _extract_python_block(text: str) -> str:
     import re
@@ -149,26 +168,84 @@ def _extract_python_block(text: str) -> str:
     return m.group(1).strip() if m else ""
 
 
-def _generate_model_new(item: tuple, api_key: str) -> tuple:
-    """Call Claude to generate model_new.py for one SakanaAI kernel."""
+def _generate_batch(sample: list, api_key: str) -> list:
+    """
+    Submit all requests as a single Claude Batch API call.
+    Checks cache first — only sends uncached items.
+    Returns list of (model_new_py | None, pytorch_code, meta) in same order as sample.
+    """
     import anthropic
-    cuda_code, pytorch_code, meta = item
+    import time
+
     client = anthropic.Anthropic(api_key=api_key)
-    try:
-        msg = client.messages.create(
-            model="claude-opus-4-6",
-            max_tokens=4096,
-            system=CLAUDE_SYSTEM,
-            messages=[{"role": "user", "content": CLAUDE_PROMPT.format(
-                pytorch_code=pytorch_code,
-                cuda_code=cuda_code,
-            )}],
-        )
-        model_new_py = _extract_python_block(msg.content[0].text)
-        return model_new_py or None, pytorch_code, meta
-    except Exception as e:
-        print(f"  Claude error [{meta.get('task_id','?')}]: {e}")
-        return None, pytorch_code, meta
+    cache  = _load_cache()
+
+    # Split into cached and uncached
+    results   = [None] * len(sample)
+    to_submit = []   # (original_index, cuda_code, pytorch_code, meta)
+
+    for i, (cuda_code, pytorch_code, meta) in enumerate(sample):
+        key = _cache_key(cuda_code, pytorch_code)
+        if key in cache:
+            results[i] = (cache[key], pytorch_code, meta)
+        else:
+            to_submit.append((i, cuda_code, pytorch_code, meta))
+
+    print(f"  Cache hits: {len(sample) - len(to_submit)}/{len(sample)}")
+
+    if not to_submit:
+        return results
+
+    print(f"  Submitting {len(to_submit)} requests to Claude Batch API...")
+
+    # Build batch requests
+    requests = []
+    for idx, (i, cuda_code, pytorch_code, meta) in enumerate(to_submit):
+        requests.append({
+            "custom_id": str(idx),
+            "params": {
+                "model": "claude-opus-4-6",
+                "max_tokens": 4096,
+                "system": CLAUDE_SYSTEM,
+                "messages": [{"role": "user", "content": CLAUDE_PROMPT.format(
+                    pytorch_code=pytorch_code,
+                    cuda_code=cuda_code,
+                )}],
+            },
+        })
+
+    # Submit batch
+    batch = client.beta.messages.batches.create(requests=requests)
+    print(f"  Batch ID: {batch.id} — polling...")
+
+    # Poll until complete
+    while batch.processing_status != "ended":
+        time.sleep(10)
+        batch = client.beta.messages.batches.retrieve(batch.id)
+        counts = batch.request_counts
+        print(f"    processing={counts.processing} succeeded={counts.succeeded} "
+              f"errored={counts.errored}", end="\r")
+    print()
+
+    # Collect results
+    batch_results = {}
+    for result in client.beta.messages.batches.results(batch.id):
+        idx = int(result.custom_id)
+        if result.result.type == "succeeded":
+            text = result.result.message.content[0].text
+            batch_results[idx] = _extract_python_block(text) or None
+        else:
+            batch_results[idx] = None
+
+    # Merge into results + update cache
+    for idx, (i, cuda_code, pytorch_code, meta) in enumerate(to_submit):
+        model_new_py = batch_results.get(idx)
+        results[i]   = (model_new_py, pytorch_code, meta)
+        key = _cache_key(cuda_code, pytorch_code)
+        cache[key] = model_new_py   # cache even None to avoid re-submitting failures
+
+    _save_cache(cache)
+    return results
 
 
 # ── Sandbox verification worker ────────────────────────────────────────────
@@ -258,14 +335,10 @@ def main():
     sample = random.sample(all_candidates, min(args.n, len(all_candidates)))
     print(f"Sampled: {len(sample)}")
 
-    # ── Step 1: Claude generates model_new.py ────────────────────────────
-    print(f"\nStep 1: Generating model_new.py via Claude API ({len(sample)} kernels)...")
+    # ── Step 1: Claude Batch API generates model_new.py ──────────────────
+    print(f"\nStep 1: Generating model_new.py via Claude Batch API ({len(sample)} kernels)...")
     t0 = time.time()
-    generated = []
-    for item in tqdm(sample, unit="kernel", desc="Claude"):
-        model_new_py, pytorch_code, meta = _generate_model_new(item, args.claude_api_key)
-        generated.append((model_new_py, pytorch_code, meta))
-
+    generated = _generate_batch(sample, args.claude_api_key)
     n_generated = sum(1 for m, _, _ in generated if m)
     print(f"Claude generated: {n_generated}/{len(sample)} in {time.time()-t0:.0f}s")
 
