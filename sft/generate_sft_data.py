@@ -16,7 +16,7 @@ import random
 import sys
 import time
 import unicodedata
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datasets import load_dataset
 from tqdm import tqdm
 
@@ -79,10 +79,6 @@ torch::Tensor add_cuda(torch::Tensor a, torch::Tensor b) {
         a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), n);
     return out;
 }
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward", &add_cuda, "add");
-}
 \"\"\"
 
 ext = load_inline(
@@ -126,6 +122,10 @@ The file must:
 - Use load_inline to compile it
 - Define ModelNew(nn.Module) with correct forward() that calls the kernel
 - Match the reference PyTorch model's interface exactly (same __init__ args, same forward args)
+
+CRITICAL: If the CUDA source contains a PYBIND11_MODULE block, you MUST remove it entirely
+from cuda_source. load_inline generates its own bindings via functions=[]. Having both causes
+a duplicate symbol linker error and the kernel will fail to compile.
 """
 
 CLAUDE_PROMPT = """\
@@ -278,7 +278,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--n", type=int, default=500,
                         help="Number of SakanaAI kernels to sample (default 500)")
-    parser.add_argument("--workers", type=int, default=16,
+    parser.add_argument("--workers", type=int, default=32,
                         help="Parallel workers for sandbox verification")
     parser.add_argument("--claude_api_key", default=os.environ.get("ANTHROPIC_API_KEY", ""),
                         help="Anthropic API key (or set ANTHROPIC_API_KEY env var)")
@@ -343,18 +343,30 @@ def main():
     print(f"Claude generated: {n_generated}/{len(sample)} in {time.time()-t0:.0f}s")
 
     # ── Step 2: Sandbox verification ─────────────────────────────────────
-    print(f"\nStep 2: Compiling + verifying {n_generated} generated wrappers "
-          f"({args.workers} workers)...")
+    # Filter out None entries before the pool to avoid wasting worker slots
+    to_verify = [(m, p, meta) for m, p, meta in generated if m]
+    skipped = len(generated) - len(to_verify)
+    print(f"\nStep 2: Compiling + verifying {len(to_verify)} generated wrappers "
+          f"({args.workers} workers, {skipped} skipped as None)...")
     t0 = time.time()
 
+    verify_results = []
+    n_pass = n_fail = 0
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
-        verify_results = list(tqdm(
-            pool.map(_verify_worker, generated, chunksize=1),
-            total=len(generated), unit="kernel", desc="Verify",
-        ))
+        futures = {pool.submit(_verify_worker, item): item for item in to_verify}
+        with tqdm(total=len(to_verify), unit="kernel", desc="Verify") as bar:
+            for fut in as_completed(futures):
+                ok, m, p, meta = fut.result()
+                verify_results.append((ok, m, p, meta))
+                if ok:
+                    n_pass += 1
+                else:
+                    n_fail += 1
+                bar.set_postfix(passed=n_pass, failed=n_fail, rate=f"{n_pass}/{n_pass+n_fail}")
+                bar.update(1)
 
     passed = [(m, p, meta) for ok, m, p, meta in verify_results if ok]
-    print(f"Verified: {len(passed)}/{n_generated} pass in {time.time()-t0:.0f}s")
+    print(f"Verified: {len(passed)}/{len(to_verify)} pass ({n_fail} failed) in {time.time()-t0:.0f}s")
 
     if not passed:
         print("ERROR: No pairs passed verification.")
