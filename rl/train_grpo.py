@@ -86,7 +86,7 @@ class GRPOConfig:
 
     # Generation
     max_new_tokens: int = 1800
-    temperature: float = 0.7
+    temperature: float = 0.3
     mock_mode: bool = False
 
     # SGLang server-mode generation (faster than model.generate())
