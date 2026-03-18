@@ -152,6 +152,7 @@ def run_eval(model, tokenizer, eval_items: list, workers: int = 16, tag: str = "
     model.eval()
 
     # Generation with tqdm
+    eval_items = eval_items[:5]  # diagnose on 5 samples only
     generated = []
     n_batches = (len(eval_items) + batch_size - 1) // batch_size
     with tqdm(total=len(eval_items), desc="Generate", unit="problem") as bar:
