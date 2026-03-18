@@ -350,6 +350,16 @@ def main():
     n_generated = sum(1 for m, _, _ in generated if m)
     print(f"Claude generated: {n_generated}/{len(sample)} in {time.time()-t0:.0f}s")
 
+    # Print first generated sample so we can sanity-check Claude's output
+    for m, p, meta in generated:
+        if m:
+            print(f"\n{'─'*60}")
+            print(f"SAMPLE OUTPUT [{meta.get('task_id','?')} / {meta.get('level_id','?')}]")
+            print(f"{'─'*60}")
+            print(m[:2000])
+            print(f"{'─'*60}\n")
+            break
+
     # ── Step 2: Sandbox verification ─────────────────────────────────────
     # Filter out None entries before the pool to avoid wasting worker slots
     to_verify = [(m, p, meta) for m, p, meta in generated if m]
