@@ -246,6 +246,7 @@ def launch_sglang_server(model_path: str, adapter_path: str, port: int, tp: int,
         "--dtype", "bfloat16",
         "--trust-remote-code",
         "--mem-fraction-static", "0.4",  # leave 60% for training process
+        "--log-level", "error",
     ]
     env = {**__import__("os").environ, "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "1"}
     proc = subprocess.Popen(cmd, env=env)
