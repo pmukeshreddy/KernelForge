@@ -484,6 +484,11 @@ def _run_group_episodes(
         n_compiled = sum(1 for res in eval_results if res is not None and res.get("compiles", res.get("correct", False)))
         compile_rate = n_compiled / max(1, len(active_indices))
         print(f"done ({time.time()-t_eval:.1f}s) | compiled={n_compiled}/{n_valid}")
+        if n_compiled == 0 and step == 0:
+            for res in eval_results:
+                if res is not None and not res.get("compiles", False):
+                    print(f"  [COMPILE ERROR] {res.get('compiler_error', 'no error')[:600]}")
+                    break
 
         # 4. Process results and update trajectories
         for batch_idx, traj_idx in enumerate(active_indices):
