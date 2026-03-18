@@ -246,7 +246,6 @@ def launch_sglang_server(model_path: str, adapter_path: str, port: int, tp: int,
         "--dtype", "bfloat16",
         "--trust-remote-code",
         "--mem-fraction-static", "0.4",  # leave 60% for training process
-        "--disable-radix-cache",         # deterministic batching for on-policy RL
     ]
     env = {**__import__("os").environ, "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "1"}
     proc = subprocess.Popen(cmd, env=env)
@@ -485,8 +484,11 @@ def _run_group_episodes(
         # First, extract code quickly
         candidates = []
         error_msgs = []
-        for resp in response_texts:
+        for batch_idx, resp in enumerate(response_texts):
+            traj_idx = active_indices[batch_idx]
             cuda_code = _extract_cuda_code(resp)
+            if step == 0 and batch_idx < 2:
+                print(f"  [CODE DUMP traj={traj_idx} turn={step}]:\n{(cuda_code or resp)[:800]}")
             if not cuda_code:
                 candidates.append(None)
                 error_msgs.append("Error: No ```cpp block found. Output CUDA C++ in a ```cpp code block.")
