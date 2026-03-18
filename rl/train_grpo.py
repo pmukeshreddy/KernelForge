@@ -499,9 +499,8 @@ def _compute_grpo_loss(
     std_r = rewards.std() + 1e-8
     advantages = (rewards - mean_r) / std_r  # [G]
 
-    total_loss = torch.tensor(0.0, device=next(model.parameters()).device,
-                              requires_grad=True)
-    n_tokens = 0
+    device = next(model.parameters()).device
+    token_losses = []
 
     for i in range(G):
         A_i = advantages[i].item()
@@ -526,15 +525,13 @@ def _compute_grpo_loss(
                 1.0 + config.cliprange_high,
             )
 
-            # Token-level loss (not sample-level mean then loss)
-            token_loss = -torch.min(ratio * float(A_i), clipped * float(A_i))
-            total_loss = total_loss + token_loss.sum()
-            n_tokens += len(resp)
+            # Token-level loss
+            token_losses.append(-torch.min(ratio * float(A_i), clipped * float(A_i)))
 
-    if n_tokens > 0:
-        total_loss = total_loss / float(n_tokens)
+    if not token_losses:
+        return torch.tensor(0.0, device=device, requires_grad=True)
 
-    return total_loss
+    return torch.cat(token_losses).mean()
 
 
 def _run_evaluation(model, tokenizer, config: GRPOConfig, val_prompts: list[str]) -> dict:
@@ -815,7 +812,10 @@ def train(config: GRPOConfig = None):
 
                 torch.nn.utils.clip_grad_norm_(trainable_params, config.max_grad_norm)
                 optimizer.step()
-                scheduler.step()
+
+            # One scheduler step per batch step (not per grpo_epoch) so LR
+            # schedule completes in the expected number of training steps.
+            scheduler.step()
 
             # Sync updated LoRA weights to SGLang server after all GRPO epochs
             if not config.mock_mode and config.use_sglang and (SGLANG_AVAILABLE or config.sglang_python):
