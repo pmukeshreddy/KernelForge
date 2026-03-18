@@ -265,7 +265,7 @@ def _verify_worker(item):
 
     model_new_py, pytorch_code, meta = item
     if not model_new_py:
-        return False, None, pytorch_code, meta
+        return False, None, pytorch_code, meta, "no_code"
 
     old_out, old_err = sys.stdout, sys.stderr
     sys.stdout = sys.stderr = io.StringIO()
@@ -274,10 +274,11 @@ def _verify_worker(item):
         sys.stdout, sys.stderr = old_out, old_err
         result = evaluate(model_new_py, pytorch_code)
         ok = bool(result and result.get("correct", False))
-        return ok, model_new_py, pytorch_code, meta
-    except Exception:
+        err = result.get("compiler_error", "") if result else "evaluate returned None"
+        return ok, model_new_py, pytorch_code, meta, err
+    except Exception as e:
         sys.stdout, sys.stderr = old_out, old_err
-        return False, None, pytorch_code, meta
+        return False, None, pytorch_code, meta, str(e)
 
 
 # ── main ───────────────────────────────────────────────────────────────────
@@ -374,8 +375,8 @@ def main():
         futures = {pool.submit(_verify_worker, item): item for item in to_verify}
         with tqdm(total=len(to_verify), unit="kernel", desc="Verify") as bar:
             for fut in as_completed(futures):
-                ok, m, p, meta = fut.result()
-                verify_results.append((ok, m, p, meta))
+                ok, m, p, meta, err = fut.result()
+                verify_results.append((ok, m, p, meta, err))
                 if ok:
                     n_pass += 1
                 else:
@@ -383,8 +384,34 @@ def main():
                 bar.set_postfix(passed=n_pass, failed=n_fail, rate=f"{n_pass}/{n_pass+n_fail}")
                 bar.update(1)
 
-    passed = [(m, p, meta) for ok, m, p, meta in verify_results if ok]
+    passed = [(m, p, meta) for ok, m, p, meta, err in verify_results if ok]
+    failures = [(err, meta) for ok, m, p, meta, err in verify_results if not ok and err]
     print(f"Verified: {len(passed)}/{len(to_verify)} pass ({n_fail} failed) in {time.time()-t0:.0f}s")
+
+    # ── Failure breakdown ─────────────────────────────────────────────────
+    if failures:
+        cats = {"compile_error": [], "correctness": [], "timeout": [], "other": []}
+        for err, meta in failures:
+            e = (err or "").lower()
+            if any(k in e for k in ("error:", "nvcc", "undefined", "fatal", "pybind")):
+                cats["compile_error"].append((err, meta))
+            elif "correctness failed" in e or "shape mismatch" in e or "max_abs_error" in e:
+                cats["correctness"].append((err, meta))
+            elif "timed out" in e:
+                cats["timeout"].append((err, meta))
+            else:
+                cats["other"].append((err, meta))
+        print(f"\nFailure breakdown:")
+        for cat, items in cats.items():
+            if items:
+                print(f"  {cat:<16} {len(items):3d}")
+        # Print 2 sample errors per category
+        for cat, items in cats.items():
+            if not items:
+                continue
+            print(f"\n  [{cat.upper()} sample]")
+            for err, meta in items[:2]:
+                print(f"    {meta.get('task_id','?')}: {(err or '')[:200]}")
 
     if not passed:
         print("ERROR: No pairs passed verification.")
