@@ -134,7 +134,8 @@ def _eval_worker(item):
         return False, label, str(e)
 
 
-def run_eval(model, tokenizer, eval_items: list, workers: int = 16, tag: str = "eval"):
+def run_eval(model, tokenizer, eval_items: list, workers: int = 16, tag: str = "eval",
+             batch_size: int = 4):
     """
     Generate model_new.py for each (pytorch_code, label), compile+verify, report Pass@1.
     eval_items: list of (pytorch_code, label)
@@ -143,22 +144,29 @@ def run_eval(model, tokenizer, eval_items: list, workers: int = 16, tag: str = "
     print(f"Post-training eval: {tag} ({len(eval_items)} problems)")
     print(f"{'='*60}")
 
+    # Left-pad so all sequences in a batch end at the same position
+    tokenizer.padding_side = "left"
     model.eval()
+
     generated = []
-    for pytorch_code, label in eval_items:
-        prompt = make_prompt(pytorch_code)
-        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    for i in range(0, len(eval_items), batch_size):
+        batch = eval_items[i:i + batch_size]
+        prompts = [make_prompt(pytorch_code) for pytorch_code, _ in batch]
+        inputs = tokenizer(prompts, return_tensors="pt", padding=True,
+                           truncation=True, max_length=4096).to(model.device)
+        prompt_len = inputs["input_ids"].shape[1]
         with torch.no_grad():
             out = model.generate(
                 **inputs,
                 max_new_tokens=2048,
                 do_sample=False,
-                temperature=1.0,
                 pad_token_id=tokenizer.eos_token_id,
             )
-        text = tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-        model_new_py = _extract_python_block(text) or None
-        generated.append((model_new_py, pytorch_code, label))
+        for j, (pytorch_code, label) in enumerate(batch):
+            text = tokenizer.decode(out[j][prompt_len:], skip_special_tokens=True)
+            model_new_py = _extract_python_block(text) or None
+            generated.append((model_new_py, pytorch_code, label))
+        print(f"  Generated {min(i+batch_size, len(eval_items))}/{len(eval_items)}", end="\r")
 
     # Parallel sandbox verification
     n_pass = n_fail = 0
