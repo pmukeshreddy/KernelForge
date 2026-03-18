@@ -171,20 +171,26 @@ def run_eval(model, tokenizer, eval_items: list, workers: int = 16, tag: str = "
             for j, (pytorch_code, label) in enumerate(batch):
                 text = tokenizer.decode(out[j][prompt_len:], skip_special_tokens=True)
                 model_new_py = _extract_python_block(text) or None
-                generated.append((model_new_py, pytorch_code, label))
+                generated.append((model_new_py, pytorch_code, label, text))
             bar.update(len(batch))
 
     # Parallel sandbox verification with live pass rate
+    # Build lookup: label -> raw text for failure diagnosis
+    raw_text_map = {label: text for _, _, label, text in generated}
+    verify_input = [(m, p, label) for m, p, label, _ in generated]
+
     n_pass = n_fail = 0
+    failures = []
     with ProcessPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_eval_worker, item): item for item in generated}
-        with tqdm(total=len(generated), desc="Verify", unit="kernel") as bar:
+        futures = {pool.submit(_eval_worker, item): item for item in verify_input}
+        with tqdm(total=len(verify_input), desc="Verify", unit="kernel") as bar:
             for fut in as_completed(futures):
                 ok, label, err = fut.result()
                 if ok:
                     n_pass += 1
                 else:
                     n_fail += 1
+                    failures.append((label, err, raw_text_map.get(label, "")))
                 total_so_far = n_pass + n_fail
                 bar.set_postfix(
                     passed=n_pass,
@@ -192,6 +198,21 @@ def run_eval(model, tokenizer, eval_items: list, workers: int = 16, tag: str = "
                     pass_rate=f"{n_pass/total_so_far*100:.0f}%"
                 )
                 bar.update(1)
+
+    # Print failure diagnostics — raw output + sandbox error
+    if failures:
+        print(f"\n{'─'*60}")
+        print(f"FAILURE DIAGNOSTICS (first 3)")
+        print(f"{'─'*60}")
+        for label, err, raw in failures[:3]:
+            has_think = "<think>" in raw
+            has_block = "```python" in raw
+            print(f"\n[{label}]")
+            print(f"  has_think={has_think}  has_python_block={has_block}")
+            print(f"  sandbox_err: {(err or 'none')[:200]}")
+            if has_think:
+                print(f"  think_len={len(re.findall(r'<think>(.*?)</think>', raw, re.DOTALL)[0]) if re.search(r'<think>', raw) else 0} chars")
+            print(f"  raw_output[:300]:\n{raw[:300]}")
 
     total = n_pass + n_fail
     print(f"\n{tag} Pass@1: {n_pass}/{total} = {n_pass/max(1,total)*100:.1f}%")
