@@ -59,7 +59,7 @@ def _debug_worker(item):
             return label, "pass", f"speedup={speedup:.2f}x"
 
         err = result.get("compiler_error") or "wrong output"
-        detail = err[:300] + "\n---WRAPPER DEBUG---\n" + debug_out.strip()[-400:]
+        detail = err[:300] + "\n---WRAPPER DEBUG---\n" + debug_out.strip()[-1200:]
         if any(k in err.lower() for k in ("error:", "nvcc", "undefined", "fatal")):
             return label, "compile_fail", detail
         return label, "wrong_output", detail
@@ -136,7 +136,7 @@ def main():
         print(f"\n{'─'*60}")
         print(f"  {cat.upper()} — sample errors (up to 5)")
         print(f"{'─'*60}")
-        for label, detail in entries[:5]:
+        for label, detail in entries[:2]:
             print(f"\n  [{label}]")
             print(f"  {detail[:400]}")
 
