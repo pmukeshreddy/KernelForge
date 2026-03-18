@@ -8,24 +8,23 @@ Sources:
 
 Verification gates applied to every SFT example before inclusion:
   Gate 1: SakanaAI Correct=True flag
-  Gate 2: nvcc -c compilation (catches API mismatches, syntax errors)
-  Gate 3: Functional correctness — output matches PyTorch reference (optional, --no_functional_check to skip)
+  Gate 2: GRPO pipeline eval — same _worker_eval_pair used during RL training:
+            build_load_inline_wrapper(cuda_code, pytorch_code)
+            → evaluate(wrapper, pytorch_code)
+          If it passes here, it will pass in GRPO. No excuses.
 
-Format matches GRPO rollout exactly so there is zero distribution shift at RL stage.
+Format matches GRPO rollout exactly — zero distribution shift at RL stage.
 """
 import argparse
 import json
 import os
-import re
-import subprocess
 import sys
-import tempfile
 import unicodedata
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 from datasets import load_dataset
 
-# ── import rl/sandbox for functional correctness check ────────────────────
-_rl_dir = os.path.join(os.path.dirname(__file__), "..", "rl")
+# ── rl/ imports — must come before any rl module usage ───────────────────
+_rl_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "rl"))
 if _rl_dir not in sys.path:
     sys.path.insert(0, _rl_dir)
 
@@ -85,9 +84,8 @@ Now write the kernel for the following operation:
 
 def make_training_text(pytorch_code: str, cuda_code: str) -> str:
     """
-    Create full training prompt+target.
-    Format must match GRPO rollout format in rl/train_grpo.py exactly:
-      FORMAT_EXAMPLE + "Reference Program:\\n```python\\n{code}\\n```"
+    Training text format — must match GRPO rollout prompt in rl/train_grpo.py exactly:
+      user_msg = FORMAT_EXAMPLE + "Reference Program:\\n```python\\n{code}\\n```"
     """
     user_msg = FORMAT_EXAMPLE + f"Reference Program:\n```python\n{pytorch_code}\n```"
     return (
@@ -97,88 +95,49 @@ def make_training_text(pytorch_code: str, cuda_code: str) -> str:
     )
 
 
-# ─── Gate 2: nvcc compilation ─────────────────────────────────────────────
+# ─── Gate 2: GRPO pipeline eval (exact same code path as RL training) ─────
 
-def nvcc_compiles(cuda_code: str) -> tuple[bool, str]:
+def _grpo_eval_worker(args):
     """
-    Gate 2: Compile CUDA C++ with nvcc -c.
-    Returns (True, "") on success, (False, error_msg) on failure.
+    Runs in a subprocess via ProcessPoolExecutor to isolate CUDA context.
+
+    This is EXACTLY the same logic as _worker_eval_pair in rl/train_grpo.py:
+        candidate = build_load_inline_wrapper(cuda_code, pytorch_code)
+        return evaluate(candidate, pytorch_code)
+
+    If a kernel passes here, it will pass during GRPO training. Period.
     """
-    try:
-        from torch.utils.cpp_extension import include_paths
-        import sysconfig
-        includes = []
-        for p in include_paths():
-            includes.extend(["-I", p])
-        includes.extend(["-I", sysconfig.get_path("include")])
-    except Exception:
-        includes = []
+    import sys, os
+    rl_dir = args[2]
+    if rl_dir not in sys.path:
+        sys.path.insert(0, rl_dir)
 
-    tmpdir = tempfile.mkdtemp(prefix="kf_sft_nvcc_")
-    cu_path = os.path.join(tmpdir, "kernel.cu")
-    obj_path = os.path.join(tmpdir, "kernel.o")
-    try:
-        with open(cu_path, "w") as f:
-            f.write(cuda_code)
-        cmd = (
-            ["nvcc", "-c", cu_path, "-o", obj_path,
-             "--std=c++17", "-w",
-             "--expt-relaxed-constexpr", "--expt-extended-lambda"]
-            + includes
-        )
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if result.returncode == 0:
-            return True, ""
-        return False, (result.stderr + result.stdout).strip()
-    except subprocess.TimeoutExpired:
-        return False, "nvcc timeout"
-    except Exception as e:
-        return False, str(e)
-    finally:
-        for f in [cu_path, obj_path]:
-            if os.path.exists(f):
-                try:
-                    os.remove(f)
-                except Exception:
-                    pass
-        try:
-            os.rmdir(tmpdir)
-        except Exception:
-            pass
-
-
-# ─── Gate 3: functional correctness ───────────────────────────────────────
-
-def _functional_check_worker(args):
-    """Run in subprocess via ProcessPoolExecutor to isolate CUDA context."""
-    cuda_code, pytorch_code = args
+    cuda_code, pytorch_code, _ = args
     try:
         from agent import build_load_inline_wrapper
         from sandbox import evaluate
         wrapper = build_load_inline_wrapper(cuda_code, pytorch_code)
         if not wrapper:
-            return False, "no_binding"
+            return False, "no torch::Tensor binding found"
         result = evaluate(wrapper, pytorch_code)
         if result is None:
-            return False, "compile_fail"
+            return False, "evaluate returned None"
         if result.get("correct", False):
             return True, ""
-        return False, result.get("compiler_error", "wrong_output")[:200]
+        err = result.get("compiler_error") or "wrong output"
+        return False, err[:300]
     except Exception as e:
-        return False, str(e)[:200]
+        return False, str(e)[:300]
 
 
-def functional_correct(cuda_code: str, pytorch_code: str, timeout: int = 60) -> tuple[bool, str]:
-    """
-    Gate 3: Run the CUDA kernel and verify output matches PyTorch reference.
-    Uses ProcessPoolExecutor to isolate CUDA context per check.
-    """
+def grpo_pipeline_passes(cuda_code: str, pytorch_code: str, timeout: int = 120) -> tuple[bool, str]:
+    """Gate 2: run the exact GRPO eval pipeline on this (cuda_code, pytorch_code) pair."""
     with ProcessPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(_functional_check_worker, (cuda_code, pytorch_code))
+        future = pool.submit(_grpo_eval_worker, (cuda_code, pytorch_code, _rl_dir))
         try:
             return future.result(timeout=timeout)
         except Exception as e:
-            return False, f"timeout/error: {e}"
+            return False, f"timeout/crash: {e}"
 
 
 # ─── main ──────────────────────────────────────────────────────────────────
@@ -186,35 +145,29 @@ def functional_correct(cuda_code: str, pytorch_code: str, timeout: int = 60) -> 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--per_level", type=int, default=1667,
-                        help="Max examples per SakanaAI level (default 1667 → ~5000 total)")
-    parser.add_argument("--no_functional_check", action="store_true",
-                        help="Skip Gate 3 (functional correctness). Faster but lower quality.")
+                        help="Max examples per SakanaAI level (~5000 total)")
+    parser.add_argument("--no_pipeline_check", action="store_true",
+                        help="Skip Gate 2 (GRPO pipeline check). Faster but lower quality.")
     parser.add_argument("--output", default="./sft_training_pairs.jsonl")
     parser.add_argument("--rl_prompts_output", default="./rl_prompts.jsonl")
     args = parser.parse_args()
 
-    run_functional = not args.no_functional_check
+    run_pipeline_check = not args.no_pipeline_check
 
-    # Check nvcc available
-    try:
-        subprocess.run(["nvcc", "--version"], stdout=subprocess.PIPE,
-                       stderr=subprocess.PIPE, check=True)
-        nvcc_available = True
-        print("nvcc: available ✓")
-    except Exception:
-        nvcc_available = False
-        print("WARNING: nvcc not found — Gate 2 will be skipped. Run on GPU machine.")
-
-    if run_functional:
-        print("Gate 3 (functional correctness): ENABLED")
+    print("=" * 60)
+    print("SFT data generation — verification gates:")
+    print("  Gate 1: SakanaAI Correct=True flag")
+    if run_pipeline_check:
+        print("  Gate 2: GRPO pipeline (build_load_inline_wrapper + evaluate)")
+        print("          Same code as _worker_eval_pair in train_grpo.py")
     else:
-        print("Gate 3 (functional correctness): DISABLED (--no_functional_check)")
+        print("  Gate 2: SKIPPED (--no_pipeline_check)")
+    print("=" * 60)
 
     pairs = []
-    gate1_pass = gate2_pass = gate3_pass = 0
-    gate1_fail = gate2_fail = gate3_fail = 0
+    g1_pass = g1_fail = g2_pass = g2_fail = 0
 
-    # === Source: SakanaAI/AI-CUDA-Engineer-Archive ========================
+    # === SakanaAI/AI-CUDA-Engineer-Archive ===================================
     print("\nLoading SakanaAI/AI-CUDA-Engineer-Archive...")
     for level in ["level_1", "level_2", "level_3"]:
         level_pairs = []
@@ -224,15 +177,16 @@ def main():
             print(f"  Warning: could not load {level}: {e}")
             continue
 
+        checked = 0
         for row in ds:
             if len(level_pairs) >= args.per_level:
                 break
 
-            # Gate 1: SakanaAI Correct flag
+            # Gate 1
             if not row.get("Correct", False):
-                gate1_fail += 1
+                g1_fail += 1
                 continue
-            gate1_pass += 1
+            g1_pass += 1
 
             pytorch_code = (
                 row.get("PyTorch_Code_Module", "")
@@ -245,25 +199,16 @@ def main():
             if "__global__" not in cuda_code or "torch::Tensor" not in cuda_code:
                 continue
 
-            # Gate 2: nvcc compilation
-            if nvcc_available:
-                ok, err = nvcc_compiles(cuda_code)
+            # Gate 2: GRPO pipeline
+            if run_pipeline_check:
+                checked += 1
+                ok, err = grpo_pipeline_passes(cuda_code, pytorch_code)
                 if not ok:
-                    gate2_fail += 1
+                    g2_fail += 1
                     continue
-                gate2_pass += 1
+                g2_pass += 1
             else:
-                gate2_pass += 1  # skip gate if no GPU machine
-
-            # Gate 3: functional correctness
-            if run_functional:
-                ok, err = functional_correct(cuda_code, pytorch_code)
-                if not ok:
-                    gate3_fail += 1
-                    continue
-                gate3_pass += 1
-            else:
-                gate3_pass += 1
+                g2_pass += 1
 
             text = make_training_text(pytorch_code, cuda_code)
             level_pairs.append({
@@ -275,14 +220,17 @@ def main():
                 "text": text,
             })
 
+            if len(level_pairs) % 50 == 0:
+                print(f"  {level}: {len(level_pairs)} verified so far "
+                      f"(gate2: {g2_pass} pass / {g2_fail} fail)...")
+
         pairs.extend(level_pairs)
         print(f"  {level}: {len(level_pairs)} verified pairs")
 
     print(f"\nVerification summary:")
-    print(f"  Gate 1 (Correct=True): {gate1_pass} pass, {gate1_fail} fail")
-    print(f"  Gate 2 (nvcc compile): {gate2_pass} pass, {gate2_fail} fail")
-    if run_functional:
-        print(f"  Gate 3 (functional):   {gate3_pass} pass, {gate3_fail} fail")
+    print(f"  Gate 1 (Correct=True):     {g1_pass} pass, {g1_fail} fail")
+    print(f"  Gate 2 (GRPO pipeline):    {g2_pass} pass, {g2_fail} fail")
+    print(f"  Gate 2 rejection rate:     {g2_fail / max(1, g2_pass + g2_fail) * 100:.1f}%")
 
     # Deduplicate
     seen = set()
@@ -293,8 +241,8 @@ def main():
             seen.add(key)
             unique_pairs.append(p)
 
-    if len(unique_pairs) == 0:
-        print("\nERROR: No training pairs survived verification. Check data sources.")
+    if not unique_pairs:
+        print("\nERROR: No pairs survived verification. Check data source and GPU environment.")
         return
 
     with open(args.output, "w") as f:
@@ -302,7 +250,7 @@ def main():
             f.write(json.dumps(p) + "\n")
     print(f"\nSFT training pairs: {len(unique_pairs)} → {args.output}")
 
-    # === RL prompts: KernelBench (prompt-only, no solutions) ==============
+    # === KernelBench RL prompts (prompt-only) ================================
     print("\nLoading KernelBench RL prompts...")
     rl_prompts = []
     existing_codes = {p["pytorch_code"] for p in unique_pairs}
