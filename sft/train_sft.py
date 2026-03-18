@@ -164,11 +164,9 @@ def run_eval(model, tokenizer, eval_items: list, workers: int = 16, tag: str = "
             with torch.no_grad():
                 out = model.generate(
                     **inputs,
-                    max_new_tokens=4096,
+                    max_new_tokens=8192,
                     do_sample=False,
                     pad_token_id=tokenizer.eos_token_id,
-                    # Disable Qwen3 thinking mode — saves tokens, keeps output focused
-                    enable_thinking=False,
                 )
             for j, (pytorch_code, label) in enumerate(batch):
                 text = tokenizer.decode(out[j][prompt_len:], skip_special_tokens=True)
