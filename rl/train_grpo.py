@@ -355,9 +355,8 @@ def _run_group_episodes(
       group_rewards: list of G scalar discounted rewards
     """
     G = config.group_size
-    system_prompt = get_system_prompt()
 
-    # Format example — identical to SFT training format, teaches data_ptr<float>() usage
+    # Format example — identical to SFT training format (from generate_sft_data.py)
     FORMAT_EXAMPLE = """\
 Here is an example of the expected output format:
 
@@ -382,15 +381,28 @@ torch::Tensor add_cuda(torch::Tensor a, torch::Tensor b) {
 Now write the kernel for the following operation:
 """
 
+    def _build_prompt(turns: list[dict], add_prefill: bool = True) -> str:
+        """
+        Build raw Qwen3 prompt string matching the exact SFT training format.
+        sys_prompt.py returns the system block already wrapped with <|im_start|>/<|im_end|>.
+        Avoids apply_chat_template which may add extra tokens or whitespace.
+        """
+        parts = []
+        for msg in turns:
+            role, content = msg["role"], msg["content"]
+            if role == "system":
+                # system_prompt already has <|im_start|>system...<|im_end|> tags
+                parts.append(content)
+            else:
+                parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
+        if add_prefill:
+            parts.append(f"<|im_start|>assistant\n{PREFILL}")
+        return "".join(parts)
+
+    user_msg = f"{FORMAT_EXAMPLE}Reference Program:\n```python\n{prompt_text}\n```"
     base_messages = [
-        {"role": "system", "content": system_prompt},
-        {
-            "role": "user",
-            "content": (
-                f"{FORMAT_EXAMPLE}"
-                f"Reference Program:\n```python\n{prompt_text}\n```"
-            ),
-        },
+        {"role": "system", "content": get_system_prompt()},
+        {"role": "user", "content": user_msg},
     ]
 
     # State per trajectory
@@ -404,29 +416,24 @@ Now write the kernel for the following operation:
         if not active_indices:
             break
 
-        # 1. Prepare batch context
+        # 1. Prepare batch context — raw format matching SFT training exactly
         context_texts = []
         for i in active_indices:
-            ctx = tokenizer.apply_chat_template(
-                messages_list[i], tokenize=False, add_generation_prompt=True
-            )
+            ctx = _build_prompt(messages_list[i], add_prefill=True)
             context_texts.append(ctx)
 
         # 2. Generation — SGLang server or fallback to model.generate()
         if not config.mock_mode:
             if config.use_sglang and (SGLANG_AVAILABLE or config.sglang_python):
-                # SGLang path: RadixAttention caches the shared prompt prefix across all G rollouts
-                # Append PREFILL to each prompt — forces model to skip <think> and output code directly,
-                # matching the SFT training format and preventing context-length blowout from CoT.
-                context_texts_pf = [ctx + PREFILL for ctx in context_texts]
+                # SGLang path: context_texts already end with PREFILL (from _build_prompt).
+                # SGLang returns full text; strip the context to get the completion.
                 t_gen = time.time()
                 print(f"  [Turn {step+1}/{config.max_react_steps}] Generating {len(active_indices)} responses...", end=" ", flush=True)
-                raw_completions = _generate_with_sglang(context_texts_pf, config)
+                raw_completions = _generate_with_sglang(context_texts, config)
                 print(f"done ({time.time()-t_gen:.1f}s)")
-                # raw_completions are full texts (prompt+prefill+completion); strip prompt+prefill
                 generated_texts = []
-                for ctx_pf, full in zip(context_texts_pf, raw_completions):
-                    completion = full[len(ctx_pf):] if full.startswith(ctx_pf) else full
+                for ctx, full in zip(context_texts, raw_completions):
+                    completion = full[len(ctx):] if full.startswith(ctx) else full
                     generated_texts.append(PREFILL + completion)  # restore prefill for extraction
             else:
                 # Fallback: standard HuggingFace batched generation
@@ -697,25 +704,15 @@ def _run_evaluation(model, tokenizer, config: GRPOConfig, val_prompts: list[str]
         return {"eval/pass_rate": 0.5, "eval/valid_rate": 0.8, "eval/avg_speedup": 1.1}
 
     model.eval()
-    system_prompt = get_system_prompt()
     candidates_to_eval = []
-    
+
     with torch.no_grad():
         for prompt_text in val_prompts:
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": (
-                        "Write an optimized CUDA C++ kernel to replace this PyTorch "
-                        "implementation. Output only the C++ code.\n\n"
-                        f"Reference Program:\n```python\n{prompt_text}\n```"
-                    ),
-                },
-            ]
-            
-            prompt_str = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+            # Build prompt in exact SFT format (raw strings, not apply_chat_template)
+            prompt_str = (
+                get_system_prompt()
+                + f"<|im_start|>user\n{prompt_text}<|im_end|>\n"
+                + f"<|im_start|>assistant\n{PREFILL}"
             )
             input_ids = tokenizer(prompt_str, return_tensors="pt").input_ids.to(model.device)
             
