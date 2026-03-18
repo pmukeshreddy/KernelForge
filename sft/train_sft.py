@@ -99,7 +99,7 @@ Now write the complete model_new.py for the following operation:
 
 def make_prompt(pytorch_code: str) -> str:
     """Build the inference prompt (no assistant content — model generates it)."""
-    user_msg = FORMAT_EXAMPLE + f"Reference Program:\n```python\n{pytorch_code}\n```"
+    user_msg = FORMAT_EXAMPLE + f"Reference Program:\n```python\n{pytorch_code}\n```\n/think"
     return (
         SYSTEM
         + f"<|im_start|>user\n{user_msg}<|im_end|>\n"
@@ -152,6 +152,7 @@ def run_eval(model, tokenizer, eval_items: list, workers: int = 16, tag: str = "
     model.eval()
 
     # Generation with tqdm
+    eval_items = eval_items[:5]  # temp: quick diagnosis
     generated = []
     n_batches = (len(eval_items) + batch_size - 1) // batch_size
     with tqdm(total=len(eval_items), desc="Generate", unit="problem") as bar:
