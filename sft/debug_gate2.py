@@ -75,11 +75,14 @@ def main():
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--level", default="",
                         help="Only test this level (level_1, level_2, level_3)")
+    parser.add_argument("--random", action="store_true",
+                        help="Random sample instead of first N per level")
     args = parser.parse_args()
 
     levels = [args.level] if args.level else ["level_1", "level_2", "level_3"]
 
     # Collect items
+    import random
     items = []
     for level in levels:
         try:
@@ -87,10 +90,8 @@ def main():
         except Exception as e:
             print(f"Could not load {level}: {e}")
             continue
-        count = 0
+        candidates = []
         for row in ds:
-            if count >= args.per_level:
-                break
             if not row.get("Correct", False):
                 continue
             pytorch_code = (
@@ -102,9 +103,12 @@ def main():
                 continue
             if "__global__" not in cuda_code or "torch::Tensor" not in cuda_code:
                 continue
-            label = f"{level}/task_{row.get('task_id','?')}"
-            items.append((cuda_code, pytorch_code, label))
-            count += 1
+            candidates.append((cuda_code, pytorch_code, f"{level}/task_{row.get('task_id','?')}"))
+        if args.random:
+            candidates = random.sample(candidates, min(args.per_level, len(candidates)))
+        else:
+            candidates = candidates[:args.per_level]
+        items.extend(candidates)
 
     print(f"Running {len(items)} kernels on {args.workers} workers...")
 
