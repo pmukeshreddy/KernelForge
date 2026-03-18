@@ -50,6 +50,21 @@ def _fix_cuda_api(cuda_code: str) -> str:
         'max': 'fmaxf(', 'min': 'fminf(', 'abs': 'fabsf(', 'fabs': 'fabsf('
     }[m.group(1)], cuda_code)
 
+    # C++17 structured bindings (auto [a, b, c] = x.sizes()) not supported by nvcc.
+    # Rewrite to explicit indexed access.
+    def _replace_structured_binding(m):
+        names = [n.strip() for n in m.group(1).split(',')]
+        rhs = m.group(2).strip()
+        lines = [f"auto _sb_ = {rhs};"]
+        for i, name in enumerate(names):
+            lines.append(f"auto {name} = _sb_[{i}];")
+        return '\n'.join(lines)
+    cuda_code = re.sub(
+        r'auto\s*\[([^\]]+)\]\s*=\s*([^;]+);',
+        _replace_structured_binding,
+        cuda_code,
+    )
+
     # __host__ or __device__ on torch::Tensor binding functions is invalid.
     # The binding function must be a plain host function callable from Python.
     # Remove __host__, __device__, __forceinline__ prefixes before torch::Tensor returns.

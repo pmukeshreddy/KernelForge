@@ -85,7 +85,7 @@ class GRPOConfig:
     reward_discount: float = 0.4      # multi-turn γ (Kevin's value)
 
     # Generation
-    max_new_tokens: int = 1800
+    max_new_tokens: int = 3000
     temperature: float = 0.3
     mock_mode: bool = False
 
