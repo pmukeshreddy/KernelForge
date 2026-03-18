@@ -516,13 +516,9 @@ Now write the kernel for the following operation:
         n_compiled = sum(1 for res in eval_results if res is not None and res.get("compiles", res.get("correct", False)))
         compile_rate = n_compiled / max(1, len(active_indices))
         print(f"done ({time.time()-t_eval:.1f}s) | compiled={n_compiled}/{n_valid}")
-        if n_compiled == 0 and step == 0:
-            for i, (res, resp) in enumerate(zip(eval_results, response_texts)):
-                if res is not None and not res.get("compiles", False):
-                    cuda_out = _extract_cuda_code(resp) or "(no cpp block found)"
-                    print(f"  [FULL CUDA OUTPUT traj={i}]\n{'='*60}\n{cuda_out}\n{'='*60}")
-                    print(f"  [COMPILE ERROR]\n{res.get('compiler_error', 'no error')[:800]}")
-                    break
+        for i, res in enumerate(eval_results):
+            if res and not res.get("compiles", False) and res.get("compiler_error"):
+                print(f"  [COMPILE ERROR traj={i}]: {res['compiler_error'][:400]}")
 
         # 4. Process results and update trajectories
         for batch_idx, traj_idx in enumerate(active_indices):
