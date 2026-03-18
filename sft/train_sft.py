@@ -152,7 +152,6 @@ def run_eval(model, tokenizer, eval_items: list, workers: int = 16, tag: str = "
     model.eval()
 
     # Generation with tqdm
-    eval_items = eval_items[:5]  # diagnose on 5 samples only
     generated = []
     n_batches = (len(eval_items) + batch_size - 1) // batch_size
     with tqdm(total=len(eval_items), desc="Generate", unit="problem") as bar:
@@ -165,7 +164,7 @@ def run_eval(model, tokenizer, eval_items: list, workers: int = 16, tag: str = "
             with torch.no_grad():
                 out = model.generate(
                     **inputs,
-                    max_new_tokens=2048,
+                    max_new_tokens=4096,
                     do_sample=False,
                     pad_token_id=tokenizer.eos_token_id,
                 )
