@@ -356,13 +356,38 @@ def _run_group_episodes(
     """
     G = config.group_size
     system_prompt = get_system_prompt()
+
+    # Format example — identical to SFT training format, teaches data_ptr<float>() usage
+    FORMAT_EXAMPLE = """\
+Here is an example of the expected output format:
+
+```cpp
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void add_kernel(const float* a, const float* b, float* out, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) out[idx] = a[idx] + b[idx];
+}
+
+torch::Tensor add_cuda(torch::Tensor a, torch::Tensor b) {
+    auto out = torch::empty_like(a);
+    int n = a.numel();
+    add_kernel<<<(n + 255) / 256, 256>>>(
+        a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), n);
+    return out;
+}
+```
+
+Now write the kernel for the following operation:
+"""
+
     base_messages = [
         {"role": "system", "content": system_prompt},
         {
             "role": "user",
             "content": (
-                "Write an optimized CUDA C++ kernel to replace this PyTorch "
-                "implementation. Output only the C++ code.\n\n"
+                f"{FORMAT_EXAMPLE}"
                 f"Reference Program:\n```python\n{prompt_text}\n```"
             ),
         },
