@@ -418,6 +418,12 @@ def main():
         return
 
     # ── Save training pairs ───────────────────────────────────────────────
+    # Extra filter: must contain a real CUDA kernel (not just PyTorch ops wrapped)
+    n_fake = sum(1 for m, _, _ in passed if "__global__" not in m)
+    if n_fake:
+        print(f"  Filtered {n_fake} fake wrappers (no __global__ kernel found)")
+    passed = [(m, p, meta) for m, p, meta in passed if "__global__" in m]
+
     training_pairs = []
     seen = set()
     for model_new_py, pytorch_code, meta in passed:
