@@ -229,12 +229,16 @@ def _generate_batch(sample: list, api_key: str) -> list:
 
     # Collect results
     batch_results = {}
+    first_error = None
     for result in client.beta.messages.batches.results(batch.id):
         idx = int(result.custom_id)
         if result.result.type == "succeeded":
             text = result.result.message.content[0].text
             batch_results[idx] = _extract_python_block(text) or None
         else:
+            if first_error is None:
+                first_error = result.result
+                print(f"\n  [ERROR sample] type={result.result.type} error={result.result}")
             batch_results[idx] = None
 
     # Merge into results + update cache
