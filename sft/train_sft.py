@@ -136,7 +136,7 @@ def _eval_worker(item):
 
 
 def run_eval(model, tokenizer, eval_items: list, workers: int = 16, tag: str = "eval",
-             batch_size: int = 4):
+             batch_size: int = 8):
     """
     Generate model_new.py for each (pytorch_code, label), compile+verify, report Pass@1.
     eval_items: list of (pytorch_code, label)
