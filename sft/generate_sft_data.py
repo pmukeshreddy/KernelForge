@@ -418,14 +418,21 @@ def main():
         return
 
     # ── Save training pairs ───────────────────────────────────────────────
+    # Print all passing wrappers for manual inspection
+    print(f"\n{'='*60}")
+    print(f"ALL {len(passed)} PASSING WRAPPERS")
+    print(f"{'='*60}")
+    for i, (m, p, meta) in enumerate(passed):
+        has_kernel = "__global__" in m
+        print(f"\n[{i+1}/{len(passed)}] task={meta.get('task_id','?')} level={meta.get('level_id','?')} has_kernel={has_kernel}")
+        print(f"{'─'*60}")
+        print(m)
+        print(f"{'─'*60}")
+
     # Extra filter: must contain a real CUDA kernel (not just PyTorch ops wrapped)
     fake = [(m, p, meta) for m, p, meta in passed if "__global__" not in m]
     if fake:
-        print(f"\n  Filtered {len(fake)} fake wrappers (no __global__ kernel):")
-        for m, p, meta in fake:
-            print(f"\n  {'─'*50}")
-            print(f"  FAKE [{meta.get('task_id','?')} / {meta.get('level_id','?')}]")
-            print(m[:1000])
+        print(f"\nFiltered {len(fake)} fake wrappers (no __global__ kernel)")
     passed = [(m, p, meta) for m, p, meta in passed if "__global__" in m]
 
     training_pairs = []
