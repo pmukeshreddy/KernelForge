@@ -122,6 +122,41 @@ class GRPOConfig:
 PREFILL = "```cpp\n#include <torch/extension.h>\n"
 
 
+def _compress_for_history(resp_text: str) -> str:
+    """
+    Strip CoT/<think> blocks from an assistant turn before adding to message history.
+    Keeps only the ```cpp block to prevent context explosion across turns.
+    Kevin (Cognition) explicitly solves this: CoT bloat reaches 50-100k tokens by turn 4.
+    """
+    # First preference: extract the cpp block (the only thing the next turn needs)
+    m = re.search(r"```cpp(.*?)```", resp_text, re.DOTALL)
+    if m:
+        return f"```cpp{m.group(1)}```"
+    # Fallback: strip think blocks and hard-truncate
+    compressed = re.sub(r"<think>.*?</think>", "", resp_text, flags=re.DOTALL).strip()
+    compressed = re.sub(r"<think>.*", "", compressed, flags=re.DOTALL).strip()
+    return compressed[:1200] if len(compressed) > 1200 else compressed
+
+
+def _preprocess_compiler_error(error: str, cuda_code: str) -> str:
+    """
+    Make nvcc errors more actionable before feeding back to the model.
+    Detects bracket imbalance (root cause of most 'expected ;' errors).
+    """
+    if not error:
+        return error
+    opens, closes = cuda_code.count('('), cuda_code.count(')')
+    curly_o, curly_c = cuda_code.count('{'), cuda_code.count('}')
+    prefix = ""
+    if opens != closes:
+        prefix += f"Note: Paren imbalance — {opens} '(' but {closes} ')' in your code.\n"
+    if curly_o != curly_c:
+        prefix += f"Note: Brace imbalance — {curly_o} '{{' but {curly_c} '}}' in your code.\n"
+    if prefix:
+        prefix += "\n"
+    return prefix + error[:1500]
+
+
 
 # ---------------------------------------------------------------------------
 # SGLang server helpers
@@ -207,22 +242,66 @@ def launch_sglang_server(model_path: str, adapter_path: str, port: int, tp: int,
 
 def sync_weights_to_sglang(model, port: int):
     """
-    Push updated LoRA weights from the training model to the SGLang server.
-    Uses SGLang's /update_weights endpoint with bucketed transfer for speed.
+    Push updated LoRA-merged weights to SGLang via update_weights_from_tensor.
+    SGLang 0.5.9+ supports this endpoint to update model weights in-place.
+
+    SGLang loaded merged weights (no LoRA layers), so we must compute
+    W_merged = W_base + lora_B @ lora_A * scaling and push each full tensor.
     """
-    import requests, io
-    state_dict = {k: v.cpu() for k, v in model.state_dict().items() if "lora" in k.lower()}
-    buf = io.BytesIO()
-    torch.save(state_dict, buf)
-    buf.seek(0)
-    resp = requests.post(
-        f"http://localhost:{port}/update_weights",
-        data=buf.read(),
-        headers={"Content-Type": "application/octet-stream"},
-        timeout=60,
-    )
-    if resp.status_code != 200:
-        print(f"[SGLang] Weight sync warning: {resp.status_code} {resp.text[:200]}")
+    import requests, base64
+
+    n_synced = 0
+    errors = 0
+
+    for name, module in model.named_modules():
+        # PEFT LoRA modules expose lora_A, lora_B, and the base weight
+        if not (hasattr(module, 'lora_A') and hasattr(module, 'lora_B')
+                and 'default' in getattr(module, 'lora_A', {})):
+            continue
+        if not hasattr(module, 'weight') or module.weight is None:
+            continue
+
+        try:
+            with torch.no_grad():
+                lora_A = module.lora_A['default'].weight   # (r, in_features)
+                lora_B = module.lora_B['default'].weight   # (out_features, r)
+                s = module.scaling
+                scaling = s['default'] if isinstance(s, dict) else float(s)
+
+                # W_merged = W_base + lora_B @ lora_A * scaling
+                delta = (lora_B.float() @ lora_A.float()) * scaling
+                merged = (module.weight.data.float() + delta).contiguous().cpu()
+
+            # Strip PEFT prefix to get SGLang-compatible parameter name
+            param_name = name + ".weight"
+            for pfx in ("base_model.model.", "base_model."):
+                if param_name.startswith(pfx):
+                    param_name = param_name[len(pfx):]
+                    break
+
+            encoded = base64.b64encode(merged.numpy().tobytes()).decode("ascii")
+            resp = requests.post(
+                f"http://localhost:{port}/update_weights_from_tensor",
+                json={
+                    "name": param_name,
+                    "dtype": "float32",
+                    "shape": list(merged.shape),
+                    "serialized_tensor": encoded,
+                },
+                timeout=60,
+            )
+            if resp.status_code == 200:
+                n_synced += 1
+            else:
+                errors += 1
+                if errors <= 2:
+                    print(f"[SGLang] Sync warn ({param_name}): {resp.status_code} {resp.text[:120]}")
+        except Exception as e:
+            errors += 1
+            if errors <= 2:
+                print(f"[SGLang] Sync error ({name}): {e}")
+
+    print(f"[SGLang] Weight sync: {n_synced} tensors pushed, {errors} errors")
 
 
 def _generate_with_sglang(context_texts: list[str], config: "GRPOConfig") -> list[str]:
@@ -312,15 +391,18 @@ def _run_group_episodes(
         if not config.mock_mode:
             if config.use_sglang and (SGLANG_AVAILABLE or config.sglang_python):
                 # SGLang path: RadixAttention caches the shared prompt prefix across all G rollouts
+                # Append PREFILL to each prompt — forces model to skip <think> and output code directly,
+                # matching the SFT training format and preventing context-length blowout from CoT.
+                context_texts_pf = [ctx + PREFILL for ctx in context_texts]
                 t_gen = time.time()
                 print(f"  [Turn {step+1}/{config.max_react_steps}] Generating {len(active_indices)} responses...", end=" ", flush=True)
-                raw_completions = _generate_with_sglang(context_texts, config)
+                raw_completions = _generate_with_sglang(context_texts_pf, config)
                 print(f"done ({time.time()-t_gen:.1f}s)")
-                # raw_completions are full texts (prompt + completion); strip prompt prefix
+                # raw_completions are full texts (prompt+prefill+completion); strip prompt+prefill
                 generated_texts = []
-                for ctx, full in zip(context_texts, raw_completions):
-                    completion = full[len(ctx):] if full.startswith(ctx) else full
-                    generated_texts.append(completion)
+                for ctx_pf, full in zip(context_texts_pf, raw_completions):
+                    completion = full[len(ctx_pf):] if full.startswith(ctx_pf) else full
+                    generated_texts.append(PREFILL + completion)  # restore prefill for extraction
             else:
                 # Fallback: standard HuggingFace batched generation
                 tokenizer.padding_side = "left"
@@ -352,11 +434,12 @@ def _run_group_episodes(
 
                 resp_text = gen_text
                 response_texts.append(resp_text)
-                
-                # Save history
+
+                # Save history — compress to just the cpp block to prevent context explosion.
+                # By turn 4 with full CoT, context hits 50k+ tokens and quality collapses.
                 exact_ctx_ids = tokenizer(context_texts[batch_idx], return_tensors="pt").input_ids[0]
                 turns_list[traj_idx].append((exact_ctx_ids, gen_ids.cpu()))
-                messages_list[traj_idx].append({"role": "assistant", "content": resp_text})
+                messages_list[traj_idx].append({"role": "assistant", "content": _compress_for_history(resp_text)})
             else:
                 resp_text = PREFILL + "import torch\ntorch.Tensor\n#include <torch/extension.h>\n__global__ void mykernel() {}\ntorch::Tensor foo(torch::Tensor a) { return a; }\n```\n"
                 response_texts.append(resp_text)
@@ -401,14 +484,6 @@ def _run_group_episodes(
         n_compiled = sum(1 for res in eval_results if res is not None and res.get("compiles", res.get("correct", False)))
         compile_rate = n_compiled / max(1, len(active_indices))
         print(f"done ({time.time()-t_eval:.1f}s) | compiled={n_compiled}/{n_valid}")
-        # DEBUG: show first compile error to diagnose
-        if n_compiled == 0 and step == 0:
-            for i, (res, resp) in enumerate(zip(eval_results, response_texts)):
-                if res is not None and not res.get("compiles", False):
-                    err = res.get("compiler_error", "no error field")
-                    print(f"  [DEBUG] Full response[{i}]:\n{resp}\n")
-                    print(f"  [DEBUG] Compiler error:\n{err[:800]}")
-                    break
 
         # 4. Process results and update trajectories
         for batch_idx, traj_idx in enumerate(active_indices):
@@ -435,11 +510,14 @@ def _run_group_episodes(
                 else:
                     base_r = config.reward_wrong_output   # -0.1: compiled, ran, but wrong answer
                 per_turn_rewards_list[traj_idx].append(base_r + length_penalty)
-                error = eval_res.get("compiler_error", "Outputs do not match.")
+                raw_error = eval_res.get("compiler_error", "Outputs do not match.")
+                # Extract the cuda_code from the current response for bracket-imbalance analysis
+                _cuda_for_err = _extract_cuda_code(response_texts[batch_idx]) or ""
+                error = _preprocess_compiler_error(raw_error, _cuda_for_err)
                 messages_list[traj_idx].append({
                     "role": "user",
                     "content": (
-                        f"Your kernel failed.\n\nError:\n```\n{error[:1500]}\n```\n\n"
+                        f"Your kernel failed.\n\nError:\n```\n{error}\n```\n\n"
                         "Fix the bug and output the corrected C++ code."
                     ),
                 })
@@ -873,27 +951,28 @@ def train(config: GRPOConfig = None):
             # Sync updated LoRA weights to SGLang server after all GRPO epochs
             if not config.mock_mode and config.use_sglang and (SGLANG_AVAILABLE or config.sglang_python):
                 sync_weights_to_sglang(model, config.sglang_port)
-                
-                if not config.mock_mode:
-                    # Compute mean policy entropy from old log probs as collapse indicator
-                    all_lp_vals = [
-                        lp for group in all_old_lps
-                        for turn_lps in group
-                        for lp in turn_lps
-                        if len(lp) > 0
-                    ]
-                    mean_entropy = float(-torch.cat(all_lp_vals).mean()) if all_lp_vals else 0.0
 
-                    wandb.log({
-                        "train/loss": total_loss_val,
-                        "train/batch_mean_reward": batch_mean,
-                        "train/mean_neg_logprob": mean_entropy,
-                        "train/degenerate_groups": n_degenerate,
-                        "train/learning_rate": scheduler.get_last_lr()[0],
-                        "epoch": epoch + (global_step / max(1, len(train_prompts) // config.batch_size))
-                    }, step=global_step)
+            # Log metrics and print loss (always, not just when using SGLang)
+            if not config.mock_mode:
+                # Compute mean policy entropy from old log probs as collapse indicator
+                all_lp_vals = [
+                    lp for group in all_old_lps
+                    for turn_lps in group
+                    for lp in turn_lps
+                    if len(lp) > 0
+                ]
+                mean_entropy = float(-torch.cat(all_lp_vals).mean()) if all_lp_vals else 0.0
 
-                print(f"  [GRPO epoch {grpo_ep+1}/{config.grpo_epochs}] loss={total_loss_val:.4f}")
+                wandb.log({
+                    "train/loss": total_loss_val,
+                    "train/batch_mean_reward": batch_mean,
+                    "train/mean_neg_logprob": mean_entropy,
+                    "train/degenerate_groups": n_degenerate,
+                    "train/learning_rate": scheduler.get_last_lr()[0],
+                    "epoch": epoch + (global_step / max(1, len(train_prompts) // config.batch_size))
+                }, step=global_step)
+
+            print(f"  [Step {global_step+1}] loss={total_loss_val:.4f}")
 
             global_step += 1
             

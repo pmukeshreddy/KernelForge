@@ -70,6 +70,32 @@ def _fix_cuda_api(cuda_code: str) -> str:
 
 import hashlib
 
+
+def _split_args(raw: str) -> list:
+    """Split a function argument string by commas, respecting nested parens/brackets.
+
+    Fixes the bug where stride=(1,1,1) gets shredded into ['stride=(1','1','1)'].
+    """
+    args, depth, current = [], 0, []
+    for ch in raw:
+        if ch in '([{':
+            depth += 1
+        elif ch in ')]}':
+            depth -= 1
+        if ch == ',' and depth == 0:
+            a = ''.join(current).strip()
+            if a:
+                args.append(a)
+            current = []
+        else:
+            current.append(ch)
+    if current:
+        a = ''.join(current).strip()
+        if a:
+            args.append(a)
+    return args
+
+
 def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
     """
     Wrap raw CUDA C++ code in a full load_inline Python script.
@@ -164,13 +190,13 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
     fwd_raw = _extract_def_args(ref_code, "forward")
     fwd_args_clean = ", ".join(
         arg.split(":")[0].split("=")[0].strip()
-        for arg in fwd_raw.split(",") if arg.strip()
+        for arg in _split_args(fwd_raw) if arg.strip()
     ) if fwd_raw else "x"
 
     init_raw = _extract_def_args(ref_code, "__init__")
     init_args_clean = ", ".join(
         arg.split(":")[0].split("=")[0].strip()
-        for arg in init_raw.split(",") if arg.strip()
+        for arg in _split_args(init_raw) if arg.strip()
     ) if init_raw else ""
 
     # Use the last binding function as the one to call from forward()
