@@ -65,21 +65,23 @@ def _fix_cuda_api(cuda_code: str) -> str:
         cuda_code,
     )
 
-    # Bug 1 — extra closing paren in device math expressions
-    # e.g. "return x * tanhf(logf(1.0f + expf(x))));" → strip excess ) before ;
-    def _fix_unbalanced_parens(line: str) -> str:
-        excess = line.count(')') - line.count('(')
+    # Bug 1 — extra closing paren in stacked math intrinsic expressions.
+    # The model produces e.g. "return x * tanhf(logf(1.0f + expf(x))));"
+    # Only fix lines with `return` that end with ); to avoid corrupting
+    # legitimately unbalanced lines inside multi-line function calls.
+    def _fix_math_line(line: str) -> str:
+        stripped = line.rstrip()
+        if not (stripped.endswith(';') and 'return' in stripped):
+            return line
+        excess = stripped.count(')') - stripped.count('(')
         if excess <= 0:
             return line
-        core = line.rstrip()
-        semi = ''
-        if core.endswith(';'):
-            core, semi = core[:-1], ';'
+        core = stripped[:-1]  # drop ;
         for _ in range(excess):
             if core.endswith(')'):
                 core = core[:-1]
-        return core + semi
-    cuda_code = '\n'.join(_fix_unbalanced_parens(l) for l in cuda_code.splitlines())
+        return core + ';'
+    cuda_code = '\n'.join(_fix_math_line(l) for l in cuda_code.splitlines())
 
     # Bug 2 — extra closing paren after TORCH_CHECK / AT_CHECK macro calls
     # e.g. TORCH_CHECK(x.is_contiguous(), "msg"))  → remove the extra )
