@@ -7,11 +7,10 @@ Sources:
    → Saved separately to rl_prompts.jsonl (prompt-only, for GRPO stage)
 
 Verification gates applied to every SFT example before inclusion:
-  Gate 1: SakanaAI Correct=True flag
-  Gate 2: GRPO pipeline eval — same _worker_eval_pair used during RL training:
-            build_load_inline_wrapper(cuda_code, pytorch_code)
-            → evaluate(wrapper, pytorch_code)
-          If it passes here, it will pass in GRPO. No excuses.
+  Gate 1: SakanaAI Correct=True flag (fast, no compilation)
+  Gate 2: GRPO pipeline eval — same build_load_inline_wrapper + evaluate
+          used during RL training. Runs in parallel across --workers processes.
+          If it passes here, it passes in GRPO.
 
 Format matches GRPO rollout exactly — zero distribution shift at RL stage.
 """
@@ -19,11 +18,13 @@ import argparse
 import json
 import os
 import sys
+import time
 import unicodedata
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datasets import load_dataset
+from tqdm import tqdm
 
-# ── rl/ imports — must come before any rl module usage ───────────────────
+# ── rl/ imports ───────────────────────────────────────────────────────────
 _rl_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "rl"))
 if _rl_dir not in sys.path:
     sys.path.insert(0, _rl_dir)
@@ -84,8 +85,8 @@ Now write the kernel for the following operation:
 
 def make_training_text(pytorch_code: str, cuda_code: str) -> str:
     """
-    Training text format — must match GRPO rollout prompt in rl/train_grpo.py exactly:
-      user_msg = FORMAT_EXAMPLE + "Reference Program:\\n```python\\n{code}\\n```"
+    Training text — must match GRPO rollout prompt exactly:
+      FORMAT_EXAMPLE + "Reference Program:\\n```python\\n{code}\\n```"
     """
     user_msg = FORMAT_EXAMPLE + f"Reference Program:\n```python\n{pytorch_code}\n```"
     return (
@@ -95,49 +96,40 @@ def make_training_text(pytorch_code: str, cuda_code: str) -> str:
     )
 
 
-# ─── Gate 2: GRPO pipeline eval (exact same code path as RL training) ─────
+# ─── Gate 2 worker — exact GRPO eval pipeline ─────────────────────────────
 
 def _grpo_eval_worker(args):
     """
-    Runs in a subprocess via ProcessPoolExecutor to isolate CUDA context.
-
-    This is EXACTLY the same logic as _worker_eval_pair in rl/train_grpo.py:
-        candidate = build_load_inline_wrapper(cuda_code, pytorch_code)
-        return evaluate(candidate, pytorch_code)
-
-    If a kernel passes here, it will pass during GRPO training. Period.
+    Same logic as _worker_eval_pair in rl/train_grpo.py.
+    Runs in a worker process to isolate CUDA context and suppress debug output.
     """
-    import sys, os
-    rl_dir = args[2]
+    cuda_code, pytorch_code, rl_dir = args
+
+    # Suppress [WRAPPER DEBUG] and other stdout noise from worker
+    import io, contextlib
     if rl_dir not in sys.path:
         sys.path.insert(0, rl_dir)
 
-    cuda_code, pytorch_code, _ = args
     try:
         from agent import build_load_inline_wrapper
         from sandbox import evaluate
-        wrapper = build_load_inline_wrapper(cuda_code, pytorch_code)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            wrapper = build_load_inline_wrapper(cuda_code, pytorch_code)
+
         if not wrapper:
             return False, "no torch::Tensor binding found"
+
         result = evaluate(wrapper, pytorch_code)
         if result is None:
             return False, "evaluate returned None"
         if result.get("correct", False):
             return True, ""
         err = result.get("compiler_error") or "wrong output"
-        return False, err[:300]
+        return False, err[:200]
     except Exception as e:
-        return False, str(e)[:300]
-
-
-def grpo_pipeline_passes(cuda_code: str, pytorch_code: str, timeout: int = 120) -> tuple[bool, str]:
-    """Gate 2: run the exact GRPO eval pipeline on this (cuda_code, pytorch_code) pair."""
-    with ProcessPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(_grpo_eval_worker, (cuda_code, pytorch_code, _rl_dir))
-        try:
-            return future.result(timeout=timeout)
-        except Exception as e:
-            return False, f"timeout/crash: {e}"
+        return False, str(e)[:200]
 
 
 # ─── main ──────────────────────────────────────────────────────────────────
@@ -145,9 +137,11 @@ def grpo_pipeline_passes(cuda_code: str, pytorch_code: str, timeout: int = 120) 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--per_level", type=int, default=1667,
-                        help="Max examples per SakanaAI level (~5000 total)")
+                        help="Max candidates per SakanaAI level to consider (~5000 total)")
     parser.add_argument("--no_pipeline_check", action="store_true",
-                        help="Skip Gate 2 (GRPO pipeline check). Faster but lower quality.")
+                        help="Skip Gate 2. Faster but includes unverified kernels.")
+    parser.add_argument("--workers", type=int, default=16,
+                        help="Parallel workers for Gate 2 evaluation (default 16)")
     parser.add_argument("--output", default="./sft_training_pairs.jsonl")
     parser.add_argument("--rl_prompts_output", default="./rl_prompts.jsonl")
     args = parser.parse_args()
@@ -155,38 +149,31 @@ def main():
     run_pipeline_check = not args.no_pipeline_check
 
     print("=" * 60)
-    print("SFT data generation — verification gates:")
-    print("  Gate 1: SakanaAI Correct=True flag")
-    if run_pipeline_check:
-        print("  Gate 2: GRPO pipeline (build_load_inline_wrapper + evaluate)")
-        print("          Same code as _worker_eval_pair in train_grpo.py")
-    else:
-        print("  Gate 2: SKIPPED (--no_pipeline_check)")
+    print("SFT data generation")
+    print("  Gate 1: SakanaAI Correct=True")
+    print(f"  Gate 2: GRPO pipeline eval ({args.workers} parallel workers)"
+          if run_pipeline_check else "  Gate 2: SKIPPED (--no_pipeline_check)")
     print("=" * 60)
 
-    pairs = []
-    g1_pass = g1_fail = g2_pass = g2_fail = 0
+    # ── Step 1: Collect all Gate 1 candidates (fast — no compilation) ────
+    print("\nStep 1/2: Collecting Gate 1 candidates from SakanaAI...")
+    candidates = []   # list of (cuda_code, pytorch_code, meta)
+    g1_fail = 0
 
-    # === SakanaAI/AI-CUDA-Engineer-Archive ===================================
-    print("\nLoading SakanaAI/AI-CUDA-Engineer-Archive...")
     for level in ["level_1", "level_2", "level_3"]:
-        level_pairs = []
+        level_count = 0
         try:
             ds = load_dataset("SakanaAI/AI-CUDA-Engineer-Archive", split=level)
         except Exception as e:
             print(f"  Warning: could not load {level}: {e}")
             continue
 
-        checked = 0
         for row in ds:
-            if len(level_pairs) >= args.per_level:
+            if level_count >= args.per_level:
                 break
-
-            # Gate 1
             if not row.get("Correct", False):
                 g1_fail += 1
                 continue
-            g1_pass += 1
 
             pytorch_code = (
                 row.get("PyTorch_Code_Module", "")
@@ -199,40 +186,72 @@ def main():
             if "__global__" not in cuda_code or "torch::Tensor" not in cuda_code:
                 continue
 
-            # Gate 2: GRPO pipeline
-            if run_pipeline_check:
-                checked += 1
-                ok, err = grpo_pipeline_passes(cuda_code, pytorch_code)
-                if not ok:
-                    g2_fail += 1
-                    continue
-                g2_pass += 1
-            else:
-                g2_pass += 1
-
-            text = make_training_text(pytorch_code, cuda_code)
-            level_pairs.append({
+            candidates.append((cuda_code, pytorch_code, {
                 "source": f"sakana-{level}",
                 "task_id": str(row.get("task_id", "")),
                 "level_id": level,
+            }))
+            level_count += 1
+
+        print(f"  {level}: {level_count} Gate 1 candidates")
+
+    print(f"\nGate 1: {len(candidates)} pass, {g1_fail} fail (Correct=False)")
+
+    # ── Step 2: Batch evaluate in parallel ───────────────────────────────
+    pairs = []
+    g2_pass = g2_fail = 0
+
+    if run_pipeline_check:
+        print(f"\nStep 2/2: Gate 2 — GRPO pipeline eval on {len(candidates)} candidates "
+              f"({args.workers} workers)...")
+
+        t0 = time.time()
+        futures = {}
+        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+            for i, (cuda_code, pytorch_code, meta) in enumerate(candidates):
+                f = pool.submit(_grpo_eval_worker, (cuda_code, pytorch_code, _rl_dir))
+                futures[f] = (cuda_code, pytorch_code, meta)
+
+            with tqdm(total=len(futures), unit="kernel",
+                      bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] pass={postfix}") as pbar:
+                pbar.set_postfix(f"{g2_pass}✓ {g2_fail}✗")
+                for future in as_completed(futures):
+                    cuda_code, pytorch_code, meta = futures[future]
+                    try:
+                        ok, err = future.result(timeout=180)
+                    except Exception as e:
+                        ok, err = False, str(e)[:100]
+
+                    if ok:
+                        g2_pass += 1
+                        pairs.append({
+                            **meta,
+                            "pytorch_code": pytorch_code,
+                            "cuda_kernel": cuda_code,
+                            "text": make_training_text(pytorch_code, cuda_code),
+                        })
+                    else:
+                        g2_fail += 1
+
+                    pbar.set_postfix(f"{g2_pass}✓ {g2_fail}✗")
+                    pbar.update(1)
+
+        elapsed = time.time() - t0
+        print(f"\nGate 2: {g2_pass} pass, {g2_fail} fail "
+              f"(rejection rate {g2_fail / max(1, len(candidates)) * 100:.1f}%) "
+              f"in {elapsed:.0f}s")
+    else:
+        print("\nStep 2/2: Skipping Gate 2 — using all Gate 1 candidates.")
+        for cuda_code, pytorch_code, meta in candidates:
+            pairs.append({
+                **meta,
                 "pytorch_code": pytorch_code,
                 "cuda_kernel": cuda_code,
-                "text": text,
+                "text": make_training_text(pytorch_code, cuda_code),
             })
+        g2_pass = len(pairs)
 
-            if len(level_pairs) % 50 == 0:
-                print(f"  {level}: {len(level_pairs)} verified so far "
-                      f"(gate2: {g2_pass} pass / {g2_fail} fail)...")
-
-        pairs.extend(level_pairs)
-        print(f"  {level}: {len(level_pairs)} verified pairs")
-
-    print(f"\nVerification summary:")
-    print(f"  Gate 1 (Correct=True):     {g1_pass} pass, {g1_fail} fail")
-    print(f"  Gate 2 (GRPO pipeline):    {g2_pass} pass, {g2_fail} fail")
-    print(f"  Gate 2 rejection rate:     {g2_fail / max(1, g2_pass + g2_fail) * 100:.1f}%")
-
-    # Deduplicate
+    # ── Deduplicate and save ──────────────────────────────────────────────
     seen = set()
     unique_pairs = []
     for p in pairs:
@@ -242,15 +261,15 @@ def main():
             unique_pairs.append(p)
 
     if not unique_pairs:
-        print("\nERROR: No pairs survived verification. Check data source and GPU environment.")
+        print("\nERROR: No pairs survived verification.")
         return
 
     with open(args.output, "w") as f:
         for p in unique_pairs:
             f.write(json.dumps(p) + "\n")
-    print(f"\nSFT training pairs: {len(unique_pairs)} → {args.output}")
+    print(f"SFT training pairs: {len(unique_pairs)} → {args.output}")
 
-    # === KernelBench RL prompts (prompt-only) ================================
+    # ── KernelBench RL prompts ────────────────────────────────────────────
     print("\nLoading KernelBench RL prompts...")
     rl_prompts = []
     existing_codes = {p["pytorch_code"] for p in unique_pairs}
@@ -282,7 +301,7 @@ def main():
                 f.write(json.dumps(p) + "\n")
         print(f"RL prompts: {len(rl_prompts)} → {args.rl_prompts_output}")
 
-    print("\n=== Done ===")
+    print(f"\n=== Done ===")
     print(f"SFT pairs: {len(unique_pairs)}")
     print(f"RL prompts: {len(rl_prompts)}")
 
