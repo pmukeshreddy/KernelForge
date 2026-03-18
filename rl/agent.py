@@ -325,9 +325,8 @@ class ModelNew(torch.nn.Module):
     def forward(self, {fwd_args_clean}):
         return ext.{binding_func}({fwd_args_clean})
 '''
-    # Show the ModelNew class portion so we can verify it's syntactically correct
     model_new_start = wrapper.find("class ModelNew")
-    print(f"[WRAPPER DEBUG] Generated ModelNew:\n{wrapper[model_new_start:model_new_start+300]}")
+    print(f"[WRAPPER DEBUG] Generated ModelNew:\n{wrapper[model_new_start:]}")
     return wrapper
 
 
