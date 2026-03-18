@@ -94,6 +94,10 @@ def _fix_cuda_api(cuda_code: str) -> str:
     # Bug 3 — .ptr<T>() is not a PyTorch C++ API method; correct is .data_ptr<T>()
     cuda_code = re.sub(r'\.ptr\s*<', '.data_ptr<', cuda_code)
 
+    # Bug 4 — tensor.type() returns DeprecatedTypeProperties, not ScalarType.
+    # AT_DISPATCH_FLOATING_TYPES and similar macros need .scalar_type().
+    cuda_code = re.sub(r'\b(\w+)\.type\(\)', r'\1.scalar_type()', cuda_code)
+
     # __host__ or __device__ on torch::Tensor binding functions is invalid.
     # The binding function must be a plain host function callable from Python.
     # Remove __host__, __device__, __forceinline__ prefixes before torch::Tensor returns.
@@ -376,12 +380,28 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
         if effective in tensor_attrs and mod_name:
             return f'self.{mod_name}.{effective}'
 
-        # Scalar/tuple attributes stored in nn module (stride, padding, etc.)
-        # nn.Conv/ConvTranspose store these as tuples, so index [0].
-        tuple_attrs = ('stride', 'padding', 'dilation', 'groups',
-                       'output_padding', 'kernel_size')
+        # 'input' / 'inp' are common C++ names for the primary input tensor — pass through
+        if effective in ('input', 'inp', 'in_tensor') and forward_args_list:
+            return forward_args_list[0]
+
+        # Scalar/tuple attributes stored in nn module.
+        # stride/padding/dilation/kernel_size are tuples → index [0].
+        # groups is a plain int → no index.
+        tuple_attrs = ('stride', 'padding', 'dilation', 'output_padding', 'kernel_size')
         if effective in tuple_attrs and mod_name:
             return f'self.{mod_name}.{effective}[0]'
+        if effective == 'groups' and mod_name:
+            return f'self.{mod_name}.groups'
+
+        # Decomposed 2D/3D params: stride_h→stride[0], stride_w→stride[1], stride_d→stride[2]
+        dim_map = {'_h': 0, '_w': 1, '_d': 2}
+        for suffix, idx in dim_map.items():
+            if effective.endswith(suffix):
+                base_attr = effective[:-len(suffix)]
+                if base_attr in tuple_attrs and mod_name:
+                    return f'self.{mod_name}.{base_attr}[{idx}]'
+                if base_attr == 'kernel_size' and mod_name:
+                    return f'self.{mod_name}.kernel_size[{idx}]'
 
         # Pattern: conv_weight -> self.conv.weight, bn_running_mean -> self.bn.running_mean
         known_attrs = tensor_attrs
