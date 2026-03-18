@@ -341,6 +341,11 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
         # Direct match: self.bias, self.weight, etc.
         if re.search(rf'\bself\.{re.escape(arg)}\b', init_body):
             return f'self.{arg}'
+        # Plural → singular: weights→weight, biases→bias, inputs→input, etc.
+        if arg.endswith('s'):
+            singular = arg[:-1]
+            if re.search(rf'\bself\.{re.escape(singular)}\b', init_body):
+                return f'self.{singular}'
         # Pattern: conv_weight -> self.conv.weight, bn_running_mean -> self.bn.running_mean
         known_attrs = ('weight', 'bias', 'running_mean', 'running_var',
                        'weight_g', 'weight_v', 'scale', 'gamma', 'beta')
