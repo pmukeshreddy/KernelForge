@@ -338,36 +338,60 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
 
     def _map_extra_arg(arg: str, init_body: str) -> str:
         """Map a C++ binding arg name to the correct Python self.* accessor."""
+        # Strip _obj suffix (SakanaAI naming: weight_obj, bias_obj, x_obj, ...)
+        effective = arg[:-4] if arg.endswith('_obj') else arg
+
+        # If effective name is a forward arg, pass it through directly (not self.*)
+        if effective in forward_set:
+            return effective
+
         # Direct match: self.bias, self.weight, etc.
-        if re.search(rf'\bself\.{re.escape(arg)}\b', init_body):
-            return f'self.{arg}'
+        if re.search(rf'\bself\.{re.escape(effective)}\b', init_body):
+            return f'self.{effective}'
+
         # Plural → singular: weights→weight, biases→bias
-        if arg.endswith('s'):
-            singular = arg[:-1]
+        if effective.endswith('s'):
+            singular = effective[:-1]
             if re.search(rf'\bself\.{re.escape(singular)}\b', init_body):
                 return f'self.{singular}'
+
         # nn.Sequential / nn.ModuleList — weights/biases live inside child layers.
-        # e.g. self.network = nn.Sequential(...) or self.layers = nn.ModuleList(...)
-        # Map: weights → [l.weight for l in self.X if hasattr(l, 'weight')]
-        #      biases  → [l.bias   for l in self.X if hasattr(l, 'bias')]
         seq_match = re.search(
             r'\bself\.(\w+)\s*=\s*nn\.(?:Sequential|ModuleList)\b', init_body
         )
         if seq_match:
             container = f'self.{seq_match.group(1)}'
-            if arg in ('weights', 'weight'):
+            if effective in ('weights', 'weight'):
                 return f'[l.weight for l in {container} if hasattr(l, "weight")]'
-            if arg in ('biases', 'bias'):
+            if effective in ('biases', 'bias'):
                 return f'[l.bias for l in {container} if hasattr(l, "bias")]'
+
+        # Find first nn.Module attribute (Conv, Linear, BN, etc.) to pull attrs from.
+        nn_mod = re.search(r'\bself\.(\w+)\s*=\s*nn\.', init_body)
+        mod_name = nn_mod.group(1) if nn_mod else None
+
+        # Tensor attributes on the nn module (weight, bias, running_mean, ...)
+        tensor_attrs = ('weight', 'bias', 'running_mean', 'running_var',
+                        'weight_g', 'weight_v', 'scale', 'gamma', 'beta')
+        if effective in tensor_attrs and mod_name:
+            return f'self.{mod_name}.{effective}'
+
+        # Scalar/tuple attributes stored in nn module (stride, padding, etc.)
+        # nn.Conv/ConvTranspose store these as tuples, so index [0].
+        tuple_attrs = ('stride', 'padding', 'dilation', 'groups',
+                       'output_padding', 'kernel_size')
+        if effective in tuple_attrs and mod_name:
+            return f'self.{mod_name}.{effective}[0]'
+
         # Pattern: conv_weight -> self.conv.weight, bn_running_mean -> self.bn.running_mean
-        known_attrs = ('weight', 'bias', 'running_mean', 'running_var',
-                       'weight_g', 'weight_v', 'scale', 'gamma', 'beta')
+        known_attrs = tensor_attrs
         for attr in known_attrs:
-            if arg.endswith('_' + attr):
-                module = arg[:-len(attr) - 1]
+            if effective.endswith('_' + attr):
+                module = effective[:-len(attr) - 1]
                 if re.search(rf'\bself\.{re.escape(module)}\b', init_body):
                     return f'self.{module}.{attr}'
-        return f'self.{arg}'
+
+        return f'self.{effective}'
 
     # 7. Build the full Python wrapper
     ext_block = f'''import torch
