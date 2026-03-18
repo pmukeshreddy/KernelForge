@@ -47,21 +47,22 @@ def _debug_worker(item):
         debug_out = buf.getvalue()
 
         if not wrapper:
-            return label, "no_binding", debug_out.strip()[-300:]
+            return label, "no_binding", debug_out.strip()[-400:]
 
         result = evaluate(wrapper, pytorch_code)
 
         if result is None:
-            return label, "compile_fail", "evaluate returned None"
+            return label, "compile_fail", "evaluate returned None\n---WRAPPER DEBUG---\n" + debug_out.strip()[-400:]
 
         if result.get("correct", False):
             speedup = result.get("speedup", 1.0)
             return label, "pass", f"speedup={speedup:.2f}x"
 
         err = result.get("compiler_error") or "wrong output"
+        detail = err[:300] + "\n---WRAPPER DEBUG---\n" + debug_out.strip()[-400:]
         if any(k in err.lower() for k in ("error:", "nvcc", "undefined", "fatal")):
-            return label, "compile_fail", err[:400]
-        return label, "wrong_output", err[:400]
+            return label, "compile_fail", detail
+        return label, "wrong_output", detail
 
     except Exception as e:
         sys.stdout, sys.stderr = old_stdout, old_stderr
