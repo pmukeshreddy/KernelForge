@@ -71,8 +71,7 @@ class GRPOConfig:
     output_dir: str = "checkpoints/kernelforge_grpo"
 
     # Episode
-    max_react_steps: int = 4          # turns per trajectory (Kevin uses 4)
-    group_size: int = 16              # G trajectories per prompt (Kevin uses 16, gives more stable advantage estimates)
+    group_size: int = 16              # G trajectories per prompt
 
     # GRPO + DAPO hyperparameters
     grpo_epochs: int = 2              # gradient updates per batch
@@ -82,7 +81,6 @@ class GRPOConfig:
     cliprange_low: float = 0.2        # standard lower clip
     cliprange_high: float = 0.28      # DAPO Clip-Higher (asymmetric)
     max_grad_norm: float = 1.0
-    reward_discount: float = 0.4      # multi-turn γ (Kevin's value)
 
     # Generation
     max_new_tokens: int = 3000
@@ -145,40 +143,6 @@ torch::Tensor add_cuda(torch::Tensor a, torch::Tensor b) {
 Now write the kernel for the following operation:
 """
 
-
-def _compress_for_history(resp_text: str) -> str:
-    """
-    Strip CoT/<think> blocks from an assistant turn before adding to message history.
-    Keeps only the ```cpp block to prevent context explosion across turns.
-    Kevin (Cognition) explicitly solves this: CoT bloat reaches 50-100k tokens by turn 4.
-    """
-    # First preference: extract the cpp block (the only thing the next turn needs)
-    m = re.search(r"```cpp(.*?)```", resp_text, re.DOTALL)
-    if m:
-        return f"```cpp{m.group(1)}```"
-    # Fallback: strip think blocks and hard-truncate
-    compressed = re.sub(r"<think>.*?</think>", "", resp_text, flags=re.DOTALL).strip()
-    compressed = re.sub(r"<think>.*", "", compressed, flags=re.DOTALL).strip()
-    return compressed[:1200] if len(compressed) > 1200 else compressed
-
-
-def _preprocess_compiler_error(error: str, cuda_code: str) -> str:
-    """
-    Make nvcc errors more actionable before feeding back to the model.
-    Detects bracket imbalance (root cause of most 'expected ;' errors).
-    """
-    if not error:
-        return error
-    opens, closes = cuda_code.count('('), cuda_code.count(')')
-    curly_o, curly_c = cuda_code.count('{'), cuda_code.count('}')
-    prefix = ""
-    if opens != closes:
-        prefix += f"Note: Paren imbalance — {opens} '(' but {closes} ')' in your code.\n"
-    if curly_o != curly_c:
-        prefix += f"Note: Brace imbalance — {curly_o} '{{' but {curly_c} '}}' in your code.\n"
-    if prefix:
-        prefix += "\n"
-    return prefix + error[:1500]
 
 
 
@@ -358,7 +322,7 @@ def _generate_with_sglang(context_texts: list[str], config: "GRPOConfig") -> lis
 
 
 # ---------------------------------------------------------------------------
-# Multi-turn episode
+# Single-turn episode (standard GRPO — no ReAct loop)
 # ---------------------------------------------------------------------------
 
 # Each turn: (context_ids, response_ids)
@@ -372,230 +336,108 @@ def _run_group_episodes(
     config: GRPOConfig,
 ) -> tuple[list[list[TurnData]], list[float]]:
     """
-    Run a group of trajectories for a single prompt simultaneously.
-    Batches the inference and parallelizes the sandbox evaluation.
+    Generate G trajectories for one prompt, evaluate in parallel, return rewards.
 
     Returns:
-      group_turns: list of G trajectory turn histories
-      group_rewards: list of G scalar discounted rewards
+      group_turns:   list[G] of single-element turn lists [(ctx_ids, resp_ids)]
+      group_rewards: list[G] of scalar rewards
     """
     G = config.group_size
 
-    def _build_prompt(turns: list[dict], add_prefill: bool = True) -> str:
-        """
-        Build raw Qwen3 prompt string matching the exact SFT training format.
-        sys_prompt.py returns the system block already wrapped with <|im_start|>/<|im_end|>.
-        Avoids apply_chat_template which may add extra tokens or whitespace.
-        """
-        parts = []
-        for msg in turns:
-            role, content = msg["role"], msg["content"]
-            if role == "system":
-                # system_prompt already has <|im_start|>system...<|im_end|> tags
-                parts.append(content)
-            else:
-                parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
-        if add_prefill:
-            parts.append(f"<|im_start|>assistant\n{PREFILL}")
-        return "".join(parts)
-
     user_msg = f"{FORMAT_EXAMPLE}Reference Program:\n```python\n{prompt_text}\n```"
-    base_messages = [
-        {"role": "system", "content": get_system_prompt()},
-        {"role": "user", "content": user_msg},
-    ]
+    prompt_str = (
+        get_system_prompt()
+        + f"<|im_start|>user\n{user_msg}<|im_end|>\n"
+        + f"<|im_start|>assistant\n{PREFILL}"
+    )
+    context_texts = [prompt_str] * G
 
-    # State per trajectory
-    messages_list = [base_messages.copy() for _ in range(G)]
-    turns_list: list[list[TurnData]] = [[] for _ in range(G)]
-    per_turn_rewards_list: list[list[float]] = [[] for _ in range(G)]
-    active_mask = [True] * G  # Track which trajectories are still generating
-
-    for step in range(config.max_react_steps):
-        active_indices = [i for i, active in enumerate(active_mask) if active]
-        if not active_indices:
-            break
-
-        # 1. Prepare batch context — raw format matching SFT training exactly
-        context_texts = []
-        for i in active_indices:
-            ctx = _build_prompt(messages_list[i], add_prefill=True)
-            context_texts.append(ctx)
-
-        # 2. Generation — SGLang server or fallback to model.generate()
-        if not config.mock_mode:
-            if config.use_sglang and (SGLANG_AVAILABLE or config.sglang_python):
-                # SGLang path: context_texts already end with PREFILL (from _build_prompt).
-                # SGLang returns full text; strip the context to get the completion.
-                t_gen = time.time()
-                print(f"  [Turn {step+1}/{config.max_react_steps}] Generating {len(active_indices)} responses...", end=" ", flush=True)
-                raw_completions = _generate_with_sglang(context_texts, config)
-                print(f"done ({time.time()-t_gen:.1f}s)")
-                generated_texts = []
-                for ctx, full in zip(context_texts, raw_completions):
-                    completion = full[len(ctx):] if full.startswith(ctx) else full
-                    generated_texts.append(PREFILL + completion)  # restore prefill for extraction
-            else:
-                # Fallback: standard HuggingFace batched generation
-                tokenizer.padding_side = "left"
-                inputs = tokenizer(context_texts, return_tensors="pt", padding=True)
-                input_ids_tensor = inputs.input_ids.to(next(model.parameters()).device)
-                attention_mask = inputs.attention_mask.to(next(model.parameters()).device)
-                with torch.no_grad():
-                    outputs = model.generate(
-                        input_ids=input_ids_tensor,
-                        attention_mask=attention_mask,
-                        max_new_tokens=config.max_new_tokens,
-                        temperature=config.temperature,
-                        do_sample=True,
-                        pad_token_id=tokenizer.eos_token_id,
-                    )
-                generated_texts = [
-                    PREFILL + tokenizer.decode(outputs[i][input_ids_tensor[i].shape[0]:], skip_special_tokens=True)
-                    for i in range(len(active_indices))
-                ]
+    # 1. Generate G completions
+    if not config.mock_mode:
+        if config.use_sglang and (SGLANG_AVAILABLE or config.sglang_python):
+            t_gen = time.time()
+            print(f"  Generating {G} responses...", end=" ", flush=True)
+            raw_completions = _generate_with_sglang(context_texts, config)
+            print(f"done ({time.time()-t_gen:.1f}s)")
+            generated_texts = []
+            for ctx, full in zip(context_texts, raw_completions):
+                completion = full[len(ctx):] if full.startswith(ctx) else full
+                generated_texts.append(PREFILL + completion)
         else:
-            generated_texts = ["#include <torch/extension.h>\n__global__ void mykernel() {}\ntorch::Tensor foo(torch::Tensor a) { return a; }\n"] * len(active_indices)
+            tokenizer.padding_side = "left"
+            inputs = tokenizer(context_texts, return_tensors="pt", padding=True)
+            input_ids_tensor = inputs.input_ids.to(next(model.parameters()).device)
+            attention_mask = inputs.attention_mask.to(next(model.parameters()).device)
+            with torch.no_grad():
+                outputs = model.generate(
+                    input_ids=input_ids_tensor,
+                    attention_mask=attention_mask,
+                    max_new_tokens=config.max_new_tokens,
+                    temperature=config.temperature,
+                    do_sample=True,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+            generated_texts = [
+                PREFILL + tokenizer.decode(outputs[i][input_ids_tensor[i].shape[0]:], skip_special_tokens=True)
+                for i in range(G)
+            ]
+    else:
+        generated_texts = ["#include <torch/extension.h>\n__global__ void mykernel() {}\ntorch::Tensor foo(torch::Tensor a) { return a; }\n"] * G
 
-        # Extract generated portion
-        response_texts = []
-        for batch_idx, traj_idx in enumerate(active_indices):
-            if not config.mock_mode:
-                gen_text = generated_texts[batch_idx]
-                gen_ids = tokenizer(gen_text, return_tensors="pt").input_ids[0]
+    # 2. Tokenize context + response for GRPO loss computation
+    turns_list: list[list[TurnData]] = []
+    for i, gen_text in enumerate(generated_texts):
+        if config.mock_mode:
+            ctx_ids = torch.tensor([1, 2, 3])
+            resp_ids = torch.tensor([4, 5, 6])
+        else:
+            ctx_ids = tokenizer(context_texts[i], return_tensors="pt").input_ids[0]
+            resp_ids = tokenizer(gen_text, return_tensors="pt").input_ids[0]
+        turns_list.append([(ctx_ids.cpu(), resp_ids.cpu())])
 
-                resp_text = gen_text
-                response_texts.append(resp_text)
+    # 3. Extract code and build wrappers
+    candidates = []
+    for i, gen_text in enumerate(generated_texts):
+        cuda_code = _extract_cuda_code(gen_text)
+        if i < 2:
+            print(f"  [CODE DUMP traj={i}]:\n{(cuda_code or gen_text)[:800]}")
+        if not cuda_code:
+            candidates.append(None)
+            continue
+        candidates.append(build_load_inline_wrapper(cuda_code, prompt_text))
 
-                # Save history — compress to just the cpp block to prevent context explosion.
-                # By turn 4 with full CoT, context hits 50k+ tokens and quality collapses.
-                exact_ctx_ids = tokenizer(context_texts[batch_idx], return_tensors="pt").input_ids[0]
-                turns_list[traj_idx].append((exact_ctx_ids, gen_ids.cpu()))
-                messages_list[traj_idx].append({"role": "assistant", "content": _compress_for_history(resp_text)})
-            else:
-                resp_text = PREFILL + "import torch\ntorch.Tensor\n#include <torch/extension.h>\n__global__ void mykernel() {}\ntorch::Tensor foo(torch::Tensor a) { return a; }\n```\n"
-                response_texts.append(resp_text)
-                
-                exact_ctx_ids = torch.tensor([1, 2, 3])
-                gen_ids = torch.tensor([4, 5, 6])
-                turns_list[traj_idx].append((exact_ctx_ids, gen_ids))
-                messages_list[traj_idx].append({"role": "assistant", "content": resp_text})
+    # 4. Parallel evaluation
+    n_valid = sum(1 for c in candidates if c is not None)
+    t_eval = time.time()
+    print(f"  Evaluating {n_valid}/{G} valid kernels...", end=" ", flush=True)
+    with ProcessPoolExecutor(max_workers=min(G, 16)) as pool:
+        eval_results = list(pool.map(
+            _worker_run_eval,
+            [(c, prompt_text) for c in candidates]
+        ))
+    n_compiled = sum(1 for r in eval_results if r is not None and r.get("compiles", r.get("correct", False)))
+    print(f"done ({time.time()-t_eval:.1f}s) | compiled={n_compiled}/{n_valid}")
 
-        # 3. Parallel Evaluation
-        # First, extract code quickly
-        candidates = []
-        error_msgs = []
-        for batch_idx, resp in enumerate(response_texts):
-            traj_idx = active_indices[batch_idx]
-            cuda_code = _extract_cuda_code(resp)
-            if step == 0 and batch_idx < 2:
-                print(f"  [CODE DUMP traj={traj_idx} turn={step}]:\n{(cuda_code or resp)[:800]}")
-            if not cuda_code:
-                candidates.append(None)
-                error_msgs.append("Error: No ```cpp block found. Output CUDA C++ in a ```cpp code block.")
-                continue
+    for i, res in enumerate(eval_results):
+        if res and not res.get("compiles", False) and res.get("compiler_error"):
+            print(f"  [COMPILE ERROR traj={i}]: {res['compiler_error'][:400]}")
 
-            cand_code = build_load_inline_wrapper(cuda_code, prompt_text)
-            if not cand_code:
-                candidates.append(None)
-                error_msgs.append("Error: No torch::Tensor binding function found.")
-                continue
-                
-            candidates.append(cand_code)
-            error_msgs.append(None)
-
-        # Run valid candidates in process pool
-        n_valid = sum(1 for c in candidates if c is not None)
-        eval_results = [None] * len(active_indices)
-        t_eval = time.time()
-        print(f"  [Turn {step+1}] Evaluating {n_valid}/{len(active_indices)} valid kernels...", end=" ", flush=True)
-        with ProcessPoolExecutor(max_workers=min(G, 16)) as pool:
-            eval_results = list(pool.map(
-                _worker_run_eval,
-                [(c, prompt_text) for c in candidates]
-            ))
-
-        # Compile rate for this step (helps decide whether to run slow NCU)
-        n_compiled = sum(1 for res in eval_results if res is not None and res.get("compiles", res.get("correct", False)))
-        compile_rate = n_compiled / max(1, len(active_indices))
-        print(f"done ({time.time()-t_eval:.1f}s) | compiled={n_compiled}/{n_valid}")
-        for i, res in enumerate(eval_results):
-            if res and not res.get("compiles", False) and res.get("compiler_error"):
-                print(f"  [COMPILE ERROR traj={i}]: {res['compiler_error'][:400]}")
-
-        # 4. Process results and update trajectories
-        for batch_idx, traj_idx in enumerate(active_indices):
-            eval_res = eval_results[batch_idx]
-            
-            # DAPO Soft overlong punishment: slight negative reward for generating excessively many tokens
-            gen_len = len(turns_list[traj_idx][-1][1])
-            length_penalty = -0.001 * gen_len
-            
-            if eval_res is None:
-                # No code block or no binding function found
-                base_r = config.reward_no_code if error_msgs[batch_idx].startswith("Error: No ```cpp") else config.reward_compile_fail
-                per_turn_rewards_list[traj_idx].append(base_r + length_penalty)
-                messages_list[traj_idx].append({
-                    "role": "user",
-                    "content": error_msgs[batch_idx],
-                })
-                continue
-
-            if not eval_res["correct"]:
-                # Distinguish compile failure from wrong output — different gradient signal
-                if not eval_res.get("compiles", False):
-                    base_r = config.reward_compile_fail   # -0.5: compiled but linker/nvcc error
-                else:
-                    base_r = config.reward_wrong_output   # -0.1: compiled, ran, but wrong answer
-                per_turn_rewards_list[traj_idx].append(base_r + length_penalty)
-                raw_error = eval_res.get("compiler_error", "Outputs do not match.")
-                # Extract the cuda_code from the current response for bracket-imbalance analysis
-                _cuda_for_err = _extract_cuda_code(response_texts[batch_idx]) or ""
-                error = _preprocess_compiler_error(raw_error, _cuda_for_err)
-                messages_list[traj_idx].append({
-                    "role": "user",
-                    "content": (
-                        f"Your kernel failed.\n\nError:\n```\n{error}\n```\n\n"
-                        "Fix the bug and output the corrected C++ code."
-                    ),
-                })
-                continue
-
-            # Success: base bonus + speedup (Kevin's approach — separates correct-but-slow from failures)
-            reward = config.reward_correct_base + calculate_reward(eval_res) + length_penalty
-            per_turn_rewards_list[traj_idx].append(reward)
-            runtime_ms = eval_res["runtime_ms"]
-            print(f"    ✅ Traj {traj_idx+1} Step {step+1}: {runtime_ms:.3f}ms, {reward:.2f}x")
-
-            if step < config.max_react_steps - 1:
-                # Need to profile to get feedback for next turn
-                # Skip NCU if batch compile rate is < 50% to save time early in training
-                if compile_rate >= 0.5 and not config.mock_mode:
-                    profiler_feedback = profile_kernel(candidates[batch_idx], prompt_text)
-                else:
-                    profiler_feedback = "Profiler Skipped: Batch compile rate is < 50%. Focus on syntax and basic correctness first."
-                    
-                messages_list[traj_idx].append({
-                    "role": "user",
-                    "content": (
-                        f"Success! {runtime_ms:.3f}ms ({reward:.2f}x speedup).\n\n"
-                        f"Profiler:\n{profiler_feedback}\n\n"
-                        "Optimize further. Output improved ```cpp code."
-                    ),
-                })
-            else:
-                active_mask[traj_idx] = False # Done optimizing
-
-
-    # Calculate discounted rewards for all trajectories
+    # 5. Compute rewards
     group_rewards = []
-    for traj_idx in range(G):
-        r_list = per_turn_rewards_list[traj_idx]
-        total = sum(
-            (config.reward_discount ** t) * r
-            for t, r in enumerate(r_list)
-        ) if r_list else config.reward_compile_fail
-        group_rewards.append(total)
+    for i, eval_res in enumerate(eval_results):
+        gen_len = len(turns_list[i][0][1])
+        length_penalty = -0.001 * gen_len
+
+        if candidates[i] is None:
+            group_rewards.append(config.reward_no_code + length_penalty)
+        elif eval_res is None or not eval_res.get("compiles", False):
+            group_rewards.append(config.reward_compile_fail + length_penalty)
+        elif not eval_res["correct"]:
+            group_rewards.append(config.reward_wrong_output + length_penalty)
+        else:
+            reward = config.reward_correct_base + calculate_reward(eval_res) + length_penalty
+            print(f"    ✅ Traj {i}: {eval_res['runtime_ms']:.3f}ms reward={reward:.3f}")
+            group_rewards.append(reward)
 
     return turns_list, group_rewards
 
@@ -863,11 +705,9 @@ def train(config: GRPOConfig = None):
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     print(
-        f"\n🚀 Multi-Turn GRPO+DAPO Training\n"
-        f"   group_size={config.group_size}, max_react_steps={config.max_react_steps}, "
-        f"batch_size={config.batch_size}, grpo_epochs={config.grpo_epochs}\n"
+        f"\n🚀 GRPO+DAPO Training\n"
+        f"   group_size={config.group_size}, batch_size={config.batch_size}, grpo_epochs={config.grpo_epochs}\n"
         f"   clip=[{config.cliprange_low}, {config.cliprange_high}] (DAPO Clip-Higher)\n"
-        f"   reward_discount={config.reward_discount} (Kevin multi-turn γ)\n"
     )
 
     global_step = 0
@@ -1026,12 +866,11 @@ def train(config: GRPOConfig = None):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="KernelForge Multi-Turn GRPO+DAPO")
+    parser = argparse.ArgumentParser(description="KernelForge GRPO+DAPO")
     parser.add_argument("--dataset", type=str, default="../sft/rl_prompts.jsonl")
     parser.add_argument("--output_dir", type=str, default="checkpoints/kernelforge_grpo")
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-14B")
     parser.add_argument("--adapter", type=str, default="../sft/sft_qwen3_14b_lora")
-    parser.add_argument("--max_react_steps", type=int, default=4)
     parser.add_argument("--group_size", type=int, default=16)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-6)
@@ -1052,7 +891,6 @@ if __name__ == "__main__":
         adapter_path=args.adapter,
         dataset_path=args.dataset,
         output_dir=args.output_dir,
-        max_react_steps=args.max_react_steps,
         group_size=args.group_size,
         batch_size=args.batch_size,
         learning_rate=args.lr,
