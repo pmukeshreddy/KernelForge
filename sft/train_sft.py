@@ -41,7 +41,7 @@ Output EXACTLY ONE ```python code block containing a complete model_new.py file 
 
 # Constraints
 - CUDA kernel: `#include <torch/extension.h>`, `#include <cuda_runtime.h>`.
-- Binding function must return `torch::Tensor` and include `PYBIND11_MODULE`.
+- Binding function must return `torch::Tensor`. Do NOT include PYBIND11_MODULE — load_inline generates it automatically via functions=[].
 - Input tensors are `float32`. Use `float*` and `.data_ptr<float>()`.
 - Do NOT use cuBLAS, cuDNN, or CUTLASS.
 
@@ -108,6 +108,8 @@ def make_prompt(pytorch_code: str) -> str:
 
 
 def _extract_python_block(text: str) -> str:
+    # Strip Qwen3 thinking tokens before extracting
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
     m = re.search(r'```python\s*(.*?)```', text, re.DOTALL)
     return m.group(1).strip() if m else ""
 
