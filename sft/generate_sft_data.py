@@ -97,38 +97,35 @@ def make_training_text(pytorch_code: str, cuda_code: str) -> str:
 
 
 # ─── Gate 2 worker — exact GRPO eval pipeline ─────────────────────────────
+# Identical to _worker_eval_pair in rl/train_grpo.py.
 
-def _grpo_eval_worker(args):
-    """
-    Same logic as _worker_eval_pair in rl/train_grpo.py.
-    Runs in a worker process to isolate CUDA context and suppress debug output.
-    """
-    cuda_code, pytorch_code, rl_dir = args
-
-    # Suppress [WRAPPER DEBUG] and other stdout noise from worker
-    import io, contextlib
-    if rl_dir not in sys.path:
-        sys.path.insert(0, rl_dir)
-
+def _grpo_eval_worker(pair):
+    """(cuda_code, pytorch_code) → (ok: bool, err: str)"""
+    import os, sys
+    if _rl_dir not in sys.path:
+        sys.path.insert(0, _rl_dir)
+    # Suppress [WRAPPER DEBUG] prints
+    devnull = open(os.devnull, 'w')
+    old_stdout, old_stderr = sys.stdout, sys.stderr
+    sys.stdout = sys.stderr = devnull
     try:
         from agent import build_load_inline_wrapper
         from sandbox import evaluate
-
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-            wrapper = build_load_inline_wrapper(cuda_code, pytorch_code)
-
+        cuda_code, pytorch_code = pair
+        wrapper = build_load_inline_wrapper(cuda_code, pytorch_code)
+        sys.stdout, sys.stderr = old_stdout, old_stderr
+        devnull.close()
         if not wrapper:
-            return False, "no torch::Tensor binding found"
-
+            return False, "no binding"
         result = evaluate(wrapper, pytorch_code)
-        if result is None:
-            return False, "evaluate returned None"
-        if result.get("correct", False):
+        if result and result.get("correct", False):
             return True, ""
-        err = result.get("compiler_error") or "wrong output"
+        err = (result or {}).get("compiler_error") or "wrong output"
         return False, err[:200]
     except Exception as e:
+        sys.stdout, sys.stderr = old_stdout, old_stderr
+        try: devnull.close()
+        except: pass
         return False, str(e)[:200]
 
 
@@ -206,38 +203,30 @@ def main():
               f"({args.workers} workers)...")
 
         t0 = time.time()
-        futures = {}
+        pairs_input = [(c[0], c[1]) for c in candidates]
+
         with ProcessPoolExecutor(max_workers=args.workers) as pool:
-            for i, (cuda_code, pytorch_code, meta) in enumerate(candidates):
-                f = pool.submit(_grpo_eval_worker, (cuda_code, pytorch_code, _rl_dir))
-                futures[f] = (cuda_code, pytorch_code, meta)
+            results = list(tqdm(
+                pool.map(_grpo_eval_worker, pairs_input, chunksize=1),
+                total=len(pairs_input),
+                unit="kernel",
+                desc="Gate 2",
+            ))
 
-            with tqdm(total=len(futures), unit="kernel",
-                      bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] pass={postfix}") as pbar:
-                pbar.set_postfix(f"{g2_pass}✓ {g2_fail}✗")
-                for future in as_completed(futures):
-                    cuda_code, pytorch_code, meta = futures[future]
-                    try:
-                        ok, err = future.result(timeout=180)
-                    except Exception as e:
-                        ok, err = False, str(e)[:100]
-
-                    if ok:
-                        g2_pass += 1
-                        pairs.append({
-                            **meta,
-                            "pytorch_code": pytorch_code,
-                            "cuda_kernel": cuda_code,
-                            "text": make_training_text(pytorch_code, cuda_code),
-                        })
-                    else:
-                        g2_fail += 1
-
-                    pbar.set_postfix(f"{g2_pass}✓ {g2_fail}✗")
-                    pbar.update(1)
+        for (ok, err), (cuda_code, pytorch_code, meta) in zip(results, candidates):
+            if ok:
+                g2_pass += 1
+                pairs.append({
+                    **meta,
+                    "pytorch_code": pytorch_code,
+                    "cuda_kernel": cuda_code,
+                    "text": make_training_text(pytorch_code, cuda_code),
+                })
+            else:
+                g2_fail += 1
 
         elapsed = time.time() - t0
-        print(f"\nGate 2: {g2_pass} pass, {g2_fail} fail "
+        print(f"Gate 2: {g2_pass} pass, {g2_fail} fail "
               f"(rejection rate {g2_fail / max(1, len(candidates)) * 100:.1f}%) "
               f"in {elapsed:.0f}s")
     else:
