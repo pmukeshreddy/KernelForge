@@ -227,9 +227,11 @@ def _generate_batch(sample: list, api_key: str) -> list:
               f"errored={counts.errored}", end="\r")
     print()
 
-    # Collect results
-    batch_results = {}
-    first_error = None
+    # Collect results — track succeeded vs api_error separately
+    # so we never cache API-level failures (billing outage would poison the cache)
+    batch_results = {}   # idx -> model_new_py | None  (succeeded, possibly empty extraction)
+    api_errors    = set()  # idx -> errored at API level, do NOT cache
+    first_error   = None
     for result in client.beta.messages.batches.results(batch.id):
         idx = int(result.custom_id)
         if result.result.type == "succeeded":
@@ -239,14 +241,16 @@ def _generate_batch(sample: list, api_key: str) -> list:
             if first_error is None:
                 first_error = result.result
                 print(f"\n  [ERROR sample] type={result.result.type} error={result.result}")
+            api_errors.add(idx)
             batch_results[idx] = None
 
-    # Merge into results + update cache
+    # Merge into results + update cache (skip caching API errors)
     for idx, (i, cuda_code, pytorch_code, meta) in enumerate(to_submit):
         model_new_py = batch_results.get(idx)
         results[i]   = (model_new_py, pytorch_code, meta)
-        key = _cache_key(cuda_code, pytorch_code)
-        cache[key] = model_new_py   # cache even None to avoid re-submitting failures
+        if idx not in api_errors:
+            key = _cache_key(cuda_code, pytorch_code)
+            cache[key] = model_new_py
 
     _save_cache(cache)
     return results
