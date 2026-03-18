@@ -485,9 +485,12 @@ def _run_group_episodes(
         compile_rate = n_compiled / max(1, len(active_indices))
         print(f"done ({time.time()-t_eval:.1f}s) | compiled={n_compiled}/{n_valid}")
         if n_compiled == 0 and step == 0:
-            for res in eval_results:
+            # Print first model C++ output + its compiler error so we can diagnose
+            for i, (res, resp) in enumerate(zip(eval_results, response_texts)):
                 if res is not None and not res.get("compiles", False):
-                    print(f"  [COMPILE ERROR] {res.get('compiler_error', 'no error')[:600]}")
+                    cuda_out = _extract_cuda_code(resp) or "(no cpp block found)"
+                    print(f"  [MODEL C++ OUTPUT traj={i}]\n{cuda_out[:800]}\n")
+                    print(f"  [COMPILE ERROR]\n{res.get('compiler_error', 'no error')[:600]}")
                     break
 
         # 4. Process results and update trajectories
