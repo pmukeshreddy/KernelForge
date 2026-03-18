@@ -247,8 +247,10 @@ def _verify_worker(item):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--per_level", type=int, default=1667,
-                        help="Max SakanaAI candidates per level (~5000 total)")
+    parser.add_argument("--target_pairs", type=int, default=1000,
+                        help="Stop once this many verified pairs are collected (default 1000)")
+    parser.add_argument("--per_level", type=int, default=1000,
+                        help="Max SakanaAI candidates per level (default 1000, ~3000 total)")
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--claude_api_key", default=os.environ.get("ANTHROPIC_API_KEY", ""),
                         help="Anthropic API key for Stage 2 repair (or set ANTHROPIC_API_KEY)")
@@ -329,12 +331,15 @@ def main():
     elapsed = time.time() - t0
     print(f"Stage 1: {len(verified_pairs)} pass, {len(failures)} fail in {elapsed:.0f}s")
 
-    # ── Stage 2: Claude API repair ────────────────────────────────────────
-    if not args.skip_claude and failures:
+    # ── Stage 2: Claude API repair (only for as many as we still need) ────
+    still_need = args.target_pairs - len(verified_pairs)
+    if not args.skip_claude and failures and still_need > 0:
         if not args.claude_api_key:
             print("WARNING: --claude_api_key not set, skipping Stage 2")
         else:
-            repaired_raw = _repair_with_claude(failures, args.claude_api_key, args.workers)
+            # Only send as many failures as needed to reach target
+            failures_to_send = failures[:still_need * 2]  # 2x buffer for ~50% repair rate
+            repaired_raw = _repair_with_claude(failures_to_send, args.claude_api_key, args.workers)
 
             if repaired_raw:
                 print(f"\nVerifying {len(repaired_raw)} Claude-repaired kernels...")
@@ -349,10 +354,16 @@ def main():
                     if ok:
                         verified_pairs.append((model_new_py, pytorch_code, meta))
                         s2_pass += 1
+                        if len(verified_pairs) >= args.target_pairs:
+                            break
 
                 print(f"Stage 2: {s2_pass}/{len(repaired_raw)} pass verification")
+    elif still_need <= 0:
+        print(f"Stage 1 already reached target ({args.target_pairs}), skipping Stage 2")
 
-    print(f"\nTotal verified pairs: {len(verified_pairs)}")
+    # Cap at target
+    verified_pairs = verified_pairs[:args.target_pairs]
+    print(f"\nTotal verified pairs: {len(verified_pairs)} (target: {args.target_pairs})")
 
     # ── Deduplicate and build training text ───────────────────────────────
     seen = set()
