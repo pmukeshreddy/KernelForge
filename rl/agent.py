@@ -210,7 +210,11 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
         """
         found = []
         ret_pat = re.compile(
-            r'(?:std::(?:vector|tuple)\s*<[^>]+>\s*|torch::Tensor\s+)'
+            # Only match torch::Tensor return or std::vector/tuple OF torch::Tensor.
+            # [^>]* around Tensor allows const/& qualifiers inside the <...>.
+            # This prevents matching thrust::device_vector<float>, std::vector<int>, etc.
+            r'(?:std::(?:vector|tuple)\s*<[^>]*(?:torch|at)::Tensor[^>]*>\s*'
+            r'|torch::Tensor\s+)'
             r'(\w+)\s*\('
         )
         for m in ret_pat.finditer(code):
@@ -413,6 +417,10 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
         if effective in tensor_attrs and mod_name:
             return f'self.{mod_name}.{effective}'
 
+        # C++ null pointer → Python None (optional tensor args)
+        if effective in ('nullptr', 'null', 'none'):
+            return 'None'
+
         # 'input' / 'inp' are common C++ names for the primary input tensor — pass through
         if effective in ('input', 'inp', 'in_tensor') and forward_args_list:
             return forward_args_list[0]
@@ -422,6 +430,17 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
             base = effective[4:]
             if base in forward_set:
                 return f'torch.log({base})'
+
+        # CUDA implementation details that leak into binding args.
+        # num_streams/num_threads → store as int attribute from C++ default or use 4.
+        if re.match(r'^num_(streams?|threads?|blocks?|warps?)$', effective):
+            # Try to find default value in the C++ signature
+            sig_default = re.search(
+                rf'\b{re.escape(effective)}\s*(?:=\s*(\d+))?',
+                last_sig
+            )
+            default_val = sig_default.group(1) if (sig_default and sig_default.group(1)) else '4'
+            return default_val
 
         # Scalar/tuple attributes stored in nn module.
         # Use _si() helper (added to wrapper) which handles both int and tuple:
