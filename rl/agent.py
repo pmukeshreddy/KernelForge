@@ -244,7 +244,8 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
 
     # 5. Generate unique module name
     code_hash = hashlib.md5((cuda_code + cpp_source).encode("utf-8")).hexdigest()[:12]
-    mod_name = f"kf_ext_{code_hash}"
+    import random as _random
+    mod_name = f"kf_ext_{code_hash}_{_random.randint(0, 0xFFFFFF):06x}"
 
     init_sig = ", " + init_args_clean if init_args_clean else ""
 

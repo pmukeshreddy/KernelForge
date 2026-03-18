@@ -86,7 +86,7 @@ class GRPOConfig:
 
     # Generation
     max_new_tokens: int = 3000
-    temperature: float = 0.0
+    temperature: float = 0.3
     mock_mode: bool = False
 
     # SGLang server-mode generation (faster than model.generate())
@@ -120,6 +120,30 @@ class GRPOConfig:
 # ---------------------------------------------------------------------------
 
 PREFILL = "```cpp\n#include <torch/extension.h>\n"
+
+FORMAT_EXAMPLE = """\
+Here is an example of the expected output format:
+
+```cpp
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void add_kernel(const float* a, const float* b, float* out, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) out[idx] = a[idx] + b[idx];
+}
+
+torch::Tensor add_cuda(torch::Tensor a, torch::Tensor b) {
+    auto out = torch::empty_like(a);
+    int n = a.numel();
+    add_kernel<<<(n + 255) / 256, 256>>>(
+        a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), n);
+    return out;
+}
+```
+
+Now write the kernel for the following operation:
+"""
 
 
 def _compress_for_history(resp_text: str) -> str:
@@ -357,31 +381,6 @@ def _run_group_episodes(
     """
     G = config.group_size
 
-    # Format example — identical to SFT training format (from generate_sft_data.py)
-    FORMAT_EXAMPLE = """\
-Here is an example of the expected output format:
-
-```cpp
-#include <torch/extension.h>
-#include <cuda_runtime.h>
-
-__global__ void add_kernel(const float* a, const float* b, float* out, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) out[idx] = a[idx] + b[idx];
-}
-
-torch::Tensor add_cuda(torch::Tensor a, torch::Tensor b) {
-    auto out = torch::empty_like(a);
-    int n = a.numel();
-    add_kernel<<<(n + 255) / 256, 256>>>(
-        a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), n);
-    return out;
-}
-```
-
-Now write the kernel for the following operation:
-"""
-
     def _build_prompt(turns: list[dict], add_prefill: bool = True) -> str:
         """
         Build raw Qwen3 prompt string matching the exact SFT training format.
@@ -452,7 +451,7 @@ Now write the kernel for the following operation:
                         pad_token_id=tokenizer.eos_token_id,
                     )
                 generated_texts = [
-                    tokenizer.decode(outputs[i][input_ids_tensor[i].shape[0]:], skip_special_tokens=True)
+                    PREFILL + tokenizer.decode(outputs[i][input_ids_tensor[i].shape[0]:], skip_special_tokens=True)
                     for i in range(len(active_indices))
                 ]
         else:
@@ -704,10 +703,11 @@ def _run_evaluation(model, tokenizer, config: GRPOConfig, val_prompts: list[str]
 
     with torch.no_grad():
         for prompt_text in val_prompts:
-            # Build prompt in exact SFT format (raw strings, not apply_chat_template)
+            # Build prompt in exact SFT/rollout format
+            user_msg = f"{FORMAT_EXAMPLE}Reference Program:\n```python\n{prompt_text}\n```"
             prompt_str = (
                 get_system_prompt()
-                + f"<|im_start|>user\n{prompt_text}<|im_end|>\n"
+                + f"<|im_start|>user\n{user_msg}<|im_end|>\n"
                 + f"<|im_start|>assistant\n{PREFILL}"
             )
             input_ids = tokenizer(prompt_str, return_tensors="pt").input_ids.to(model.device)
@@ -722,8 +722,8 @@ def _run_evaluation(model, tokenizer, config: GRPOConfig, val_prompts: list[str]
             )
             resp_ids = output_ids[0][len(input_ids[0]):]
             response_text = tokenizer.decode(resp_ids, skip_special_tokens=True)
-            
-            cuda_code = _extract_cuda_code(response_text)
+
+            cuda_code = _extract_cuda_code(PREFILL + response_text)
             candidates_to_eval.append((cuda_code, prompt_text))
             
     # Parallel eval over generated candidates
