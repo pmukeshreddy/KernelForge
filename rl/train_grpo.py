@@ -86,7 +86,7 @@ class GRPOConfig:
 
     # Generation
     max_new_tokens: int = 3000
-    temperature: float = 0.3
+    temperature: float = 0.0
     mock_mode: bool = False
 
     # SGLang server-mode generation (faster than model.generate())
@@ -316,7 +316,8 @@ def _generate_with_sglang(context_texts: list[str], config: "GRPOConfig") -> lis
         "sampling_params": {
             "max_new_tokens": config.max_new_tokens,
             "temperature": config.temperature,
-            "stop": ["<|im_end|>"],  # stop at end of assistant turn
+            "top_p": 1.0 if config.temperature == 0.0 else 0.9,
+            "stop": ["<|im_end|>"],
         },
     }
     resp = requests.post(
