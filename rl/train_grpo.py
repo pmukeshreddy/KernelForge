@@ -38,7 +38,7 @@ try:
 except ImportError:
     SGLANG_AVAILABLE = False
 
-from agent import build_load_inline_wrapper, _extract_cuda_code
+from agent import _extract_cuda_code
 from profiler import profile_kernel
 from reward import calculate_reward
 from sandbox import evaluate
@@ -51,12 +51,11 @@ def _worker_run_eval(args):
     return evaluate(cand, prompt_text)
 
 
-def _worker_eval_pair(pair):
-    cuda_code, p_code = pair
-    if not cuda_code: return None
-    candidate = build_load_inline_wrapper(cuda_code, p_code)
-    if not candidate: return None
-    return evaluate(candidate, p_code)
+def _extract_python_block(text: str) -> str:
+    """Extract the first ```python ... ``` block from model output."""
+    import re
+    m = re.search(r'```python\s*(.*?)```', text, re.DOTALL)
+    return m.group(1).strip() if m else ""
 
 
 # ---------------------------------------------------------------------------
@@ -117,12 +116,17 @@ class GRPOConfig:
 # Format helpers (must match agent.py)
 # ---------------------------------------------------------------------------
 
-PREFILL = "```cpp\n#include <torch/extension.h>\n"
+PREFILL = "```python\nimport torch\n"
 
 FORMAT_EXAMPLE = """\
 Here is an example of the expected output format:
 
-```cpp
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = \"\"\"
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 
@@ -134,13 +138,32 @@ __global__ void add_kernel(const float* a, const float* b, float* out, int n) {
 torch::Tensor add_cuda(torch::Tensor a, torch::Tensor b) {
     auto out = torch::empty_like(a);
     int n = a.numel();
-    add_kernel<<<(n + 255) / 256, 256>>>(
+    add_kernel<<<(n+255)/256, 256>>>(
         a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), n);
     return out;
 }
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("forward", &add_cuda, "add");
+}
+\"\"\"
+
+ext = load_inline(
+    name="add_ext",
+    cpp_sources="torch::Tensor add_cuda(torch::Tensor a, torch::Tensor b);",
+    cuda_sources=cuda_source,
+    functions=["add_cuda"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, a, b):
+        return ext.add_cuda(a, b)
 ```
 
-Now write the kernel for the following operation:
+Now write the complete model_new.py for the following operation:
 """
 
 
@@ -382,7 +405,9 @@ def _run_group_episodes(
                 for i in range(G)
             ]
     else:
-        generated_texts = ["#include <torch/extension.h>\n__global__ void mykernel() {}\ntorch::Tensor foo(torch::Tensor a) { return a; }\n"] * G
+        generated_texts = [
+            "```python\nimport torch\nimport torch.nn as nn\nclass ModelNew(nn.Module):\n    def forward(self, a): return a\n```"
+        ] * G
 
     # 2. Tokenize context + response for GRPO loss computation
     turns_list: list[list[TurnData]] = []
@@ -395,16 +420,13 @@ def _run_group_episodes(
             resp_ids = tokenizer(gen_text, return_tensors="pt").input_ids[0]
         turns_list.append([(ctx_ids.cpu(), resp_ids.cpu())])
 
-    # 3. Extract code and build wrappers
+    # 3. Extract complete model_new.py from model output — no wrapper needed
     candidates = []
     for i, gen_text in enumerate(generated_texts):
-        cuda_code = _extract_cuda_code(gen_text)
+        model_new_py = _extract_python_block(gen_text)
         if i < 2:
-            print(f"  [CODE DUMP traj={i}]:\n{(cuda_code or gen_text)[:800]}")
-        if not cuda_code:
-            candidates.append(None)
-            continue
-        candidates.append(build_load_inline_wrapper(cuda_code, prompt_text))
+            print(f"  [CODE DUMP traj={i}]:\n{(model_new_py or gen_text)[:800]}")
+        candidates.append(model_new_py if model_new_py else None)
 
     # 4. Parallel evaluation
     n_valid = sum(1 for c in candidates if c is not None)
@@ -565,16 +587,16 @@ def _run_evaluation(model, tokenizer, config: GRPOConfig, val_prompts: list[str]
             resp_ids = output_ids[0][len(input_ids[0]):]
             response_text = tokenizer.decode(resp_ids, skip_special_tokens=True)
 
-            cuda_code = _extract_cuda_code(PREFILL + response_text)
-            candidates_to_eval.append((cuda_code, prompt_text))
-            
+            model_new_py = _extract_python_block(PREFILL + response_text)
+            candidates_to_eval.append((model_new_py or None, prompt_text))
+
     # Parallel eval over generated candidates
     success = 0
     valid = 0
     total_speedup = 0.0
-    
+
     with ProcessPoolExecutor(max_workers=min(16, len(val_prompts))) as pool:
-        eval_results = list(pool.map(_worker_eval_pair, candidates_to_eval))
+        eval_results = list(pool.map(_worker_run_eval, candidates_to_eval))
         
     for res in eval_results:
         if res is not None:
