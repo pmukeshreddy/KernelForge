@@ -2,30 +2,39 @@
 generate_sft_data.py - Download and prepare CUDA kernel SFT training pairs.
 
 Sources:
-1. CUDA-L1 (deepreinforce-ai/CUDA-L1) - Has ref_code + optimized custom_code pairs
+1. SakanaAI/AI-CUDA-Engineer-Archive - verified CUDA kernel pairs (Correct=True)
 2. KernelBench (ScalingIntelligence/KernelBench) - 250 PyTorch reference problems
    → Saved separately to rl_prompts.jsonl (prompt-only, for GRPO stage)
 
-Target format: raw CUDA C++ only (the content inside cuda_source = \"\"\"...\"\"\").
-Python wrappers, load_inline boilerplate, PYBIND11, and ModelNew classes are
-discarded. Entries where a clean kernel cannot be extracted are filtered out.
-Entries are verified with `nvcc -c` before inclusion.
+Verification gates applied to every SFT example before inclusion:
+  Gate 1: SakanaAI Correct=True flag
+  Gate 2: nvcc -c compilation (catches API mismatches, syntax errors)
+  Gate 3: Functional correctness — output matches PyTorch reference (optional, --no_functional_check to skip)
+
+Format matches GRPO rollout exactly so there is zero distribution shift at RL stage.
 """
+import argparse
 import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import unicodedata
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datasets import load_dataset
+
+# ── import rl/sandbox for functional correctness check ────────────────────
+_rl_dir = os.path.join(os.path.dirname(__file__), "..", "rl")
+if _rl_dir not in sys.path:
+    sys.path.insert(0, _rl_dir)
 
 
 def _normalize_code(code: str) -> str:
-    """Normalize unicode characters in code to ASCII-compatible form."""
     return unicodedata.normalize("NFKC", code).encode("utf-8").decode("utf-8")
 
-# ─── System Prompt (condensed version of rl/sys_prompt.py) ────────────────
-# Must align with what the model sees during GRPO so distribution doesn't shift.
+
+# ─── System Prompt — must match rl/sys_prompt.py exactly ──────────────────
 SYSTEM = """<|im_start|>system
 You are an expert NVIDIA CUDA Systems Engineer.
 Your objective is to write optimized CUDA C++ kernels to replace PyTorch operations.
@@ -48,9 +57,9 @@ Output EXACTLY ONE ```cpp code block containing your kernel and binding function
 <|im_end|>
 """
 
-
-# ─── Format example (teaches the model the exact output skeleton) ─────────
-FORMAT_EXAMPLE = """Here is an example of the expected output format:
+# ─── Format example — must match rl/train_grpo.py FORMAT_EXAMPLE exactly ─
+FORMAT_EXAMPLE = """\
+Here is an example of the expected output format:
 
 ```cpp
 #include <torch/extension.h>
@@ -74,226 +83,261 @@ Now write the kernel for the following operation:
 """
 
 
-def _extract_cuda_cpp(custom_code: str) -> str:  # unused, kept for reference
+def make_training_text(pytorch_code: str, cuda_code: str) -> str:
     """
-    Extract raw CUDA C++ from a load_inline Python script.
-
-    CUDA-L1 custom_code looks like:
-        cuda_source = \"\"\"
-        #include <torch/extension.h>
-        __global__ void my_kernel(...) { ... }
-        torch::Tensor run_cuda(...) { ... }
-        \"\"\"
-        cpp_source = "..."
-        ext = load_inline(...)
-        class ModelNew(...): ...
-
-    We want ONLY the content inside cuda_source = \"\"\"...\"\"\".
-    Returns empty string if extraction fails or the result is not valid C++.
+    Create full training prompt+target.
+    Format must match GRPO rollout format in rl/train_grpo.py exactly:
+      FORMAT_EXAMPLE + "Reference Program:\\n```python\\n{code}\\n```"
     """
-    # Try all common variable names used in CUDA-L1 custom_code
-    # Build search list: known names + dynamically detect from cuda_sources=VARNAME
-    known_vars = ['cuda_source', 'cuda_code', 'cuda_src', 'cuda_kernel_code',
-                  'cuda_kernel', 'cuda_kernel_source', 'kernel', 'kernel_code', 'CUDA_KERNEL']
-    dynamic = re.search(r'cuda_sources\s*=\s*(\w+)', custom_code)
-    if dynamic and dynamic.group(1) not in ('self', 'None'):
-        search_vars = [dynamic.group(1)] + known_vars
-    else:
-        search_vars = known_vars
-
-    match = None
-    for var in search_vars:
-        match = re.search(rf'{re.escape(var)}\s*=\s*"""(.*?)"""', custom_code, re.DOTALL)
-        if match:
-            break
-        match = re.search(rf"{re.escape(var)}\s*=\s*'''(.*?)'''", custom_code, re.DOTALL)
-        if match:
-            break
-    if not match:
-        return ""
-
-    cpp = match.group(1).strip()
-
-    # Fix deprecated PyTorch C++ API (removed in torch 2.x)
-    cpp = cpp.replace(".type()", ".scalar_type()")
-
-    # Add missing includes for commonly used APIs
-    if "getCurrentCUDAStream" in cpp and "<ATen/cuda/CUDAContext.h>" not in cpp:
-        cpp = "#include <ATen/cuda/CUDAContext.h>\n" + cpp
-
-    # Must contain a real CUDA kernel and a torch::Tensor binding function
-    if "__global__" not in cpp:
-        return ""
-    if "torch::Tensor" not in cpp:
-        return ""
-    if "#include" not in cpp:
-        return ""
-
-    return cpp
+    user_msg = FORMAT_EXAMPLE + f"Reference Program:\n```python\n{pytorch_code}\n```"
+    return (
+        SYSTEM
+        + f"<|im_start|>user\n{user_msg}<|im_end|>\n"
+        + f"<|im_start|>assistant\n```cpp\n{cuda_code}\n```<|im_end|>\n"
+    )
 
 
-def check_nvcc_available() -> bool:
-    """Check if nvcc is available on this machine."""
-    try:
-        subprocess.run(["nvcc", "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        return True
-    except FileNotFoundError:
-        return False
-
+# ─── Gate 2: nvcc compilation ─────────────────────────────────────────────
 
 def nvcc_compiles(cuda_code: str) -> tuple[bool, str]:
     """
-    Try to compile CUDA C++ with nvcc -c. 
-    Returns (True, "") if successful, or (False, error_msg) if it fails.
+    Gate 2: Compile CUDA C++ with nvcc -c.
+    Returns (True, "") on success, (False, error_msg) on failure.
     """
-    import torch
-    import sysconfig
-    from torch.utils.cpp_extension import include_paths
-    
-    tmpdir = tempfile.mkdtemp(prefix="kf_nvcc_")
-    cu_path = os.path.join(tmpdir, "kernel.cu")
-    obj_path = os.path.join(tmpdir, "kernel.o")
-    
     try:
-        with open(cu_path, "w") as f:
-            f.write(cuda_code)
-            
-        # Get PyTorch and Python include paths
+        from torch.utils.cpp_extension import include_paths
+        import sysconfig
         includes = []
         for p in include_paths():
             includes.extend(["-I", p])
         includes.extend(["-I", sysconfig.get_path("include")])
-        
-        cmd = ["nvcc", "-c", cu_path, "-o", obj_path, "--std=c++17", "-w",
-               "--expt-relaxed-constexpr", "--expt-extended-lambda"] + includes
-        
-        result = subprocess.run(
-            cmd,
-            capture_output=True, text=True, timeout=120,
+    except Exception:
+        includes = []
+
+    tmpdir = tempfile.mkdtemp(prefix="kf_sft_nvcc_")
+    cu_path = os.path.join(tmpdir, "kernel.cu")
+    obj_path = os.path.join(tmpdir, "kernel.o")
+    try:
+        with open(cu_path, "w") as f:
+            f.write(cuda_code)
+        cmd = (
+            ["nvcc", "-c", cu_path, "-o", obj_path,
+             "--std=c++17", "-w",
+             "--expt-relaxed-constexpr", "--expt-extended-lambda"]
+            + includes
         )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if result.returncode == 0:
             return True, ""
-        else:
-            return False, result.stderr + "\n" + result.stdout
+        return False, (result.stderr + result.stdout).strip()
     except subprocess.TimeoutExpired:
-        return False, "Timeout"
+        return False, "nvcc timeout"
     except Exception as e:
         return False, str(e)
     finally:
         for f in [cu_path, obj_path]:
             if os.path.exists(f):
-                os.remove(f)
-        os.rmdir(tmpdir)
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
+        try:
+            os.rmdir(tmpdir)
+        except Exception:
+            pass
 
 
-def make_training_text(pytorch_code, cuda_code, ops_desc=None):
-    """Create full training prompt with input + target, including format example."""
-    user_msg = ""
-    if ops_desc:
-        user_msg += f"Operations: {ops_desc}\n\n"
-    user_msg += FORMAT_EXAMPLE
-    user_msg += f"```python\n{pytorch_code}\n```"
-    return SYSTEM + f"<|im_start|>user\n{user_msg}<|im_end|>\n<|im_start|>assistant\n```cpp\n{cuda_code}\n```<|im_end|>\n"
+# ─── Gate 3: functional correctness ───────────────────────────────────────
+
+def _functional_check_worker(args):
+    """Run in subprocess via ProcessPoolExecutor to isolate CUDA context."""
+    cuda_code, pytorch_code = args
+    try:
+        from agent import build_load_inline_wrapper
+        from sandbox import evaluate
+        wrapper = build_load_inline_wrapper(cuda_code, pytorch_code)
+        if not wrapper:
+            return False, "no_binding"
+        result = evaluate(wrapper, pytorch_code)
+        if result is None:
+            return False, "compile_fail"
+        if result.get("correct", False):
+            return True, ""
+        return False, result.get("compiler_error", "wrong_output")[:200]
+    except Exception as e:
+        return False, str(e)[:200]
+
+
+def functional_correct(cuda_code: str, pytorch_code: str, timeout: int = 60) -> tuple[bool, str]:
+    """
+    Gate 3: Run the CUDA kernel and verify output matches PyTorch reference.
+    Uses ProcessPoolExecutor to isolate CUDA context per check.
+    """
+    with ProcessPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(_functional_check_worker, (cuda_code, pytorch_code))
+        try:
+            return future.result(timeout=timeout)
+        except Exception as e:
+            return False, f"timeout/error: {e}"
+
+
+# ─── main ──────────────────────────────────────────────────────────────────
 
 def main():
-    output_file = "./sft_training_pairs.jsonl"
-    rl_prompts_file = "./rl_prompts.jsonl"
-    pairs = []
-    
-    # === Source 0: SakanaAI/AI-CUDA-Engineer-Archive (30k pre-verified pairs) ===
-    print("Downloading SakanaAI/AI-CUDA-Engineer-Archive (pre-verified pairs)...")
-    PER_LEVEL = 5000 // 3  # ~1667 per level for balanced difficulty
-    try:
-        for level in ["level_1", "level_2", "level_3"]:
-            try:
-                ds = load_dataset("SakanaAI/AI-CUDA-Engineer-Archive", split=level)
-                level_pairs = []
-                for row in ds:
-                    if len(level_pairs) >= PER_LEVEL:
-                        break
-                    if not row.get("Correct", False):
-                        continue
-                    pytorch_code = row.get("PyTorch_Code_Module", "") or row.get("PyTorch_Code_Functional", "")
-                    cuda_code = row.get("CUDA_Code", "")
-                    if not pytorch_code or not cuda_code:
-                        continue
-                    if "__global__" not in cuda_code:
-                        continue
-                    text = make_training_text(pytorch_code, cuda_code)
-                    level_pairs.append({
-                        "source": f"sakana-{level}",
-                        "task_id": str(row.get("task_id", "")),
-                        "level_id": level,
-                        "pytorch_code": pytorch_code,
-                        "cuda_kernel": cuda_code,
-                        "text": text
-                    })
-                pairs.extend(level_pairs)
-                print(f"  SakanaAI {level}: {len(level_pairs)} pairs")
-            except Exception as e:
-                print(f"  Warning: Could not load SakanaAI {level}: {e}")
-        print(f"SakanaAI total pairs (balanced): {len(pairs)}")
-    except Exception as e:
-        print(f"Warning: Could not load SakanaAI dataset: {e}")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--per_level", type=int, default=1667,
+                        help="Max examples per SakanaAI level (default 1667 → ~5000 total)")
+    parser.add_argument("--no_functional_check", action="store_true",
+                        help="Skip Gate 3 (functional correctness). Faster but lower quality.")
+    parser.add_argument("--output", default="./sft_training_pairs.jsonl")
+    parser.add_argument("--rl_prompts_output", default="./rl_prompts.jsonl")
+    args = parser.parse_args()
 
-    
-    # === Source 2: KernelBench → separate rl_prompts.jsonl ===
-    # These are prompt-only entries for the GRPO stage. NOT included in SFT training.
-    print("Loading KernelBench dataset (RL prompts only)...")
-    rl_prompts = []
+    run_functional = not args.no_functional_check
+
+    # Check nvcc available
     try:
-        existing_codes = {p["pytorch_code"] for p in pairs}
-        
-        for level in ["level_1", "level_2", "level_3"]:
-            try:
-                ds = load_dataset("ScalingIntelligence/KernelBench", split=level)
-                for row in ds:
-                    code = row.get("code", "") or row.get("pytorch_code", "") or row.get("ref_code", "")
-                    if not code or code in existing_codes:
-                        continue
-                    code = _normalize_code(code)
-                    rl_prompts.append({
-                        "source": f"kernelbench-{level}",
-                        "task_id": row.get("task_id", row.get("name", "")),
-                        "level_id": level,
-                        "pytorch_code": code,
-                    })
-                    existing_codes.add(code)
-            except Exception as e:
-                print(f"  Warning: Could not load KernelBench {level}: {e}")
-        
-        print(f"KernelBench RL prompts: {len(rl_prompts)}")
-    except Exception as e:
-        print(f"Warning: Could not load KernelBench: {e}")
-    
-    # === Save SFT training data ===
-    if len(pairs) == 0:
-        print("ERROR: No training pairs generated! Check data sources.")
-        return
-    
-    # Deduplicate by pytorch_code content hash
+        subprocess.run(["nvcc", "--version"], stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, check=True)
+        nvcc_available = True
+        print("nvcc: available ✓")
+    except Exception:
+        nvcc_available = False
+        print("WARNING: nvcc not found — Gate 2 will be skipped. Run on GPU machine.")
+
+    if run_functional:
+        print("Gate 3 (functional correctness): ENABLED")
+    else:
+        print("Gate 3 (functional correctness): DISABLED (--no_functional_check)")
+
+    pairs = []
+    gate1_pass = gate2_pass = gate3_pass = 0
+    gate1_fail = gate2_fail = gate3_fail = 0
+
+    # === Source: SakanaAI/AI-CUDA-Engineer-Archive ========================
+    print("\nLoading SakanaAI/AI-CUDA-Engineer-Archive...")
+    for level in ["level_1", "level_2", "level_3"]:
+        level_pairs = []
+        try:
+            ds = load_dataset("SakanaAI/AI-CUDA-Engineer-Archive", split=level)
+        except Exception as e:
+            print(f"  Warning: could not load {level}: {e}")
+            continue
+
+        for row in ds:
+            if len(level_pairs) >= args.per_level:
+                break
+
+            # Gate 1: SakanaAI Correct flag
+            if not row.get("Correct", False):
+                gate1_fail += 1
+                continue
+            gate1_pass += 1
+
+            pytorch_code = (
+                row.get("PyTorch_Code_Module", "")
+                or row.get("PyTorch_Code_Functional", "")
+            ).strip()
+            cuda_code = row.get("CUDA_Code", "").strip()
+
+            if not pytorch_code or not cuda_code:
+                continue
+            if "__global__" not in cuda_code or "torch::Tensor" not in cuda_code:
+                continue
+
+            # Gate 2: nvcc compilation
+            if nvcc_available:
+                ok, err = nvcc_compiles(cuda_code)
+                if not ok:
+                    gate2_fail += 1
+                    continue
+                gate2_pass += 1
+            else:
+                gate2_pass += 1  # skip gate if no GPU machine
+
+            # Gate 3: functional correctness
+            if run_functional:
+                ok, err = functional_correct(cuda_code, pytorch_code)
+                if not ok:
+                    gate3_fail += 1
+                    continue
+                gate3_pass += 1
+            else:
+                gate3_pass += 1
+
+            text = make_training_text(pytorch_code, cuda_code)
+            level_pairs.append({
+                "source": f"sakana-{level}",
+                "task_id": str(row.get("task_id", "")),
+                "level_id": level,
+                "pytorch_code": pytorch_code,
+                "cuda_kernel": cuda_code,
+                "text": text,
+            })
+
+        pairs.extend(level_pairs)
+        print(f"  {level}: {len(level_pairs)} verified pairs")
+
+    print(f"\nVerification summary:")
+    print(f"  Gate 1 (Correct=True): {gate1_pass} pass, {gate1_fail} fail")
+    print(f"  Gate 2 (nvcc compile): {gate2_pass} pass, {gate2_fail} fail")
+    if run_functional:
+        print(f"  Gate 3 (functional):   {gate3_pass} pass, {gate3_fail} fail")
+
+    # Deduplicate
     seen = set()
     unique_pairs = []
     for p in pairs:
-        key = hash(p.get("pytorch_code", "") + p.get("cuda_kernel", ""))
+        key = hash(p["pytorch_code"] + p["cuda_kernel"])
         if key not in seen:
             seen.add(key)
             unique_pairs.append(p)
-    
-    with open(output_file, 'w') as f:
+
+    if len(unique_pairs) == 0:
+        print("\nERROR: No training pairs survived verification. Check data sources.")
+        return
+
+    with open(args.output, "w") as f:
         for p in unique_pairs:
             f.write(json.dumps(p) + "\n")
-    
-    # === Save RL prompts separately ===
+    print(f"\nSFT training pairs: {len(unique_pairs)} → {args.output}")
+
+    # === RL prompts: KernelBench (prompt-only, no solutions) ==============
+    print("\nLoading KernelBench RL prompts...")
+    rl_prompts = []
+    existing_codes = {p["pytorch_code"] for p in unique_pairs}
+    for level in ["level_1", "level_2", "level_3"]:
+        try:
+            ds = load_dataset("ScalingIntelligence/KernelBench", split=level)
+            for row in ds:
+                code = (
+                    row.get("code", "")
+                    or row.get("pytorch_code", "")
+                    or row.get("ref_code", "")
+                ).strip()
+                if not code or code in existing_codes:
+                    continue
+                code = _normalize_code(code)
+                rl_prompts.append({
+                    "source": f"kernelbench-{level}",
+                    "task_id": row.get("task_id", row.get("name", "")),
+                    "level_id": level,
+                    "pytorch_code": code,
+                })
+                existing_codes.add(code)
+        except Exception as e:
+            print(f"  Warning: could not load KernelBench {level}: {e}")
+
     if rl_prompts:
-        with open(rl_prompts_file, 'w') as f:
+        with open(args.rl_prompts_output, "w") as f:
             for p in rl_prompts:
                 f.write(json.dumps(p) + "\n")
-        print(f"RL prompts saved to: {rl_prompts_file}")
-    
-    print(f"\n=== Results ===")
-    print(f"SFT training pairs: {len(unique_pairs)} → {output_file}")
-    print(f"RL prompts (KernelBench): {len(rl_prompts)} → {rl_prompts_file}")
+        print(f"RL prompts: {len(rl_prompts)} → {args.rl_prompts_output}")
+
+    print("\n=== Done ===")
+    print(f"SFT pairs: {len(unique_pairs)}")
+    print(f"RL prompts: {len(rl_prompts)}")
+
 
 if __name__ == "__main__":
     main()
