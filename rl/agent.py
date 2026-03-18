@@ -156,14 +156,16 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
             break
 
     if not sig_matches:
+        print(f"[WRAPPER DEBUG] No torch::Tensor binding found. First 300 chars of cuda_code:\n{cuda_code[:300]}")
         return None
 
     func_signatures = [m[0] for m in sig_matches]
     func_names = [m[1] for m in sig_matches]
+    print(f"[WRAPPER DEBUG] Found {len(func_names)} binding(s): {func_names}")
 
     # Build cpp_source from signatures
     cpp_source = "; ".join(func_signatures) + ";"
-    
+
     # 2. Parse reference code's Model.forward() and __init__() arg names
     # Use balanced-paren extraction so multiline/nested signatures work correctly.
     def _extract_def_args(code: str, def_name: str) -> str:
@@ -198,6 +200,9 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
         arg.split(":")[0].split("=")[0].strip()
         for arg in _split_args(init_raw) if arg.strip()
     ) if init_raw else ""
+
+    print(f"[WRAPPER DEBUG] fwd_raw={repr(fwd_raw[:120])} → fwd_args_clean={repr(fwd_args_clean)}")
+    print(f"[WRAPPER DEBUG] init_raw={repr(init_raw[:120])} → init_args_clean={repr(init_args_clean)}")
 
     # Use the last binding function as the one to call from forward()
     binding_func = func_names[-1]
@@ -320,6 +325,9 @@ class ModelNew(torch.nn.Module):
     def forward(self, {fwd_args_clean}):
         return ext.{binding_func}({fwd_args_clean})
 '''
+    # Show the ModelNew class portion so we can verify it's syntactically correct
+    model_new_start = wrapper.find("class ModelNew")
+    print(f"[WRAPPER DEBUG] Generated ModelNew:\n{wrapper[model_new_start:model_new_start+300]}")
     return wrapper
 
 
