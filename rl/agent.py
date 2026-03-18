@@ -341,11 +341,24 @@ def build_load_inline_wrapper(cuda_code: str, ref_code: str) -> str:
         # Direct match: self.bias, self.weight, etc.
         if re.search(rf'\bself\.{re.escape(arg)}\b', init_body):
             return f'self.{arg}'
-        # Plural → singular: weights→weight, biases→bias, inputs→input, etc.
+        # Plural → singular: weights→weight, biases→bias
         if arg.endswith('s'):
             singular = arg[:-1]
             if re.search(rf'\bself\.{re.escape(singular)}\b', init_body):
                 return f'self.{singular}'
+        # nn.Sequential / nn.ModuleList — weights/biases live inside child layers.
+        # e.g. self.network = nn.Sequential(...) or self.layers = nn.ModuleList(...)
+        # Map: weights → [l.weight for l in self.X if hasattr(l, 'weight')]
+        #      biases  → [l.bias   for l in self.X if hasattr(l, 'bias')]
+        seq_match = re.search(
+            r'\bself\.(\w+)\s*=\s*nn\.(?:Sequential|ModuleList)\b', init_body
+        )
+        if seq_match:
+            container = f'self.{seq_match.group(1)}'
+            if arg in ('weights', 'weight'):
+                return f'[l.weight for l in {container} if hasattr(l, "weight")]'
+            if arg in ('biases', 'bias'):
+                return f'[l.bias for l in {container} if hasattr(l, "bias")]'
         # Pattern: conv_weight -> self.conv.weight, bn_running_mean -> self.bn.running_mean
         known_attrs = ('weight', 'bias', 'running_mean', 'running_var',
                        'weight_g', 'weight_v', 'scale', 'gamma', 'beta')
