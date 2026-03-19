@@ -337,7 +337,6 @@ def main():
             torch_dtype=torch.bfloat16,
             device_map="auto",
             trust_remote_code=True,
-            attn_implementation="kernels-community/flash-attn2",
         )
         print(f"Loading LoRA adapter from {args.output_dir}")
         model = PeftModel.from_pretrained(model, args.output_dir)
