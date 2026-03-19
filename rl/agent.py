@@ -631,13 +631,13 @@ class KernelForgeAgent:
                 # Compilation failed or output was wrong
                 error_msg = eval_result.get("compiler_error") or "Outputs do not match the reference implementation exactly (Correctness Failed)."
                 print(f"❌ Evaluation Failed: {error_msg.strip()[:100]}...\n")
-                print(f"--- FAILED GENERATED CODE ---\n{cuda_code}\n-----------------------------")
+                print(f"--- FAILED GENERATED CODE ---\n{candidate_code}\n-----------------------------")
                 
                 # Feed error back to LLM (show the C++ error, not Python wrapper errors)
                 feedback = f"Your CUDA C++ code failed during compilation or evaluation.\n\nError Log:\n```\n{error_msg}\n```\n\nAnalyze the root cause carefully. If this is a CUDA runtime error (illegal memory access), check your shared memory sizing, indexing bounds, and output write offsets. Remember: use float* and data_ptr<float>() for float32 tensors. Fix the bug and output the corrected C++ code."
                 messages.append({"role": "user", "content": feedback})
                 continue
-                
+
             runtime_ms = eval_result["runtime_ms"]
             print(f"✅ Sandbox Passed! Latency: {runtime_ms:.3f} ms")
             
