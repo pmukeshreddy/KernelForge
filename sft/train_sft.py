@@ -396,6 +396,7 @@ def main():
             bf16=True,
             gradient_checkpointing=True,
             dataset_text_field="text",
+            max_seq_length=8192,
             packing=False,
             report_to="none",
         )
