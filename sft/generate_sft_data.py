@@ -461,12 +461,16 @@ def main():
 
     training_pairs = []
     seen = set()
+    n_no_think = 0
     for model_new_py, pytorch_code, meta in passed:
         key = hash(pytorch_code + model_new_py)
         if key in seen:
             continue
         seen.add(key)
         thinking = _think_by_code.get(model_new_py, "")
+        if not thinking:
+            n_no_think += 1
+            continue  # skip old cache entries without thinking traces
         training_pairs.append({
             **meta,
             "pytorch_code": pytorch_code,
@@ -474,6 +478,8 @@ def main():
             "thinking": thinking,
             "text": make_training_text(pytorch_code, model_new_py, thinking),
         })
+    if n_no_think:
+        print(f"  Skipped {n_no_think} pairs without <think> blocks (old cache entries)")
 
     with open(args.output, "w") as f:
         for p in training_pairs:
