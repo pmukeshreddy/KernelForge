@@ -130,10 +130,12 @@ def check_nvcc() -> bool:
 def compile_kernel(code: str) -> tuple[bool, str]:
     import torch
     import torch.utils.cpp_extension
-    torch_include = torch.utils.cpp_extension.include_paths()
-    torch_lib     = torch.utils.cpp_extension.library_paths()
+    import sysconfig
+    torch_include  = torch.utils.cpp_extension.include_paths()
+    torch_lib      = torch.utils.cpp_extension.library_paths()
+    python_include = sysconfig.get_path("include")
 
-    includes = [f"-I{p}" for p in torch_include]
+    includes = [f"-I{p}" for p in torch_include] + [f"-I{python_include}"]
     libs     = [f"-L{p}" for p in torch_lib]
 
     with tempfile.NamedTemporaryFile(suffix=".cu", mode="w", delete=False) as f:
