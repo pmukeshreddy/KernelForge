@@ -241,7 +241,11 @@ except Exception as e:
     # Get the exception line — skip trailing CUDA suggestion lines
     exc_line = next(
         (l.strip() for l in reversed(lines)
-         if l.strip() and 'TORCH_USE_CUDA_DSA' not in l and 'Compile with' not in l),
+         if l.strip()
+         and 'TORCH_USE_CUDA_DSA' not in l
+         and 'Compile with' not in l
+         and 'CUDA_LAUNCH_BLOCKING' not in l
+         and 'For debugging' not in l),
         str(e)
     )
     exc_line = exc_line[:300]
