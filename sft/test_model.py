@@ -109,6 +109,7 @@ def extract_code(text: str) -> str:
     # Strip <think>...</think> blocks first
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
+    # Try complete fenced blocks first
     for lang in ["cpp", "cuda", "c++"]:
         m = re.search(rf"```{lang}\s*(.*?)```", text, re.DOTALL)
         if m:
@@ -116,6 +117,14 @@ def extract_code(text: str) -> str:
     m = re.search(r"```\s*(.*?)```", text, re.DOTALL)
     if m:
         return m.group(1).strip()
+    # Handle unclosed fenced block — take everything after the opening fence
+    for lang in ["cpp", "cuda", "c++"]:
+        m = re.search(rf"```{lang}\s*(.*)", text, re.DOTALL)
+        if m:
+            return m.group(1).strip()
+    # Strip any leading ``` markers from raw fallback
+    text = re.sub(r"^```\w*\s*", "", text.strip())
+    text = re.sub(r"```$", "", text.strip())
     return text.strip()
 
 
