@@ -147,14 +147,19 @@ def make_prompt(pytorch_code: str) -> str:
     return (
         SYSTEM
         + f"<|im_start|>user\n{user_msg}<|im_end|>\n"
-        + "<|im_start|>assistant\n"
+        + "<|im_start|>assistant\n```python\n"
     )
 
 
 def _extract_python_block(text: str) -> str:
-    # Training data has no <think> blocks. Model outputs ```python\n{code}\n``` directly.
-    m = re.search(r'```python\s*(.*?)```', text, re.DOTALL)
-    return m.group(1).strip() if m else ""
+    # The prompt is primed with ```python\n so the model output is the code continuation
+    # (no opening fence in the decoded text). Reconstruct the full block and extract.
+    full = "```python\n" + text
+    m = re.search(r'```python\s*(.*?)```', full, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    # Fallback: if no closing fence, return everything (model generated code without fence)
+    return text.strip()
 
 
 # ── Sandbox verification worker (same as GRPO) ──────────────────────────────
