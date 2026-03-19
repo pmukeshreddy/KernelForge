@@ -356,8 +356,27 @@ def main():
         # DataCollatorForCompletionOnlyLM masks every token before the response
         # template, so gradients only flow through <think>...</think> + ```python...```.
         # packing must be False — sequence packing breaks per-example masking.
+        RESPONSE_TEMPLATE = "<|im_start|>assistant\n"
+        # Sanity check: verify the response template tokenizes to IDs that actually
+        # appear in training examples. If this fails, loss masking is silently broken.
+        tmpl_ids = tokenizer.encode(RESPONSE_TEMPLATE, add_special_tokens=False)
+        sample_ids = tokenizer.encode(train_pairs[0]["text"], add_special_tokens=False)
+        found = any(sample_ids[i:i+len(tmpl_ids)] == tmpl_ids
+                    for i in range(len(sample_ids) - len(tmpl_ids) + 1))
+        print(f"\nLoss masking sanity check:")
+        print(f"  Template IDs : {tmpl_ids}")
+        print(f"  Found in sample: {found}")
+        if not found:
+            raise RuntimeError(
+                "Response template token IDs not found in training text. "
+                "Loss masking will be silently broken. "
+                f"Template '{RESPONSE_TEMPLATE}' -> {tmpl_ids}. "
+                "Check that the text field uses the same tokenization as the template."
+            )
+        print("  OK — masking will work correctly.\n")
+
         response_collator = DataCollatorForCompletionOnlyLM(
-            response_template="<|im_start|>assistant\n",
+            response_template=RESPONSE_TEMPLATE,
             tokenizer=tokenizer,
         )
 
