@@ -17,7 +17,7 @@ from tqdm import tqdm
 import torch
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from trl import SFTTrainer, SFTConfig
+from trl import SFTTrainer, SFTConfig, DataCollatorForCompletionOnlyLM
 from peft import LoraConfig, get_peft_model
 from datasets import Dataset
 
@@ -44,6 +44,7 @@ Output EXACTLY ONE ```python code block containing a complete model_new.py file 
 - Binding function must return `torch::Tensor`. Do NOT include PYBIND11_MODULE — load_inline generates it automatically via functions=[].
 - Input tensors are `float32`. Use `float*` and `.data_ptr<float>()`.
 - Do NOT use cuBLAS, cuDNN, or CUTLASS.
+- `load_inline` MUST always include `cpp_sources` as a string with the C++ function declaration(s).
 
 # Common Bugs to Avoid
 - Use `fmaxf`/`fminf` in device code, NOT `std::max`/`std::min`.
@@ -306,6 +307,17 @@ def main():
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
 
+        # Only compute loss on the assistant turn (think block + kernel).
+        # The system prompt + format example + user message are identical boilerplate
+        # across all examples — computing loss on them causes mode collapse.
+        # DataCollatorForCompletionOnlyLM masks every token before the response
+        # template, so gradients only flow through <think>...</think> + ```python...```.
+        # packing must be False — sequence packing breaks per-example masking.
+        response_collator = DataCollatorForCompletionOnlyLM(
+            response_template="<|im_start|>assistant\n",
+            tokenizer=tokenizer,
+        )
+
         training_args = SFTConfig(
             output_dir="./sft_output",
             per_device_train_batch_size=2,
@@ -322,7 +334,7 @@ def main():
             bf16=True,
             gradient_checkpointing=True,
             dataset_text_field="text",
-            packing=True,
+            packing=False,
             report_to="none",
         )
 
@@ -331,6 +343,7 @@ def main():
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             args=training_args,
+            data_collator=response_collator,
         )
 
         print("\nStarting SFT training...")

@@ -21,6 +21,7 @@ Output EXACTLY ONE ```python code block containing a complete model_new.py file 
 - Binding function must return `torch::Tensor`. Do NOT include PYBIND11_MODULE — load_inline generates it automatically via functions=[].
 - Input tensors are `float32`. Use `float*` and `.data_ptr<float>()`.
 - Do NOT use cuBLAS, cuDNN, or CUTLASS.
+- `load_inline` MUST always include `cpp_sources` as a string with the C++ function declaration(s).
 
 # Common Bugs to Avoid
 - Use `fmaxf`/`fminf` in device code, NOT `std::max`/`std::min`.
