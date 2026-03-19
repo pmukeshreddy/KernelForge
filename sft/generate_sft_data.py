@@ -100,12 +100,16 @@ Now write the complete model_new.py for the following operation:
 """
 
 
-def make_training_text(pytorch_code: str, model_new_py: str) -> str:
+def make_training_text(pytorch_code: str, model_new_py: str, thinking: str = "") -> str:
     user_msg = FORMAT_EXAMPLE + f"Reference Program:\n```python\n{pytorch_code}\n```"
+    assistant = ""
+    if thinking:
+        assistant += f"<think>\n{thinking}\n</think>\n"
+    assistant += f"```python\n{model_new_py}\n```"
     return (
         SYSTEM
         + f"<|im_start|>user\n{user_msg}<|im_end|>\n"
-        + f"<|im_start|>assistant\n```python\n{model_new_py}\n```<|im_end|>\n"
+        + f"<|im_start|>assistant\n{assistant}<|im_end|>\n"
     )
 
 
@@ -114,18 +118,21 @@ def make_training_text(pytorch_code: str, model_new_py: str) -> str:
 CLAUDE_SYSTEM = """\
 You are an expert NVIDIA CUDA engineer.
 Given a PyTorch reference implementation and its verified CUDA C++ kernel,
-generate a complete, working model_new.py file.
+generate a complete, working model_new.py file WITH a chain-of-thought reasoning block.
 
-Output EXACTLY ONE ```python code block with the complete model_new.py.
-The file must:
-- Embed the CUDA source as a string
+Output format — EXACTLY in this order:
+1. A <think>...</think> block explaining:
+   - What the operation does mathematically
+   - How to map it to CUDA threads/blocks
+   - Key implementation decisions (shared memory, vectorization, reductions, etc.)
+   - How ModelNew.__init__ and forward() args match the reference exactly
+2. EXACTLY ONE ```python code block with the complete model_new.py
+
+The model_new.py must:
+- Embed the CUDA source as a string (NO PYBIND11_MODULE — load_inline generates it via functions=[])
 - Use load_inline to compile it
 - Define ModelNew(nn.Module) with correct forward() that calls the kernel
 - Match the reference PyTorch model's interface exactly (same __init__ args, same forward args)
-
-CRITICAL: If the CUDA source contains a PYBIND11_MODULE block, you MUST remove it entirely
-from cuda_source. load_inline generates its own bindings via functions=[]. Having both causes
-a duplicate symbol linker error and the kernel will fail to compile.
 """
 
 CLAUDE_PROMPT = """\
@@ -139,7 +146,7 @@ Verified CUDA C++ kernel (Correct=True, already tested by SakanaAI):
 {cuda_code}
 ```
 
-Generate the complete model_new.py:
+Generate the <think> block then the complete model_new.py:
 """
 
 CACHE_FILE = os.path.join(os.path.dirname(__file__), ".claude_cache.json")
@@ -168,11 +175,18 @@ def _extract_python_block(text: str) -> str:
     return m.group(1).strip() if m else ""
 
 
+def _extract_think_block(text: str) -> str:
+    import re
+    m = re.search(r'<think>\s*(.*?)\s*</think>', text, re.DOTALL)
+    return m.group(1).strip() if m else ""
+
+
 def _generate_batch(sample: list, api_key: str) -> list:
     """
     Submit all requests as a single Claude Batch API call.
     Checks cache first — only sends uncached items.
-    Returns list of (model_new_py | None, pytorch_code, meta) in same order as sample.
+    Returns list of (model_new_py | None, thinking | "", pytorch_code, meta).
+    Cache stores {"code": model_new_py, "thinking": thinking}.
     """
     import anthropic
     import time
@@ -180,14 +194,18 @@ def _generate_batch(sample: list, api_key: str) -> list:
     client = anthropic.Anthropic(api_key=api_key)
     cache  = _load_cache()
 
-    # Split into cached and uncached
     results   = [None] * len(sample)
-    to_submit = []   # (original_index, cuda_code, pytorch_code, meta)
+    to_submit = []
 
     for i, (cuda_code, pytorch_code, meta) in enumerate(sample):
         key = _cache_key(cuda_code, pytorch_code)
         if key in cache:
-            results[i] = (cache[key], pytorch_code, meta)
+            entry = cache[key]
+            # Support old cache format (plain string) and new format (dict)
+            if isinstance(entry, dict):
+                results[i] = (entry.get("code"), entry.get("thinking", ""), pytorch_code, meta)
+            else:
+                results[i] = (entry, "", pytorch_code, meta)
         else:
             to_submit.append((i, cuda_code, pytorch_code, meta))
 
@@ -198,14 +216,13 @@ def _generate_batch(sample: list, api_key: str) -> list:
 
     print(f"  Submitting {len(to_submit)} requests to Claude Batch API...")
 
-    # Build batch requests
     requests = []
     for idx, (i, cuda_code, pytorch_code, meta) in enumerate(to_submit):
         requests.append({
             "custom_id": str(idx),
             "params": {
-                "model": "claude-opus-4-6",
-                "max_tokens": 4096,
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 8000,
                 "system": CLAUDE_SYSTEM,
                 "messages": [{"role": "user", "content": CLAUDE_PROMPT.format(
                     pytorch_code=pytorch_code,
@@ -214,11 +231,9 @@ def _generate_batch(sample: list, api_key: str) -> list:
             },
         })
 
-    # Submit batch
     batch = client.beta.messages.batches.create(requests=requests)
     print(f"  Batch ID: {batch.id} — polling...")
 
-    # Poll until complete
     while batch.processing_status != "ended":
         time.sleep(10)
         batch = client.beta.messages.batches.retrieve(batch.id)
@@ -227,30 +242,29 @@ def _generate_batch(sample: list, api_key: str) -> list:
               f"errored={counts.errored}", end="\r")
     print()
 
-    # Collect results — track succeeded vs api_error separately
-    # so we never cache API-level failures (billing outage would poison the cache)
-    batch_results = {}   # idx -> model_new_py | None  (succeeded, possibly empty extraction)
-    api_errors    = set()  # idx -> errored at API level, do NOT cache
+    batch_results = {}
+    api_errors    = set()
     first_error   = None
     for result in client.beta.messages.batches.results(batch.id):
         idx = int(result.custom_id)
         if result.result.type == "succeeded":
             text = result.result.message.content[0].text
-            batch_results[idx] = _extract_python_block(text) or None
+            code    = _extract_python_block(text) or None
+            thinking = _extract_think_block(text)
+            batch_results[idx] = (code, thinking)
         else:
             if first_error is None:
                 first_error = result.result
                 print(f"\n  [ERROR sample] type={result.result.type} error={result.result}")
             api_errors.add(idx)
-            batch_results[idx] = None
+            batch_results[idx] = (None, "")
 
-    # Merge into results + update cache (skip caching API errors)
     for idx, (i, cuda_code, pytorch_code, meta) in enumerate(to_submit):
-        model_new_py = batch_results.get(idx)
-        results[i]   = (model_new_py, pytorch_code, meta)
+        code, thinking = batch_results.get(idx, (None, ""))
+        results[i] = (code, thinking, pytorch_code, meta)
         if idx not in api_errors:
             key = _cache_key(cuda_code, pytorch_code)
-            cache[key] = model_new_py
+            cache[key] = {"code": code, "thinking": thinking}
 
     _save_cache(cache)
     return results
@@ -285,7 +299,7 @@ def _verify_worker(item):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--n", type=int, default=500,
+    parser.add_argument("--n", type=int, default=3000,
                         help="Number of SakanaAI kernels to sample (default 500)")
     parser.add_argument("--workers", type=int, default=32,
                         help="Parallel workers for sandbox verification")
@@ -348,22 +362,26 @@ def main():
     print(f"\nStep 1: Generating model_new.py via Claude Batch API ({len(sample)} kernels)...")
     t0 = time.time()
     generated = _generate_batch(sample, args.claude_api_key)
-    n_generated = sum(1 for m, _, _ in generated if m)
-    print(f"Claude generated: {n_generated}/{len(sample)} in {time.time()-t0:.0f}s")
+    n_generated = sum(1 for m, t, p, meta in generated if m)
+    n_with_thinking = sum(1 for m, t, p, meta in generated if m and t)
+    print(f"Claude generated: {n_generated}/{len(sample)} in {time.time()-t0:.0f}s "
+          f"({n_with_thinking} with <think> blocks)")
 
     # Print first generated sample so we can sanity-check Claude's output
-    for m, p, meta in generated:
+    for m, t, p, meta in generated:
         if m:
             print(f"\n{'─'*60}")
             print(f"SAMPLE OUTPUT [{meta.get('task_id','?')} / {meta.get('level_id','?')}]")
             print(f"{'─'*60}")
+            if t:
+                print(f"<think>\n{t[:500]}\n</think>")
             print(m[:2000])
             print(f"{'─'*60}\n")
             break
 
     # ── Step 2: Sandbox verification ─────────────────────────────────────
     # Filter out None entries before the pool to avoid wasting worker slots
-    to_verify = [(m, p, meta) for m, p, meta in generated if m]
+    to_verify = [(m, p, meta) for m, t, p, meta in generated if m]
     skipped = len(generated) - len(to_verify)
     print(f"\nStep 2: Compiling + verifying {len(to_verify)} generated wrappers "
           f"({args.workers} workers, {skipped} skipped as None)...")
@@ -383,6 +401,11 @@ def main():
                     n_fail += 1
                 bar.set_postfix(passed=n_pass, failed=n_fail, rate=f"{n_pass}/{n_pass+n_fail}")
                 bar.update(1)
+
+    # Build thinking lookup from generated (verify_results don't carry thinking)
+    thinking_map = {id(item[0]): item[1] for item in [(m, t, p, meta) for m, t, p, meta in generated if m]}
+    # Simpler: rebuild map by matching model_new_py content
+    _think_by_code = {m: t for m, t, p, meta in generated if m}
 
     passed = [(m, p, meta) for ok, m, p, meta, err in verify_results if ok]
     failures = [(err, meta) for ok, m, p, meta, err in verify_results if not ok and err]
@@ -424,7 +447,8 @@ def main():
     print(f"{'='*60}")
     for i, (m, p, meta) in enumerate(passed):
         has_kernel = "__global__" in m
-        print(f"\n[{i+1}/{len(passed)}] task={meta.get('task_id','?')} level={meta.get('level_id','?')} has_kernel={has_kernel}")
+        thinking = _think_by_code.get(m, "")
+        print(f"\n[{i+1}/{len(passed)}] task={meta.get('task_id','?')} level={meta.get('level_id','?')} has_kernel={has_kernel} has_think={bool(thinking)}")
         print(f"{'─'*60}")
         print(m)
         print(f"{'─'*60}")
@@ -442,11 +466,13 @@ def main():
         if key in seen:
             continue
         seen.add(key)
+        thinking = _think_by_code.get(model_new_py, "")
         training_pairs.append({
             **meta,
             "pytorch_code": pytorch_code,
             "model_new_py": model_new_py,
-            "text": make_training_text(pytorch_code, model_new_py),
+            "thinking": thinking,
+            "text": make_training_text(pytorch_code, model_new_py, thinking),
         })
 
     with open(args.output, "w") as f:
