@@ -147,16 +147,13 @@ def make_prompt(pytorch_code: str) -> str:
     return (
         SYSTEM
         + f"<|im_start|>user\n{user_msg}<|im_end|>\n"
-        + "<|im_start|>assistant\n```python\n"
+        + "<|im_start|>assistant\n"
     )
 
 
 def _extract_python_block(text: str) -> str:
-    # Training data has no <think> blocks — assistant turn starts directly with ```python.
-    # The inference prompt is primed with ```python\n so the model output is the code continuation.
-    # Prepend the opening fence that was part of the prompt (stripped by decode) then extract.
-    full = "```python\n" + text
-    m = re.search(r'```python\s*(.*?)```', full, re.DOTALL)
+    # Training data has no <think> blocks. Model outputs ```python\n{code}\n``` directly.
+    m = re.search(r'```python\s*(.*?)```', text, re.DOTALL)
     return m.group(1).strip() if m else ""
 
 
