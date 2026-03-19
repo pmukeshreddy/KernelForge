@@ -209,7 +209,8 @@ def run_eval(model, tokenizer, eval_items: list, workers: int = 16, tag: str = "
                 out = model.generate(
                     **inputs,
                     max_new_tokens=12288,
-                    do_sample=False,
+                    do_sample=True,
+                    temperature=0.6,
                     pad_token_id=tokenizer.eos_token_id,
                 )
             for j, (pytorch_code, label) in enumerate(batch):
