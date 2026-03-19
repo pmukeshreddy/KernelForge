@@ -258,9 +258,14 @@ def run_eval(model, tokenizer, eval_items: list, workers: int = 16, tag: str = "
         for label, err, raw in failures:
             has_think = "<think>" in raw
             has_block = "```python" in raw
+            # Extract the ext name to see what operation the model generated
+            import re as _re
+            ext_name = _re.search(r'name=["\'](\w+)["\']', raw)
+            fn_names = _re.findall(r'def (\w+)\(', raw)
             print(f"\n{'─'*60}")
             print(f"[{label}]")
             print(f"  has_think={has_think}  has_python_block={has_block}")
+            print(f"  generated_ext={ext_name.group(1) if ext_name else '?'}  fns={fn_names[:4]}")
             print(f"  sandbox_err: {(err or 'none')[:300]}")
             print(f"  raw_output:\n{raw}")
 
