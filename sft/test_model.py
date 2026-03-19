@@ -129,6 +129,7 @@ def check_nvcc() -> bool:
 
 def compile_kernel(code: str) -> tuple[bool, str]:
     import torch
+    import torch.utils.cpp_extension
     torch_include = torch.utils.cpp_extension.include_paths()
     torch_lib     = torch.utils.cpp_extension.library_paths()
 
