@@ -152,13 +152,18 @@ def make_prompt(pytorch_code: str) -> str:
 
 
 def _extract_python_block(text: str) -> str:
-    # The prompt is primed with ```python\n so the model output is the code continuation
-    # (no opening fence in the decoded text). Reconstruct the full block and extract.
-    full = "```python\n" + text
-    m = re.search(r'```python\s*(.*?)```', full, re.DOTALL)
+    # Qwen3 native thinking: model outputs code as thinking, then </think>, then the real answer.
+    # Always extract from AFTER </think> if present.
+    if '</think>' in text:
+        text = text[text.index('</think>') + len('</think>'):].strip()
+
+    # After </think> the model outputs ```python\n{code}\n```.
+    # Without </think>, the prompt was primed with ```python\n so there's no opening fence.
+    m = re.search(r'```python\s*(.*?)```', text, re.DOTALL)
     if m:
         return m.group(1).strip()
-    # Fallback: if no closing fence, return everything (model generated code without fence)
+
+    # Fallback: no fence found, return the whole text as code
     return text.strip()
 
 
