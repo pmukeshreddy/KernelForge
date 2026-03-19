@@ -63,8 +63,9 @@ def evaluate(kernel_code: str, reference_code: str, timeout: int = 300,
         env = os.environ.copy()
         env["PYTHONPATH"] = tmpdir
         
-        # Persistent compilation cache for nvcc speedups over the whole trajectory/training
-        cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".kf_compilation_cache")
+        # Each sandbox gets its own cache subdir to avoid parallel-eval race conditions
+        # where two processes compile different kernels with the same name= simultaneously.
+        cache_dir = os.path.join(tmpdir, ".kf_cache")
         os.makedirs(cache_dir, exist_ok=True)
         env["TORCH_EXTENSIONS_DIR"] = cache_dir
         if "TORCH_CUDA_ARCH_LIST" not in env:
