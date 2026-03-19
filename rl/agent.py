@@ -577,8 +577,13 @@ class KernelForgeAgent:
         messages = [
             {"role": "system", "content": self.system_prompt},
             {
-                "role": "user", 
-                "content": f"Write an optimized CUDA C++ kernel to replace this PyTorch implementation. Output only the C++ code.\n\nReference Program:\n```python\n{target_program}\n```"
+                "role": "user",
+                "content": (
+                    "Write the complete model_new.py for the following operation.\n\n"
+                    "Output EXACTLY ONE ```python code block containing the complete model_new.py "
+                    "with load_inline and a ModelNew(nn.Module) class.\n\n"
+                    f"Reference Program:\n```python\n{target_program}\n```"
+                )
             }
         ]
 
