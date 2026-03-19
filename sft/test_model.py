@@ -232,7 +232,8 @@ def main():
             print(f"  nvcc compile : {compiled}")
         if compile_err:
             print(f"  Error        : {compile_err[:200]}")
-        print(f"  Code preview :\n{code[:300]}\n{'...' if len(code) > 300 else ''}")
+        print(f"  Generated tokens: {out.shape[1] - prompt_len}")
+        print(f"  Full generated code:\n{'-'*40}\n{code}\n{'-'*40}")
 
         results.append({
             "name": name,
