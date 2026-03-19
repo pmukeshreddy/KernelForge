@@ -1,5 +1,7 @@
 #!/bin/bash
 export PYTORCH_ALLOC_CONF=expandable_segments:True
+export CUDA_HOME=${CUDA_HOME:-$(dirname $(dirname $(which nvcc)))}
+export CUDA_PATH=${CUDA_HOME}
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$REPO_DIR/rl"
 python train_grpo.py \
