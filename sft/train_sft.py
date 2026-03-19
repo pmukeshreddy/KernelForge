@@ -17,7 +17,50 @@ from tqdm import tqdm
 import torch
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from trl import SFTTrainer, SFTConfig, DataCollatorForCompletionOnlyLM
+from trl import SFTTrainer, SFTConfig
+try:
+    from trl import DataCollatorForCompletionOnlyLM
+except ImportError:
+    # Older TRL versions — inline implementation of response-only loss masking.
+    from dataclasses import dataclass
+    from transformers import PreTrainedTokenizerBase
+    from typing import Any
+
+    @dataclass
+    class DataCollatorForCompletionOnlyLM:
+        """Mask all tokens before the response_template so loss only flows through the assistant turn."""
+        response_template: str
+        tokenizer: Any
+
+        def __call__(self, features):
+            import torch
+            from transformers.data.data_collator import DataCollatorForSeq2Seq
+            input_ids = [torch.tensor(f["input_ids"]) for f in features]
+            # Pad to max length in batch
+            max_len = max(t.shape[0] for t in input_ids)
+            padded_ids, labels = [], []
+            for ids in input_ids:
+                pad_len = max_len - ids.shape[0]
+                padded = torch.cat([torch.full((pad_len,), self.tokenizer.pad_token_id, dtype=torch.long), ids])
+                label = padded.clone()
+                # Find response template tokens
+                tmpl_ids = self.tokenizer.encode(self.response_template, add_special_tokens=False)
+                tmpl_len = len(tmpl_ids)
+                # Mask everything up to and including the response template
+                mask_end = 0
+                for i in range(len(label) - tmpl_len + 1):
+                    if label[i:i+tmpl_len].tolist() == tmpl_ids:
+                        mask_end = i + tmpl_len
+                label[:mask_end] = -100
+                # Also mask padding tokens
+                label[:pad_len] = -100
+                padded_ids.append(padded)
+                labels.append(label)
+            return {
+                "input_ids": torch.stack(padded_ids),
+                "attention_mask": (torch.stack(padded_ids) != self.tokenizer.pad_token_id).long(),
+                "labels": torch.stack(labels),
+            }
 from peft import LoraConfig, get_peft_model
 from datasets import Dataset
 
