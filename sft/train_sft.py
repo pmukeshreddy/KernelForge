@@ -445,7 +445,7 @@ def main():
 
     # ── Post-training eval ─────────────────────────────────────────────────
     # 1. Held-out test set from SakanaAI (same distribution as training)
-    test_items = [(p["pytorch_code"], f"sakana/{p.get('task_id','?')}") for p in test_pairs]
+    test_items = [(p["pytorch_code"], f"sakana/{i}") for i, p in enumerate(test_pairs)]
     if args.n_eval > 0:
         test_items = random.sample(test_items, min(args.n_eval, len(test_items)))
     run_eval(eval_model, tokenizer, test_items,
@@ -458,7 +458,7 @@ def main():
         with open(args.rl_prompts) as f:
             kb_prompts = [json.loads(l) for l in f]
         kb_sample = random.sample(kb_prompts, min(args.n_kernelbench_eval, len(kb_prompts)))
-        kb_items = [(p["pytorch_code"], f"kb/{p.get('task_id','?')}") for p in kb_sample]
+        kb_items = [(p["pytorch_code"], f"kb/{i}") for i, p in enumerate(kb_sample)]
         run_eval(eval_model, tokenizer, kb_items,
                  workers=args.eval_workers, tag="KernelBench (unseen)",
                  batch_size=args.eval_batch_size, greedy=args.greedy)
