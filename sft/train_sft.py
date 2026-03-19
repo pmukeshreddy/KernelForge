@@ -233,6 +233,8 @@ def main():
     parser.add_argument("--eval_batch_size", type=int, default=8)
     parser.add_argument("--n_kernelbench_eval", type=int, default=50,
                         help="Number of KernelBench prompts to eval after training")
+    parser.add_argument("--n_eval", type=int, default=0,
+                        help="Limit held-out test to N samples (0 = all)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no_train", action="store_true",
                         help="Skip training, load existing LoRA from --output_dir and run eval only")
@@ -343,6 +345,8 @@ def main():
     # ── Post-training eval ─────────────────────────────────────────────────
     # 1. Held-out test set from SakanaAI (same distribution as training)
     test_items = [(p["pytorch_code"], f"sakana/{p.get('task_id','?')}") for p in test_pairs]
+    if args.n_eval > 0:
+        test_items = test_items[:args.n_eval]
     run_eval(eval_model, tokenizer, test_items,
              workers=args.eval_workers, tag="held-out SakanaAI test",
              batch_size=args.eval_batch_size)
