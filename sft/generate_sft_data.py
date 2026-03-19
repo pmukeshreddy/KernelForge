@@ -118,15 +118,15 @@ def make_training_text(pytorch_code: str, model_new_py: str, thinking: str = "")
 CLAUDE_SYSTEM = """\
 You are an expert NVIDIA CUDA engineer.
 Given a PyTorch reference implementation and its verified CUDA C++ kernel,
-generate a complete, working model_new.py file WITH a chain-of-thought reasoning block.
+generate a complete, working model_new.py file.
 
-Output format — EXACTLY in this order:
-1. A <think>...</think> block explaining:
-   - What the operation does mathematically
-   - How to map it to CUDA threads/blocks
-   - Key implementation decisions (shared memory, vectorization, reductions, etc.)
-   - How ModelNew.__init__ and forward() args match the reference exactly
-2. EXACTLY ONE ```python code block with the complete model_new.py
+First, output a <think>...</think> block analyzing:
+- What the reference PyTorch model does (ops, shapes, parameters)
+- The CUDA kernel's optimization strategy (tiling, fusion, memory access pattern)
+- How ModelNew.__init__ must mirror Model.__init__ parameter names exactly
+- Any edge cases (thread count, shared memory bounds, dtype)
+
+Then output EXACTLY ONE ```python code block with the complete model_new.py.
 
 The model_new.py must:
 - Embed the CUDA source as a string (NO PYBIND11_MODULE — load_inline generates it via functions=[])
