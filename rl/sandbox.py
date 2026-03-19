@@ -238,8 +238,12 @@ except Exception as e:
     # Tensor dumps appear at the END of the message; take the FIRST part instead.
     tb = traceback.format_exc()
     lines = tb.strip().split('\\n')
-    # Get the exception class + message (last non-empty line) truncated
-    exc_line = next((l.strip() for l in reversed(lines) if l.strip()), str(e))
+    # Get the exception line — skip trailing CUDA suggestion lines
+    exc_line = next(
+        (l.strip() for l in reversed(lines)
+         if l.strip() and 'TORCH_USE_CUDA_DSA' not in l and 'Compile with' not in l),
+        str(e)
+    )
     exc_line = exc_line[:300]
     # Get up to 3 File/line context lines
     file_lines = [l.strip() for l in lines if l.strip().startswith('File ')][-3:]
