@@ -240,17 +240,8 @@ except Exception as e:
     # Tensor dumps appear at the END of the message; take the FIRST part instead.
     tb = traceback.format_exc()
     lines = tb.strip().split('\\n')
-    # Get the exception line — skip trailing CUDA suggestion lines
-    # Find the actual exception line (starts with ExceptionType:)
-    # rather than CUDA suggestion lines that follow it
-    import re as _re
-    exc_line = next(
-        (l.strip() for l in reversed(lines)
-         if l.strip() and _re.match(r'^[A-Za-z].*Error.*:', l.strip())),
-        str(e)
-    )
-    if not exc_line:
-        exc_line = str(e)
+    # Get the exception class + message (last non-empty line) truncated
+    exc_line = next((l.strip() for l in reversed(lines) if l.strip()), str(e))
     exc_line = exc_line[:300]
     # Get up to 3 File/line context lines
     file_lines = [l.strip() for l in lines if l.strip().startswith('File ')][-3:]
