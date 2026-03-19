@@ -695,7 +695,7 @@ def train(config: GRPOConfig = None):
         print(f"Loading base model: {config.model_id}...")
         base_model = AutoModelForCausalLM.from_pretrained(
             config.model_id,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             device_map="auto",
             trust_remote_code=True,
             attn_implementation="kernels-community/flash-attn2",
