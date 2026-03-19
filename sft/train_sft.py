@@ -400,13 +400,15 @@ def main():
             report_to="none",
         )
 
+        # Force 8192-token context — SFTTrainer reads model_max_length from tokenizer.
+        tokenizer.model_max_length = 8192
+
         trainer = SFTTrainer(
             model=model,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             args=training_args,
             data_collator=response_collator,
-            max_seq_length=8192,
         )
 
         print("\nStarting SFT training...")
