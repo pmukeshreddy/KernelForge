@@ -483,14 +483,43 @@ class KernelForgeAgent:
         self.mock_mode = mock_mode
         
         if not mock_mode:
-            print(f"Loading Model: {model_name}...")
+            import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+            # Detect if model_name is a LoRA adapter (has adapter_config.json on HF)
+            adapter_path = None
+            base_model_name = model_name
+            try:
+                from huggingface_hub import hf_hub_download
+                hf_hub_download(repo_id=model_name, filename="adapter_config.json")
+                # If we get here, it's a LoRA adapter — read base model from config
+                import json
+                from huggingface_hub import hf_hub_download
+                cfg_path = hf_hub_download(repo_id=model_name, filename="adapter_config.json")
+                with open(cfg_path) as f:
+                    adapter_cfg = json.load(f)
+                base_model_name = adapter_cfg.get("base_model_name_or_path", model_name)
+                adapter_path = model_name
+                print(f"Detected LoRA adapter. Base model: {base_model_name}")
+            except Exception:
+                pass  # Not a LoRA adapter, load as full model
+
+            print(f"Loading base model: {base_model_name}...")
+            self.tokenizer = AutoTokenizer.from_pretrained(adapter_path or model_name)
             self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
+                base_model_name,
                 device_map="auto",
-                torch_dtype="auto"
+                torch_dtype=torch.bfloat16,
+                attn_implementation="sdpa",
             )
+
+            if adapter_path:
+                print(f"Loading LoRA adapter: {adapter_path}...")
+                from peft import PeftModel
+                self.model = PeftModel.from_pretrained(self.model, adapter_path)
+
+            self.model.eval()
+            print("Model ready.")
 
     def generate(self, messages: List[Dict[str, str]]) -> str:
         """Call the LLM to generate the next response based on conversation history."""
