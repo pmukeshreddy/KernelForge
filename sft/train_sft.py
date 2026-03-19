@@ -199,20 +199,19 @@ def run_eval(model, tokenizer, eval_items: list, workers: int = 16, tag: str = "
                 )
                 bar.update(1)
 
-    # Print failure diagnostics — raw output + sandbox error
+    # Print full diagnostics — raw output + sandbox error for ALL failures
     if failures:
-        print(f"\n{'─'*60}")
-        print(f"FAILURE DIAGNOSTICS (first 3)")
-        print(f"{'─'*60}")
-        for label, err, raw in failures[:3]:
+        print(f"\n{'='*60}")
+        print(f"ALL {len(failures)} FAILURES — FULL OUTPUT")
+        print(f"{'='*60}")
+        for label, err, raw in failures:
             has_think = "<think>" in raw
             has_block = "```python" in raw
-            print(f"\n[{label}]")
+            print(f"\n{'─'*60}")
+            print(f"[{label}]")
             print(f"  has_think={has_think}  has_python_block={has_block}")
-            print(f"  sandbox_err: {(err or 'none')[:200]}")
-            if has_think:
-                print(f"  think_len={len(re.findall(r'<think>(.*?)</think>', raw, re.DOTALL)[0]) if re.search(r'<think>', raw) else 0} chars")
-            print(f"  raw_output[:300]:\n{raw[:300]}")
+            print(f"  sandbox_err: {(err or 'none')[:300]}")
+            print(f"  raw_output:\n{raw}")
 
     total = n_pass + n_fail
     print(f"\n{tag} Pass@1: {n_pass}/{total} = {n_pass/max(1,total)*100:.1f}%")
