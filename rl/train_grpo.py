@@ -102,10 +102,23 @@ class GRPOConfig:
     wandb_run_name: str = "grpo-qwen-14b"
 
     # Reward shaping (graduated — creates gradient signal at every failure stage)
-    reward_no_code: float = -1.0      # no ```cpp block found at all
+    reward_no_code: float = -1.0      # no ```python block found at all
     reward_compile_fail: float = -0.5 # code found but fails to compile or wrap
     reward_wrong_output: float = -0.1 # compiles but produces wrong outputs
     reward_correct_base: float = 0.3  # base bonus for any correct kernel (Kevin's approach)
+
+    # Length penalty — scaled to be minor relative to reward signal
+    # At 3000 tokens: -0.0001 * 3000 = -0.3 (won't swamp the correctness signal)
+    length_penalty_coef: float = 0.0001
+
+    # Entropy bonus — prevents entropy collapse (critical for coding tasks)
+    # A small positive coefficient adds H(π) to the objective, keeping exploration alive.
+    # Dr. Kernel and DAPO both recommend ~0.01-0.05 for code generation.
+    entropy_coef: float = 0.02
+
+    # Curriculum: weight sampling toward easier tasks (lower level_id) early in training
+    # Set to True to use level_id field from dataset if available
+    curriculum: bool = True
 
     # Dynamic Sampling: skip degenerate groups where all rewards are identical
     dynamic_sampling: bool = True
@@ -448,7 +461,7 @@ def _run_group_episodes(
     group_rewards = []
     for i, eval_res in enumerate(eval_results):
         gen_len = len(turns_list[i][0][1])
-        length_penalty = -0.001 * gen_len
+        length_penalty = -config.length_penalty_coef * gen_len  # max ~-0.3 at 3000 tokens
 
         if candidates[i] is None:
             group_rewards.append(config.reward_no_code + length_penalty)
@@ -512,6 +525,7 @@ def _compute_grpo_loss(
 
     1. Group-relative advantage: A_i = (r_i - mean) / (std + ε)
     2. Token-level clipped loss with DAPO Clip-Higher
+    3. Entropy bonus: -entropy_coef * H(π) prevents entropy collapse
     """
     G = len(group_rewards)
     rewards = torch.tensor(group_rewards, dtype=torch.float32)
@@ -523,6 +537,7 @@ def _compute_grpo_loss(
 
     device = next(model.parameters()).device
     token_losses = []
+    entropy_terms = []
 
     for i in range(G):
         A_i = advantages[i].item()
@@ -547,13 +562,26 @@ def _compute_grpo_loss(
                 1.0 + config.cliprange_high,
             )
 
-            # Token-level loss
+            # Token-level policy loss
             token_losses.append(-torch.min(ratio * float(A_i), clipped * float(A_i)))
+
+            # Entropy: H(π) = -E[log π] = -mean(new_lp)
+            # Maximizing entropy = adding -entropy_coef * (-new_lp) = entropy_coef * new_lp
+            # We subtract from loss (loss -= entropy_coef * H) = loss += entropy_coef * new_lp
+            if config.entropy_coef > 0:
+                entropy_terms.append(-new_lp)  # -log π per token (positive entropy)
 
     if not token_losses:
         return torch.tensor(0.0, device=device, requires_grad=True)
 
-    return torch.cat(token_losses).mean()
+    policy_loss = torch.cat(token_losses).mean()
+
+    if entropy_terms and config.entropy_coef > 0:
+        # entropy = mean(-log π); we want to maximize it → subtract from loss
+        entropy = torch.cat(entropy_terms).mean()
+        return policy_loss - config.entropy_coef * entropy
+
+    return policy_loss
 
 
 def _run_evaluation(model, tokenizer, config: GRPOConfig, val_prompts: list[str]) -> dict:
@@ -634,13 +662,21 @@ def train(config: GRPOConfig = None):
     except Exception as e:
         print(f"Failed to load dataset.\n{e}")
         return
-    prompts = [row["pytorch_code"] for row in raw]
+    rows = list(raw)
+
+    # Curriculum: sort by level_id (easy first) if available and enabled
+    if config.curriculum and "level_id" in rows[0]:
+        rows.sort(key=lambda r: (r.get("level_id", 99), random.random()))
+        print(f"Curriculum enabled: sorted {len(rows)} tasks by level_id (easy-first).")
+    else:
+        random.shuffle(rows)
+
+    prompts = [row["pytorch_code"] for row in rows]
     # Split to train/val (10% val, max 20)
-    random.shuffle(prompts)
     val_size = min(int(len(prompts) * 0.1), 20)
     if val_size == 0 and len(prompts) > 1:
         val_size = 1
-    
+
     val_prompts = prompts[:val_size]
     train_prompts = prompts[val_size:]
     
@@ -857,7 +893,7 @@ def train(config: GRPOConfig = None):
                 wandb.log({
                     "train/loss": total_loss_val,
                     "train/batch_mean_reward": batch_mean,
-                    "train/mean_neg_logprob": mean_entropy,
+                    "train/mean_entropy": mean_entropy,  # track entropy — collapse = this dropping
                     "train/degenerate_groups": n_degenerate,
                     "train/learning_rate": scheduler.get_last_lr()[0],
                     "epoch": epoch + (global_step / max(1, len(train_prompts) // config.batch_size))
