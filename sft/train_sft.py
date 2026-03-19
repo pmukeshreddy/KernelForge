@@ -396,7 +396,6 @@ def main():
             bf16=True,
             gradient_checkpointing=True,
             dataset_text_field="text",
-            max_seq_length=8192,
             packing=False,
             report_to="none",
         )
@@ -407,6 +406,7 @@ def main():
             eval_dataset=eval_dataset,
             args=training_args,
             data_collator=response_collator,
+            max_seq_length=8192,
         )
 
         print("\nStarting SFT training...")
