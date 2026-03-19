@@ -225,6 +225,13 @@ def run_eval(model, tokenizer, eval_items: list, workers: int = 16, tag: str = "
             for j, (pytorch_code, label) in enumerate(batch):
                 text = tokenizer.decode(out[j][prompt_len:], skip_special_tokens=True)
                 model_new_py = _extract_python_block(text) or None
+                kernels_before = re.findall(r'void\s+(\w+)\s*\(', text[:text.index('</think>')] if '</think>' in text else text)
+                kernels_after  = re.findall(r'void\s+(\w+)\s*\(', text[text.index('</think>'):] if '</think>' in text else '')
+                print(f"\n[DEBUG] label={label}")
+                print(f"  has_think={'<think>' in text}  has_close={'</think>' in text}")
+                print(f"  kernels_before_think: {kernels_before[:3]}")
+                print(f"  kernels_after_think:  {kernels_after[:3]}")
+                print(f"  extracted_ext: {re.search(r'name=.*?(\\w+)', model_new_py or '').group(0)[:40] if model_new_py else 'None'}")
                 generated.append((model_new_py, pytorch_code, label, text))
             bar.update(len(batch))
 
