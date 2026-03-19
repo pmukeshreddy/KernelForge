@@ -106,6 +106,9 @@ def make_prompt(pytorch_code: str) -> str:
 
 
 def extract_code(text: str) -> str:
+    # Strip <think>...</think> blocks first
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
     for lang in ["cpp", "cuda", "c++"]:
         m = re.search(rf"```{lang}\s*(.*?)```", text, re.DOTALL)
         if m:
@@ -125,16 +128,26 @@ def check_nvcc() -> bool:
 
 
 def compile_kernel(code: str) -> tuple[bool, str]:
+    import torch
+    torch_include = torch.utils.cpp_extension.include_paths()
+    torch_lib     = torch.utils.cpp_extension.library_paths()
+
+    includes = [f"-I{p}" for p in torch_include]
+    libs     = [f"-L{p}" for p in torch_lib]
+
     with tempfile.NamedTemporaryFile(suffix=".cu", mode="w", delete=False) as f:
         f.write(code)
         cu_path = f.name
     obj_path = cu_path.replace(".cu", ".o")
     try:
-        result = subprocess.run(
-            ["nvcc", "-c", cu_path, "-o", obj_path, "--compiler-options", "-w"],
-            capture_output=True, text=True, timeout=20
-        )
-        return result.returncode == 0, result.stderr.strip()
+        cmd = ["nvcc", "-c", cu_path, "-o", obj_path,
+               "-Wno-deprecated-gpu-targets", "-std=c++17"] + includes + libs
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        err = result.stderr.strip()
+        # Filter out pure warnings, keep only errors
+        error_lines = [l for l in err.splitlines()
+                       if "error:" in l.lower() or "fatal" in l.lower()]
+        return result.returncode == 0, "\n".join(error_lines) if error_lines else err[:300]
     except subprocess.TimeoutExpired:
         return False, "Compilation timeout"
     except Exception as e:
