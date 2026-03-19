@@ -698,6 +698,7 @@ def train(config: GRPOConfig = None):
             torch_dtype=torch.bfloat16,
             device_map="auto",
             trust_remote_code=True,
+            attn_implementation="flash_attention_2",
         )
         print(f"Loading SFT adapter: {config.adapter_path}...")
         model = PeftModel.from_pretrained(base_model, config.adapter_path, is_trainable=True)
