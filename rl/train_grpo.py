@@ -29,6 +29,8 @@ from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
+_MP_SPAWN_CTX = multiprocessing.get_context("spawn")
 
 # SGLang imports — optional, falls back to model.generate() if not installed
 try:
@@ -445,7 +447,7 @@ def _run_group_episodes(
     n_valid = sum(1 for c in candidates if c is not None)
     t_eval = time.time()
     print(f"  Evaluating {n_valid}/{G} valid kernels...", end=" ", flush=True)
-    with ProcessPoolExecutor(max_workers=min(G, 16)) as pool:
+    with ProcessPoolExecutor(max_workers=min(G, 16), mp_context=_MP_SPAWN_CTX) as pool:
         eval_results = list(pool.map(
             _worker_run_eval,
             [(c, prompt_text) for c in candidates]
@@ -623,7 +625,7 @@ def _run_evaluation(model, tokenizer, config: GRPOConfig, val_prompts: list[str]
     valid = 0
     total_speedup = 0.0
 
-    with ProcessPoolExecutor(max_workers=min(16, len(val_prompts))) as pool:
+    with ProcessPoolExecutor(max_workers=min(16, len(val_prompts)), mp_context=_MP_SPAWN_CTX) as pool:
         eval_results = list(pool.map(_worker_run_eval, candidates_to_eval))
         
     for res in eval_results:
