@@ -231,7 +231,8 @@ def run_eval(model, tokenizer, eval_items: list, workers: int = 16, tag: str = "
                 print(f"  has_think={'<think>' in text}  has_close={'</think>' in text}")
                 print(f"  kernels_before_think: {kernels_before[:3]}")
                 print(f"  kernels_after_think:  {kernels_after[:3]}")
-                print(f"  extracted_ext: {re.search(r'name=.*?(\\w+)', model_new_py or '').group(0)[:40] if model_new_py else 'None'}")
+                ext_match = re.search(r"name=['\"](\w+)['\"]", model_new_py or '')
+                print(f"  extracted_ext: {ext_match.group(1) if ext_match else 'None'}")
                 generated.append((model_new_py, pytorch_code, label, text))
             bar.update(len(batch))
 
