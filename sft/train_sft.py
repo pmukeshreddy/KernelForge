@@ -147,20 +147,16 @@ def make_prompt(pytorch_code: str) -> str:
     return (
         SYSTEM
         + f"<|im_start|>user\n{user_msg}<|im_end|>\n"
-        + "<|im_start|>assistant\n<think>\n"
+        + "<|im_start|>assistant\n```python\n"
     )
 
 
 def _extract_python_block(text: str) -> str:
-    # The inference prompt already ends with "<think>\n", so the model output is:
-    # "{thinking content}\n</think>\n```python\n{code}\n```"
-    # Strip everything up to and including the first </think>, then find the python block.
-    if '</think>' in text:
-        text = text[text.index('</think>') + len('</think>'):].strip()
-    else:
-        # Fallback: strip any full <think>...</think> blocks
-        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
-    m = re.search(r'```python\s*(.*?)```', text, re.DOTALL)
+    # Training data has no <think> blocks — assistant turn starts directly with ```python.
+    # The inference prompt is primed with ```python\n so the model output is the code continuation.
+    # Prepend the opening fence that was part of the prompt (stripped by decode) then extract.
+    full = "```python\n" + text
+    m = re.search(r'```python\s*(.*?)```', full, re.DOTALL)
     return m.group(1).strip() if m else ""
 
 
@@ -362,7 +358,7 @@ def main():
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
 
-        # Only compute loss on the assistant turn (think block + kernel).
+        # Only compute loss on the assistant turn (kernel code only — no thinking in this data).
         # The system prompt + format example + user message are identical boilerplate
         # across all examples — computing loss on them causes mode collapse.
         # DataCollatorForCompletionOnlyLM masks every token before the response
