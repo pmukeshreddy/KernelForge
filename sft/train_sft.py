@@ -191,7 +191,7 @@ def _eval_worker(item):
 
 
 def run_eval(model, tokenizer, eval_items: list, workers: int = 16, tag: str = "eval",
-             batch_size: int = 8):
+             batch_size: int = 8, greedy: bool = False):
     """
     Generate model_new.py for each (pytorch_code, label), compile+verify, report Pass@1.
     eval_items: list of (pytorch_code, label)
@@ -218,7 +218,7 @@ def run_eval(model, tokenizer, eval_items: list, workers: int = 16, tag: str = "
                 out = model.generate(
                     **inputs,
                     max_new_tokens=12288,
-                    do_sample=not args.greedy,
+                    do_sample=not greedy,
                     temperature=0.6,
                     pad_token_id=tokenizer.eos_token_id,
                 )
@@ -443,7 +443,7 @@ def main():
         test_items = random.sample(test_items, min(args.n_eval, len(test_items)))
     run_eval(eval_model, tokenizer, test_items,
              workers=args.eval_workers, tag="held-out SakanaAI test",
-             batch_size=args.eval_batch_size)
+             batch_size=args.eval_batch_size, greedy=args.greedy)
 
     # 2. KernelBench prompts (different distribution — unseen tasks)
     kb_items = []
@@ -454,7 +454,7 @@ def main():
         kb_items = [(p["pytorch_code"], f"kb/{p.get('task_id','?')}") for p in kb_sample]
         run_eval(eval_model, tokenizer, kb_items,
                  workers=args.eval_workers, tag="KernelBench (unseen)",
-                 batch_size=args.eval_batch_size)
+                 batch_size=args.eval_batch_size, greedy=args.greedy)
     else:
         print(f"\nSkipping KernelBench eval — {args.rl_prompts} not found")
 
