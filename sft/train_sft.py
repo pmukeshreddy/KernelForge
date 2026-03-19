@@ -147,13 +147,19 @@ def make_prompt(pytorch_code: str) -> str:
     return (
         SYSTEM
         + f"<|im_start|>user\n{user_msg}<|im_end|>\n"
-        + "<|im_start|>assistant\n"
+        + "<|im_start|>assistant\n<think>\n"
     )
 
 
 def _extract_python_block(text: str) -> str:
-    # Strip Qwen3 thinking tokens before extracting
-    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+    # The inference prompt already ends with "<think>\n", so the model output is:
+    # "{thinking content}\n</think>\n```python\n{code}\n```"
+    # Strip everything up to and including the first </think>, then find the python block.
+    if '</think>' in text:
+        text = text[text.index('</think>') + len('</think>'):].strip()
+    else:
+        # Fallback: strip any full <think>...</think> blocks
+        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
     m = re.search(r'```python\s*(.*?)```', text, re.DOTALL)
     return m.group(1).strip() if m else ""
 
