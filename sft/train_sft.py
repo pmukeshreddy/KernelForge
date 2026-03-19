@@ -218,7 +218,7 @@ def run_eval(model, tokenizer, eval_items: list, workers: int = 16, tag: str = "
                 out = model.generate(
                     **inputs,
                     max_new_tokens=12288,
-                    do_sample=True,
+                    do_sample=not args.greedy,
                     temperature=0.6,
                     pad_token_id=tokenizer.eos_token_id,
                 )
@@ -294,6 +294,8 @@ def main():
     parser.add_argument("--n_eval", type=int, default=0,
                         help="Limit held-out test to N samples (0 = all)")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--greedy", action="store_true",
+                        help="Use greedy decoding instead of sampling")
     parser.add_argument("--no_train", action="store_true",
                         help="Skip training, load existing LoRA from --output_dir and run eval only")
     args = parser.parse_args()
