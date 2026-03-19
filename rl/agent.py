@@ -454,6 +454,21 @@ class ModelNew(torch.nn.Module):
     print(f"[WRAPPER DEBUG] ModelNew:\n{wrapper[wrapper.find('class ModelNew'):]}")
     return wrapper
 
+def _extract_python_code(response: str) -> str:
+    """Extract the Python model_new.py block from the LLM's response."""
+    # Strip <think> blocks first
+    response = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL)
+    response = re.sub(r"<think>.*", "", response, flags=re.DOTALL)
+    m = re.search(r"```python\s*(.*?)```", response, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    # Handle unclosed block
+    m = re.search(r"```python\s*(.*)", response, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
 def _extract_cuda_code(response: str) -> str:
     """Extract the CUDA C++ code block from the LLM's response."""
     # Try cpp, cuda, c++ block markers
@@ -528,21 +543,21 @@ class KernelForgeAgent:
             tokenize=False,
             add_generation_prompt=True
         )
-        
-        # Pre-fill the assistant response to force C++ output (matches SFT training format)
-        prefill = "```cpp\n#include <torch/extension.h>\n"
+
+        # Pre-fill with python block to match SFT training format
+        prefill = "```python\n"
         text += prefill
-        
+
         inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
-        
+
         outputs = self.model.generate(
             **inputs,
             max_new_tokens=4096,
-            temperature=0.7,   # Slight creativity for exploration
+            temperature=0.7,
             do_sample=True,
             pad_token_id=self.tokenizer.eos_token_id
         )
-        
+
         # Extract only the newly generated text
         generated_ids = outputs[0][len(inputs.input_ids[0]):]
         return self.tokenizer.decode(generated_ids, skip_special_tokens=True)
@@ -592,23 +607,15 @@ class KernelForgeAgent:
             print("🧠 Generating Kernel...")
             response = self.generate(messages)
             # Restore the prefill we forced it to start with
-            full_response = "```cpp\n#include <torch/extension.h>\n" + response
+            full_response = "```python\n" + response
             messages.append({"role": "assistant", "content": full_response})
             
-            # 2. Extract CUDA C++ Code
-            cuda_code = _extract_cuda_code(full_response)
-            if not cuda_code:
-                print("❌ Failed to extract C++ code block. Requesting fix...")
+            # 2. Extract Python model_new.py block (matches SFT training format)
+            candidate_code = _extract_python_code(full_response)
+            if not candidate_code or "ModelNew" not in candidate_code:
+                print("❌ Failed to extract Python model_new.py block. Requesting fix...")
                 print(f"--- FAILED GENERATED TEXT ---\n{response[:500]}\n-----------------------------")
-                messages.append({"role": "user", "content": "Error: Could not find ```cpp block in your response. Please output the CUDA C++ code properly in a ```cpp code block."})
-                continue
-            
-            # 3. Wrap in load_inline Python
-            candidate_code = build_load_inline_wrapper(cuda_code, target_program)
-            if not candidate_code:
-                print("❌ Could not parse binding function from C++ code.")
-                print(f"--- FAILED GENERATED CODE ---\n{cuda_code[:500]}\n-----------------------------")
-                messages.append({"role": "user", "content": "Error: Could not find a `torch::Tensor` binding function in your code. You must include a C++ function that returns `torch::Tensor` and calls your CUDA kernel."})
+                messages.append({"role": "user", "content": "Error: Could not find a ```python code block with a ModelNew class in your response. Output EXACTLY ONE ```python block containing the complete model_new.py file with load_inline and a ModelNew(nn.Module) class."})
                 continue
                 
             # 4. Sandbox Evaluation
@@ -644,7 +651,7 @@ class KernelForgeAgent:
             # 6. Iteration Feedback
             if step < max_steps:
                 print("🔄 Sending profiler feedback back to LLM for next iteration...")
-                feedback = f"Success! Your kernel ran in {runtime_ms:.3f} ms, achieving a {reward:.2f}x speedup over the baseline.\n\nHere is the hardware profiling report:\n{profiler_feedback}\n\nCan you optimize the C++ kernel further to resolve the bottleneck? Output the improved ```cpp code."
+                feedback = f"Success! Your kernel ran in {runtime_ms:.3f} ms, achieving a {reward:.2f}x speedup over the baseline.\n\nHere is the hardware profiling report:\n{profiler_feedback}\n\nCan you optimize the kernel further to resolve the bottleneck? Output the improved ```python model_new.py."
                 messages.append({"role": "user", "content": feedback})
 
         print(f"\n🏁 Optimization Completed. Best Reward: {best_reward:.2f}x")
