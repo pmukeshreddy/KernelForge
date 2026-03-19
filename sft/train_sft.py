@@ -438,7 +438,7 @@ def main():
     # 1. Held-out test set from SakanaAI (same distribution as training)
     test_items = [(p["pytorch_code"], f"sakana/{p.get('task_id','?')}") for p in test_pairs]
     if args.n_eval > 0:
-        test_items = test_items[:args.n_eval]
+        test_items = random.sample(test_items, min(args.n_eval, len(test_items)))
     run_eval(eval_model, tokenizer, test_items,
              workers=args.eval_workers, tag="held-out SakanaAI test",
              batch_size=args.eval_batch_size)
