@@ -69,7 +69,9 @@ def evaluate(kernel_code: str, reference_code: str, timeout: int = 300,
         os.makedirs(cache_dir, exist_ok=True)
         env["TORCH_EXTENSIONS_DIR"] = cache_dir
         if "TORCH_CUDA_ARCH_LIST" not in env:
-            env["TORCH_CUDA_ARCH_LIST"] = "9.0"
+            import torch
+            major, minor = torch.cuda.get_device_capability()
+            env["TORCH_CUDA_ARCH_LIST"] = f"{major}.{minor}"
 
         proc = subprocess.run(
             [sys.executable, eval_path],
