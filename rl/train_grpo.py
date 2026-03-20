@@ -835,15 +835,14 @@ def train(config: GRPOConfig = None):
                 print(f"\n[Prompt {p_idx+1}/{len(batch)}] Generating {config.group_size} trajectories (batched/parallel)...")
                 group_turns, group_rewards = _run_group_episodes(prompt_text, model, tokenizer, config)
 
-                # Dynamic Sampling: if all rewards are identical, resample (DAPO)
+                # Dynamic Sampling: skip degenerate groups (DAPO)
+                # Don't resample the same hard prompt — just skip it entirely.
                 if config.dynamic_sampling:
-                    for attempt in range(config.max_resample_attempts):
-                        reward_std = torch.tensor(group_rewards).std().item()
-                        if reward_std > 1e-4:
-                            break
+                    reward_std = torch.tensor(group_rewards).std().item()
+                    if reward_std <= 1e-4:
                         n_degenerate += 1
-                        print(f"  [Dynamic Sampling] Degenerate group (std={reward_std:.6f}), resampling attempt {attempt+1}/{config.max_resample_attempts}...")
-                        group_turns, group_rewards = _run_group_episodes(prompt_text, model, tokenizer, config)
+                        print(f"  [Dynamic Sampling] Degenerate group (std={reward_std:.6f}), skipping prompt.")
+                        continue
 
                 all_group_turns.append(group_turns)
                 all_group_rewards.append(group_rewards)
