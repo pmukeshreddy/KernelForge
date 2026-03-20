@@ -99,9 +99,10 @@ def test_weight_sync(model_path: str, adapter_path: str, port: int,
 
         # ── 4. Release memory (simulate trainer taking the GPU) ──────────────
         print("[4] Releasing SGLang memory (/release_memory_occupation)...")
-        r = requests.post(f"http://localhost:{port}/release_memory_occupation", timeout=60)
+        r = requests.post(f"http://localhost:{port}/release_memory_occupation",
+                          json={}, timeout=60)
         print(f"    release_memory_occupation → {r.status_code}  {r.text[:100]}")
-        assert r.status_code == 200, f"release failed: {r.status_code}"
+        assert r.status_code == 200, f"release failed: {r.status_code} {r.text[:200]}"
         print("    Memory released OK  (SGLang is now sleeping)")
 
         # Simulate a short training step
@@ -110,9 +111,10 @@ def test_weight_sync(model_path: str, adapter_path: str, port: int,
 
         # ── 5. Resume memory ─────────────────────────────────────────────────
         print("[5] Resuming SGLang memory (/resume_memory_occupation)...")
-        r = requests.post(f"http://localhost:{port}/resume_memory_occupation", timeout=120)
+        r = requests.post(f"http://localhost:{port}/resume_memory_occupation",
+                          json={}, timeout=120)
         print(f"    resume_memory_occupation → {r.status_code}  {r.text[:100]}")
-        assert r.status_code == 200, f"resume failed: {r.status_code}"
+        assert r.status_code == 200, f"resume failed: {r.status_code} {r.text[:200]}"
         print("    Memory resumed OK  (SGLang is awake again)")
 
         # ── 6. Save a modified LoRA and hot-reload ───────────────────────────

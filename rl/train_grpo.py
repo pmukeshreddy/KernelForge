@@ -280,7 +280,8 @@ def release_sglang_memory(port: int):
     """Release SGLang's GPU allocation so the trainer can use full VRAM for backward pass."""
     import requests
     try:
-        r = requests.post(f"http://localhost:{port}/release_memory_occupation", timeout=60)
+        r = requests.post(f"http://localhost:{port}/release_memory_occupation",
+                          json={}, timeout=60)
         print(f"[SGLang] Memory released (status={r.status_code})")
     except Exception as e:
         print(f"[SGLang] release_memory_occupation failed: {e}")
@@ -290,7 +291,8 @@ def resume_sglang_memory(port: int):
     """Restore SGLang's GPU allocation after the training step is done."""
     import requests
     try:
-        r = requests.post(f"http://localhost:{port}/resume_memory_occupation", timeout=120)
+        r = requests.post(f"http://localhost:{port}/resume_memory_occupation",
+                          json={}, timeout=120)
         print(f"[SGLang] Memory resumed (status={r.status_code})")
     except Exception as e:
         print(f"[SGLang] resume_memory_occupation failed: {e}")
