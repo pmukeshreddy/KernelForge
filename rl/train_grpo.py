@@ -249,7 +249,7 @@ def launch_sglang_server(model_path: str, adapter_path: str, port: int, tp: int,
         "--tp", str(tp),
         "--dtype", "bfloat16",
         "--trust-remote-code",
-        "--mem-fraction-static", "0.5",  # training model takes ~35GB, SGLang needs 70% of remainder
+        "--mem-fraction-static", "0.4",  # training model ~42GB, SGLang gets 40% of 95GB = ~38GB
         "--log-level", "error",
     ]
     env = {**__import__("os").environ, "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "1"}
