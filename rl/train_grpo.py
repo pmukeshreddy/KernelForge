@@ -306,7 +306,7 @@ def init_weight_sync_group(port: int, tp_size: int = 1) -> bool:
                     "master_port": master_port,
                     "rank_offset": 1,
                     "world_size": world_size,
-                    "group_name": "kf_weight_sync",
+                    "group_name": "weight_update_group",
                     "backend": "nccl",
                 },
                 timeout=300,
