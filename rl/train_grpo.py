@@ -56,17 +56,36 @@ def _worker_run_eval(args):
 def _extract_python_block(text: str) -> str:
     """Extract the first ```python ... ``` block from model output."""
     import re
-    # Strip Qwen3 think blocks (base model leaks these even after SFT)
+    # Strip Qwen3 think blocks
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
     m = re.search(r'```python\s*(.*?)```', text, re.DOTALL)
     if m:
-        return m.group(1).strip()
-    # Fallback: unclosed block (truncated by max_new_tokens / stop token)
-    m = re.search(r'```python\s*(.*)', text, re.DOTALL)
-    if m:
-        return m.group(1).strip()
-    return ""
+        code = m.group(1).strip()
+    else:
+        # Fallback: unclosed block (truncated by max_new_tokens)
+        m = re.search(r'```python\s*(.*)', text, re.DOTALL)
+        if m:
+            code = m.group(1).strip()
+        else:
+            return ""
+    # Fix: model sometimes writes """ inside the CUDA triple-quoted string
+    # (e.g. in comments), which closes the Python string prematurely.
+    # Replace any """ that appears INSIDE cuda_source = """...""" with \"\"\".
+    def _fix_inner_quotes(c):
+        # Find the cuda_source string boundaries and escape interior """
+        parts = re.split(r'(cuda_source\s*=\s*""")', c, maxsplit=1)
+        if len(parts) < 3:
+            return c
+        before, opener, rest = parts
+        # Find the closing """ — first occurrence after the opener
+        close = rest.find('"""')
+        if close == -1:
+            return c  # unclosed — leave as-is
+        inside = rest[:close].replace('"""', r'\"\"\"')
+        after = rest[close:]
+        return before + opener + inside + after
+    return _fix_inner_quotes(code)
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +112,7 @@ class GRPOConfig:
     max_grad_norm: float = 1.0
 
     # Generation
-    max_new_tokens: int = 4096
+    max_new_tokens: int = 3000
     temperature: float = 0.3
     mock_mode: bool = False
 
@@ -495,7 +514,7 @@ def _run_group_episodes(
 # GRPO core
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 4096
+MAX_SEQ_LEN = 3072
 
 
 def _get_token_log_probs(
