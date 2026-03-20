@@ -199,7 +199,17 @@ Now write the complete model_new.py for the following operation:
 
 _sglang_server = None  # global handle so we can shut it down at exit
 _pynccl_comm = None   # SGLang's own PyNcclCommunicator (not torch.distributed)
-_NCCL_MASTER_PORT = 65501  # separate port from SGLang HTTP port
+
+
+def _free_port() -> int:
+    """Find a free TCP port."""
+    import socket
+    with socket.socket() as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+_NCCL_MASTER_PORT = _free_port()  # chosen at import time, free at that moment
 
 
 def _ensure_sglang_importable(sglang_python: str = None):

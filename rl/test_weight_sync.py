@@ -15,7 +15,11 @@ import requests
 
 
 def test_weight_sync(model_path: str, port: int, sglang_python: str, tp: int = 1):
-    NCCL_PORT = 65501
+    import socket as _socket
+    with _socket.socket() as _s:
+        _s.bind(("", 0))
+        NCCL_PORT = _s.getsockname()[1]
+    print(f"    Using NCCL rendezvous port: {NCCL_PORT}")
 
     # ── 1. Launch SGLang server ──────────────────────────────────────────────
     print(f"[1] Launching SGLang server on port {port}...")
