@@ -295,6 +295,7 @@ def init_weight_sync_group(port: int, tp_size: int = 1) -> bool:
     # Trainer must call dist.init_process_group concurrently to avoid deadlock.
     import threading
     http_result = [None]
+    http_body = [None]
 
     def _send_init_request():
         try:
@@ -311,6 +312,7 @@ def init_weight_sync_group(port: int, tp_size: int = 1) -> bool:
                 timeout=300,
             )
             http_result[0] = r.status_code
+            http_body[0] = r.text[:300]
         except Exception as e:
             http_result[0] = str(e)
 
@@ -328,12 +330,16 @@ def init_weight_sync_group(port: int, tp_size: int = 1) -> bool:
             world_size=world_size,
             rank=0,
         )
-        t.join(timeout=60)
-        if http_result[0] != 200:
-            print(f"[SGLang] init_weights_update_group response: {http_result[0]}")
-        _weight_sync_group = dist.GroupMember.WORLD
-        print(f"[SGLang] NCCL weight sync group initialized (world_size={world_size})")
-        return True
+        # Wait up to 120s for SGLang's HTTP handler to finish storing the group
+        t.join(timeout=120)
+        print(f"[SGLang] init_weights_update_group HTTP result: status={http_result[0]} body={http_body[0]}")
+        if http_result[0] == 200:
+            _weight_sync_group = dist.GroupMember.WORLD
+            print(f"[SGLang] NCCL weight sync group initialized (world_size={world_size})")
+            return True
+        else:
+            print(f"[SGLang] SGLang failed to init weight sync group — sync will be skipped.")
+            return False
     except Exception as e:
         print(f"[SGLang] NCCL group init failed: {e}")
         t.join(timeout=10)
@@ -368,13 +374,16 @@ def sync_weights_to_sglang(model, port: int):
             continue
         try:
             with torch.no_grad():
-                lora_A = module.lora_A['default'].weight
-                lora_B = module.lora_B['default'].weight
+                # Compute merge on CPU to avoid GPU OOM — GPU has no headroom
+                # during training (trainer ~59GB + SGLang ~36GB ≈ full 95GB)
+                lora_A = module.lora_A['default'].weight.detach().cpu()
+                lora_B = module.lora_B['default'].weight.detach().cpu()
                 s = module.scaling
                 scaling = s['default'] if isinstance(s, dict) else float(s)
                 delta = (lora_B.float() @ lora_A.float()) * scaling
-                # Keep on GPU for NCCL broadcast
-                merged = (module.weight.data.float() + delta).contiguous().cuda()
+                base_w = module.weight.data.detach().cpu()
+                # Keep bfloat16 to match SGLang's stored dtype
+                merged = (base_w.float() + delta).to(torch.bfloat16).cuda().contiguous()
 
             param_name = name + ".weight"
             for pfx in ("base_model.model.", "base_model."):
@@ -386,6 +395,7 @@ def sync_weights_to_sglang(model, port: int):
             print(f"[SGLang] Merge error ({name}): {e}")
 
     n_synced = 0
+    n_failed_400 = 0
     for param_name, tensor in params_to_sync:
         try:
             # Signal SGLang to prepare to receive this parameter
@@ -393,13 +403,17 @@ def sync_weights_to_sglang(model, port: int):
                 f"http://localhost:{port}/update_weights_from_distributed",
                 json={
                     "name": param_name,
-                    "dtype": "float32",
+                    "dtype": "bfloat16",  # match SGLang's model dtype
                     "shape": list(tensor.shape),
                 },
                 timeout=30,
             )
             if resp.status_code != 200:
-                print(f"[SGLang] update signal failed ({param_name}): {resp.status_code}")
+                n_failed_400 += 1
+                if n_failed_400 == 1:
+                    # Log first failure body — tells us WHY SGLang rejected it
+                    print(f"[SGLang] update_weights_from_distributed 1st failure: "
+                          f"status={resp.status_code} param={param_name} body={resp.text[:400]}")
                 continue
             # NCCL broadcast: trainer rank 0 → SGLang rank 1
             dist.broadcast(tensor, src=0, group=_weight_sync_group)
@@ -408,6 +422,8 @@ def sync_weights_to_sglang(model, port: int):
         except Exception as e:
             print(f"[SGLang] Sync error ({param_name}): {e}")
             break
+    if n_failed_400 > 0:
+        print(f"[SGLang] {n_failed_400} params returned 400 — NCCL group not ready on SGLang side")
 
     try:
         requests.post(f"http://localhost:{port}/flush_cache", timeout=30)
