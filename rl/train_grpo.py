@@ -93,7 +93,7 @@ class GRPOConfig:
     max_grad_norm: float = 1.0
 
     # Generation
-    max_new_tokens: int = 3000
+    max_new_tokens: int = 6000
     temperature: float = 0.7
     mock_mode: bool = False
 
@@ -233,7 +233,7 @@ def launch_sglang_server(model_path: str, adapter_path: str, port: int, tp: int,
         "--lora-paths", f"{_LORA_NAME}={adapter_path}",
         "--max-loras-per-batch", "1",
         "--mem-fraction-static", "0.5",
-        "--context-length", "8192",
+        "--context-length", "10240",
         "--log-level", "error",
     ]
 
