@@ -399,12 +399,13 @@ def sync_weights_to_sglang(model, port: int):
     for param_name, tensor in params_to_sync:
         try:
             # Signal SGLang to prepare to receive this parameter
+            # SGLang API uses plural list fields: names/dtypes/shapes
             resp = requests.post(
                 f"http://localhost:{port}/update_weights_from_distributed",
                 json={
-                    "name": param_name,
-                    "dtype": "bfloat16",  # match SGLang's model dtype
-                    "shape": list(tensor.shape),
+                    "names": [param_name],
+                    "dtypes": ["bfloat16"],  # match SGLang's model dtype
+                    "shapes": [list(tensor.shape)],
                 },
                 timeout=30,
             )
