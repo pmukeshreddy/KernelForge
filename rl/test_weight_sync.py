@@ -83,16 +83,30 @@ def test_weight_sync(model_path: str, port: int, sglang_python: str, tp: int = 1
         print("[3] Initializing NCCL communicator...")
         import threading as _threading
         world_size = tp + 1
-        pg_result = [None]
+        # SGLang's HTTP handler creates StatelessProcessGroup(rank=1) AND
+        # PyNcclCommunicator(rank=1) synchronously before returning 200.
+        # Trainer must create both concurrently in a background thread so
+        # NCCL init on both sides happens at the same time and can rendezvous.
+        comm_result = [None]
+        comm_error  = [None]
 
-        def _create_pg():
-            pg_result[0] = StatelessProcessGroup.create(
-                host="localhost", port=NCCL_PORT, rank=0, world_size=world_size
-            )
+        def _create_pg_and_comm():
+            try:
+                print("    [thread] creating StatelessProcessGroup...")
+                pg = StatelessProcessGroup.create(
+                    host="localhost", port=NCCL_PORT, rank=0, world_size=world_size
+                )
+                print("    [thread] StatelessProcessGroup done, creating PyNcclCommunicator...")
+                comm = PyNcclCommunicator(pg, device=torch.device("cuda:0"))
+                print("    [thread] PyNcclCommunicator done")
+                comm_result[0] = comm
+            except Exception as e:
+                import traceback
+                comm_error[0] = traceback.format_exc()
 
-        pg_thread = _threading.Thread(target=_create_pg, daemon=True)
+        pg_thread = _threading.Thread(target=_create_pg_and_comm, daemon=True)
         pg_thread.start()
-        time.sleep(1)  # ensure listener is up
+        time.sleep(1)  # ensure TCP listener is up before SGLang connects
 
         r = requests.post(
             f"http://localhost:{port}/init_weights_update_group",
@@ -109,13 +123,11 @@ def test_weight_sync(model_path: str, port: int, sglang_python: str, tp: int = 1
         print(f"    init_weights_update_group → {r.status_code}")
         assert r.status_code == 200, f"failed: {r.text[:200]}"
 
-        print("    waiting for StatelessProcessGroup...")
-        pg_thread.join(timeout=30)
-        print(f"    pg_thread done, pg_result={pg_result[0]}")
-        assert pg_result[0] is not None, "StatelessProcessGroup.create() timed out"
-        device = 0
-        print("    creating PyNcclCommunicator...")
-        comm = PyNcclCommunicator(pg_result[0], device=torch.device(f"cuda:{device}"))
+        pg_thread.join(timeout=60)
+        if comm_error[0]:
+            raise RuntimeError(f"NCCL init failed:\n{comm_error[0]}")
+        assert comm_result[0] is not None, "PyNcclCommunicator timed out"
+        comm = comm_result[0]
         print("    NCCL communicator ready")
 
         # ── 4. Pick one real parameter from the model ────────────────────────
