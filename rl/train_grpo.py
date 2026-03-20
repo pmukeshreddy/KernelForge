@@ -342,6 +342,8 @@ def init_weight_sync_group(port: int, tp_size: int = 1) -> bool:
         # Wait up to 120s for SGLang's HTTP handler to finish storing the group
         t.join(timeout=120)
         print(f"[SGLang] init_weights_update_group HTTP result: status={http_result[0]} body={http_body[0]}")
+        print(f"[SGLang][DEBUG] dist.is_initialized()={dist.is_initialized()} "
+              f"t.is_alive()={t.is_alive()} http_result={http_result[0]}")
         if http_result[0] == 200:
             _weight_sync_group = dist.GroupMember.WORLD
             print(f"[SGLang] NCCL weight sync group initialized (world_size={world_size})")
@@ -350,7 +352,9 @@ def init_weight_sync_group(port: int, tp_size: int = 1) -> bool:
             print(f"[SGLang] SGLang failed to init weight sync group — sync will be skipped.")
             return False
     except Exception as e:
+        import traceback as _tb
         print(f"[SGLang] NCCL group init failed: {e}")
+        print(_tb.format_exc())
         t.join(timeout=10)
         return False
 
@@ -368,8 +372,23 @@ def sync_weights_to_sglang(model, port: int):
     """
     import requests
     import torch.distributed as dist
+    import traceback
 
     global _weight_sync_group
+
+    # --- DEBUG: dump NCCL group state before attempting sync ---
+    print(f"[SGLang][DEBUG] sync start: _weight_sync_group={_weight_sync_group!r} "
+          f"dist.is_initialized()={dist.is_initialized()}")
+    if dist.is_initialized():
+        print(f"[SGLang][DEBUG] dist world_size={dist.get_world_size()} rank={dist.get_rank()} backend={dist.get_backend()}")
+
+    # --- DEBUG: quick health-check so we know SGLang is up before sending NCCL signal ---
+    try:
+        health = requests.get(f"http://localhost:{port}/health", timeout=5)
+        print(f"[SGLang][DEBUG] /health → {health.status_code}")
+    except Exception as _he:
+        print(f"[SGLang][DEBUG] /health failed: {_he}")
+
     if _weight_sync_group is None or not dist.is_initialized():
         print("[SGLang] NCCL group not initialized — skipping weight sync.")
         return
@@ -405,10 +424,15 @@ def sync_weights_to_sglang(model, port: int):
 
     n_synced = 0
     n_failed_400 = 0
+    n_timeout = 0
     for param_name, tensor in params_to_sync:
         try:
             # Signal SGLang to prepare to receive this parameter
             # SGLang API uses plural list fields: names/dtypes/shapes
+            # First NCCL call has init overhead — use 120s timeout
+            http_timeout = 120 if n_synced == 0 else 60
+            if n_synced == 0:
+                print(f"[SGLang][DEBUG] first param HTTP timeout={http_timeout}s param={param_name} shape={list(tensor.shape)}")
             resp = requests.post(
                 f"http://localhost:{port}/update_weights_from_distributed",
                 json={
@@ -416,7 +440,7 @@ def sync_weights_to_sglang(model, port: int):
                     "dtypes": ["bfloat16"],  # match SGLang's model dtype
                     "shapes": [list(tensor.shape)],
                 },
-                timeout=30,
+                timeout=http_timeout,
             )
             if resp.status_code != 200:
                 n_failed_400 += 1
@@ -429,9 +453,21 @@ def sync_weights_to_sglang(model, port: int):
             dist.broadcast(tensor, src=0, group=_weight_sync_group)
             torch.cuda.synchronize()
             n_synced += 1
+        except requests.exceptions.Timeout as e:
+            n_timeout += 1
+            if n_timeout == 1:
+                print(f"[SGLang] Timeout on first param ({param_name}): {e}")
+                print(f"[SGLang][DEBUG] timeout detail: http_timeout was {http_timeout}s")
+                print(traceback.format_exc())
+            # Don't break — continue trying other params so we get full failure count
+            continue
         except Exception as e:
             print(f"[SGLang] Sync error ({param_name}): {e}")
-            break
+            print(traceback.format_exc())
+            # Don't break — continue so we get a full picture of what failed
+            continue
+    if n_timeout > 0:
+        print(f"[SGLang] {n_timeout}/{len(params_to_sync)} params timed out on HTTP signal")
     if n_failed_400 > 0:
         print(f"[SGLang] {n_failed_400} params returned 400 — NCCL group not ready on SGLang side")
 
