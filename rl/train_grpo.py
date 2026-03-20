@@ -409,62 +409,51 @@ def sync_weights_to_sglang(model, port: int):
         except Exception as e:
             print(f"[SGLang] Merge error ({name}): {e}")
 
-    n_synced = 0
-    n_failed_400 = 0
+    # Batch all param metadata into ONE HTTP call.
+    # SGLang's handler will do len(params_to_sync) sequential nccl.recv() calls.
+    # We fire the HTTP POST in a background thread, then immediately broadcast
+    # each tensor in the same order so the recvs and broadcasts line up.
+    # This cuts 280 HTTP round-trips down to 1, eliminating the per-param latency.
     import threading as _threading
+
+    all_names  = [p for p, _ in params_to_sync]
+    all_shapes = [list(t.shape) for _, t in params_to_sync]
+    all_dtypes = ["bfloat16"] * len(params_to_sync)
+
+    http_result = [None]
+    http_body   = [None]
+
+    def _post_all():
+        try:
+            r = requests.post(
+                f"http://localhost:{port}/update_weights_from_distributed",
+                json={"names": all_names, "dtypes": all_dtypes, "shapes": all_shapes},
+                timeout=600,  # large: SGLang blocks until all recvs finish
+            )
+            http_result[0] = r.status_code
+            http_body[0]   = r.text[:400]
+        except Exception as _e:
+            http_result[0] = -1
+            http_body[0]   = str(_e)
+
+    t = _threading.Thread(target=_post_all, daemon=True)
+    t.start()
+
+    # Broadcast each tensor in the same order SGLang will recv them
+    n_synced = 0
     for param_name, tensor in params_to_sync:
         try:
-            # SGLang's /update_weights_from_distributed handler blocks internally on
-            # nccl.recv() before returning 200. We must call dist.broadcast() *concurrently*
-            # with the HTTP POST — not after it — otherwise both sides deadlock waiting
-            # for the other to move first.
-            #
-            # Pattern: fire HTTP POST in a thread, broadcast immediately, then check result.
-            http_timeout = 120 if n_synced == 0 else 60
-            http_result = [None]
-            http_error  = [None]
-
-            def _post(_name=param_name, _shape=list(tensor.shape), _t=http_timeout):
-                try:
-                    r = requests.post(
-                        f"http://localhost:{port}/update_weights_from_distributed",
-                        json={
-                            "names": [_name],
-                            "dtypes": ["bfloat16"],
-                            "shapes": [_shape],
-                        },
-                        timeout=_t,
-                    )
-                    http_result[0] = r.status_code
-                    if r.status_code != 200:
-                        http_error[0] = r.text[:400]
-                except Exception as _e:
-                    http_result[0] = -1
-                    http_error[0] = str(_e)
-
-            t = _threading.Thread(target=_post, daemon=True)
-            t.start()
-
-            # Broadcast immediately — SGLang's handler is now calling nccl.recv()
             dist.broadcast(tensor, src=0, group=_weight_sync_group)
             torch.cuda.synchronize()
-
-            t.join(timeout=http_timeout + 5)
-            if http_result[0] == 200:
-                n_synced += 1
-            else:
-                n_failed_400 += 1
-                if n_failed_400 == 1:
-                    print(f"[SGLang] update_weights_from_distributed 1st failure: "
-                          f"status={http_result[0]} param={param_name} body={http_error[0]}")
+            n_synced += 1
         except Exception as e:
-            print(f"[SGLang] Sync error ({param_name}): {e}")
-            print(traceback.format_exc())
-            continue
-    if n_failed_400 > 0:
-        print(f"[SGLang] {n_failed_400} params returned non-200")
-    if n_failed_400 > 0:
-        print(f"[SGLang] {n_failed_400} params returned 400 — NCCL group not ready on SGLang side")
+            print(f"[SGLang] broadcast error ({param_name}): {e}")
+            break
+
+    t.join(timeout=660)
+    if http_result[0] != 200:
+        print(f"[SGLang] update_weights_from_distributed failed: "
+              f"status={http_result[0]} body={http_body[0]}")
 
     try:
         requests.post(f"http://localhost:{port}/flush_cache", timeout=30)
