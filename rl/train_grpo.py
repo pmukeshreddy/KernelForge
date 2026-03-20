@@ -166,10 +166,6 @@ torch::Tensor add_cuda(torch::Tensor a, torch::Tensor b) {
         a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), n);
     return out;
 }
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward", &add_cuda, "add");
-}
 \"\"\"
 
 ext = load_inline(
