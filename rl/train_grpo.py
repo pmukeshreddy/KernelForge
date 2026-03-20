@@ -133,7 +133,7 @@ class GRPOConfig:
 
     # Dynamic Sampling: skip degenerate groups where all rewards are identical
     dynamic_sampling: bool = True
-    max_resample_attempts: int = 3
+    max_resample_attempts: int = 1
 
 
 # ---------------------------------------------------------------------------
