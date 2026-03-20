@@ -146,7 +146,11 @@ def test_weight_sync(model_path: str, adapter_path: str, port: int,
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
             print(f"    Modified LoRA saved → {lora_save_path}")
 
-            # Hot-reload into SGLang
+            # Unload old adapter, then load updated one
+            r = requests.post(f"http://localhost:{port}/unload_lora_adapter",
+                              json={"lora_name": LORA_NAME}, timeout=30)
+            print(f"    unload_lora_adapter → {r.status_code}  {r.text[:100]}")
+
             r = requests.post(
                 f"http://localhost:{port}/load_lora_adapter",
                 json={"lora_name": LORA_NAME, "lora_path": lora_save_path},

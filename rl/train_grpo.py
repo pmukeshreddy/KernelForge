@@ -316,7 +316,13 @@ def sync_lora_to_sglang(model, port: int):
     # Save only the LoRA adapter weights (small — ~100MB)
     model.save_pretrained(lora_path)
 
-    # Hot-reload in SGLang
+    # Unload the old adapter, then load the updated one
+    try:
+        requests.post(f"http://localhost:{port}/unload_lora_adapter",
+                      json={"lora_name": _LORA_NAME}, timeout=30)
+    except Exception:
+        pass  # best-effort; load will fail if still loaded
+
     try:
         r = requests.post(
             f"http://localhost:{port}/load_lora_adapter",
