@@ -285,6 +285,7 @@ def launch_sglang_server(model_path: str, adapter_path: str, port: int, tp: int,
         "--trust-remote-code",
         "--mem-fraction-static", "0.5",
         "--context-length", "8192",  # limit KV cache: 8192*160KB=1.3GB vs default 131K*160KB=21GB
+        "--disable-cuda-graph",   # avoid JIT kernel compilation failure (crt/host_config.h missing)
         "--log-level", "error",
     ]
     env = {**__import__("os").environ, "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "1"}
