@@ -198,8 +198,33 @@ Now write the complete model_new.py for the following operation:
 # ---------------------------------------------------------------------------
 
 _sglang_server = None  # global handle so we can shut it down at exit
-_weight_sync_group = None  # NCCL process group for weight sync
+_pynccl_comm = None   # SGLang's own PyNcclCommunicator (not torch.distributed)
 _NCCL_MASTER_PORT = 65501  # separate port from SGLang HTTP port
+
+
+def _ensure_sglang_importable(sglang_python: str = None):
+    """Add SGLang's site-packages to sys.path if not already importable."""
+    try:
+        import sglang.srt.distributed  # noqa
+        return
+    except ImportError:
+        pass
+    import subprocess, sys as _sys
+    python = sglang_python or os.environ.get("SGLANG_PYTHON", "")
+    if not python:
+        raise ImportError(
+            "SGLang not importable and SGLANG_PYTHON not set. "
+            "Set SGLANG_PYTHON=/path/to/sglang_env/bin/python"
+        )
+    result = subprocess.run(
+        [python, "-c",
+         "import sglang, os; print(os.path.dirname(os.path.dirname(sglang.__file__)))"],
+        capture_output=True, text=True, timeout=10,
+    )
+    site_packages = result.stdout.strip()
+    if site_packages and site_packages not in _sys.path:
+        _sys.path.insert(0, site_packages)
+        print(f"[SGLang] Added to sys.path: {site_packages}")
 
 
 def launch_sglang_server(model_path: str, adapter_path: str, port: int, tp: int,
@@ -278,35 +303,32 @@ def launch_sglang_server(model_path: str, adapter_path: str, port: int, tp: int,
     raise RuntimeError(f"SGLang server failed to start on port {port}")
 
 
-def init_weight_sync_group(port: int, tp_size: int = 1) -> bool:
+def init_weight_sync_group(port: int, tp_size: int = 1, sglang_python: str = None) -> bool:
     """
-    Initialize NCCL process group for weight sync between trainer and SGLang.
-    This is the correct cross-process approach used by verl/OpenRLHF/TorchRL.
+    Initialize NCCL communicator for weight sync between trainer and SGLang.
+    Uses SGLang's own StatelessProcessGroup + PyNcclCommunicator (same as TorchRL/verl).
 
-    - Trainer joins as rank 0
-    - SGLang worker(s) join as ranks 1..tp_size
-    - NCCL handles the actual tensor transfer — no serialization needed
+    torch.distributed uses a different rendezvous protocol than StatelessProcessGroup;
+    mixing them means the NCCL comm IDs are never exchanged and collectives hang.
     """
-    import requests, time
-    import torch.distributed as dist
+    import requests, time, threading
 
-    global _weight_sync_group
+    global _pynccl_comm
+    if _pynccl_comm is not None:
+        print("[SGLang] NCCL communicator already initialized.")
+        return True
 
-    if dist.is_initialized():
-        print("[SGLang] torch.distributed already initialized — skipping NCCL group init.")
-        return False
+    _ensure_sglang_importable(sglang_python)
+    from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
+    from sglang.srt.distributed.utils import StatelessProcessGroup
 
     master_addr = "localhost"
     master_port = _NCCL_MASTER_PORT
-    world_size = tp_size + 1  # trainer + SGLang worker(s)
+    world_size = tp_size + 1  # rank 0 = trainer, ranks 1..tp_size = SGLang
 
-    # Send HTTP request in a background thread — it may block until NCCL forms.
-    # Trainer must call dist.init_process_group concurrently to avoid deadlock.
-    import threading
+    # Tell SGLang to join the same StatelessProcessGroup
     http_result = [None]
-    http_body = [None]
-
-    def _send_init_request():
+    def _send_init():
         try:
             r = requests.post(
                 f"http://localhost:{port}/init_weights_update_group",
@@ -321,40 +343,29 @@ def init_weight_sync_group(port: int, tp_size: int = 1) -> bool:
                 timeout=300,
             )
             http_result[0] = r.status_code
-            http_body[0] = r.text[:300]
         except Exception as e:
             http_result[0] = str(e)
 
-    t = threading.Thread(target=_send_init_request, daemon=True)
+    t = threading.Thread(target=_send_init, daemon=True)
     t.start()
+    time.sleep(1)  # give SGLang time to start its TCP listener
 
-    # Small delay so SGLang starts its NCCL init before trainer tries to rendezvous
-    time.sleep(3)
-
-    # Trainer joins as rank 0 concurrently with SGLang joining as rank 1
     try:
-        dist.init_process_group(
-            backend="nccl",
-            init_method=f"tcp://{master_addr}:{master_port}",
-            world_size=world_size,
-            rank=0,
+        device = torch.cuda.current_device()
+        pg = StatelessProcessGroup.create(
+            host=master_addr, port=master_port, rank=0, world_size=world_size
         )
-        # Wait up to 120s for SGLang's HTTP handler to finish storing the group
-        t.join(timeout=120)
-        print(f"[SGLang] init_weights_update_group HTTP result: status={http_result[0]} body={http_body[0]}")
-        print(f"[SGLang][DEBUG] dist.is_initialized()={dist.is_initialized()} "
-              f"t.is_alive()={t.is_alive()} http_result={http_result[0]}")
+        _pynccl_comm = PyNcclCommunicator(pg, device=torch.device(f"cuda:{device}"))
+        t.join(timeout=60)
         if http_result[0] == 200:
-            _weight_sync_group = dist.GroupMember.WORLD
-            print(f"[SGLang] NCCL weight sync group initialized (world_size={world_size})")
+            print(f"[SGLang] NCCL communicator ready (world_size={world_size}, device=cuda:{device})")
             return True
         else:
-            print(f"[SGLang] SGLang failed to init weight sync group — sync will be skipped.")
+            print(f"[SGLang] init_weights_update_group returned {http_result[0]} — sync may fail")
             return False
     except Exception as e:
         import traceback as _tb
-        print(f"[SGLang] NCCL group init failed: {e}")
-        print(_tb.format_exc())
+        print(f"[SGLang] NCCL init failed: {e}\n{_tb.format_exc()}")
         t.join(timeout=10)
         return False
 
@@ -362,24 +373,19 @@ def init_weight_sync_group(port: int, tp_size: int = 1) -> bool:
 def sync_weights_to_sglang(model, port: int):
     """
     Push updated LoRA-merged weights to SGLang via NCCL broadcast.
-
-    Correct cross-process approach (used by verl, OpenRLHF, TorchRL):
-      1. Signal SGLang via HTTP with parameter name/dtype/shape
-      2. NCCL broadcast the merged tensor from trainer (rank 0) to SGLang (rank 1)
-      3. Flush KV cache so stale cached prompts are invalidated
-
-    No serialization, no pickle, no size limit.
+    Follows TorchRL's SGLangCollectiveTransport pattern exactly:
+      1. HTTP POST all param metadata (SGLang enqueues async recvs, returns 200)
+      2. pynccl_comm.broadcast() each tensor on CUDA stream (non-blocking)
+      3. torch.cuda.synchronize() to ensure all transfers complete
     """
-    import requests
-    import torch.distributed as dist
-    import traceback
+    import requests, threading
 
-    global _weight_sync_group
-
-    if _weight_sync_group is None or not dist.is_initialized():
-        print("[SGLang] NCCL group not initialized — skipping weight sync.")
+    global _pynccl_comm
+    if _pynccl_comm is None:
+        print("[SGLang] NCCL communicator not initialized — skipping weight sync.")
         return
 
+    # Merge LoRA deltas into base weights (CPU to avoid OOM)
     params_to_sync = []
     for name, module in model.named_modules():
         if not (hasattr(module, 'lora_A') and hasattr(module, 'lora_B')
@@ -389,17 +395,13 @@ def sync_weights_to_sglang(model, port: int):
             continue
         try:
             with torch.no_grad():
-                # Compute merge on CPU to avoid GPU OOM — GPU has no headroom
-                # during training (trainer ~59GB + SGLang ~36GB ≈ full 95GB)
-                lora_A = module.lora_A['default'].weight.detach().cpu()
-                lora_B = module.lora_B['default'].weight.detach().cpu()
-                s = module.scaling
+                lora_A  = module.lora_A['default'].weight.detach().cpu()
+                lora_B  = module.lora_B['default'].weight.detach().cpu()
+                s       = module.scaling
                 scaling = s['default'] if isinstance(s, dict) else float(s)
-                delta = (lora_B.float() @ lora_A.float()) * scaling
-                base_w = module.weight.data.detach().cpu()
-                # Keep bfloat16 to match SGLang's stored dtype
-                merged = (base_w.float() + delta).to(torch.bfloat16).cuda().contiguous()
-
+                delta   = (lora_B.float() @ lora_A.float()) * scaling
+                base_w  = module.weight.data.detach().cpu()
+                merged  = (base_w.float() + delta).to(torch.bfloat16).cuda().contiguous()
             param_name = name + ".weight"
             for pfx in ("base_model.model.", "base_model."):
                 if param_name.startswith(pfx):
@@ -409,51 +411,44 @@ def sync_weights_to_sglang(model, port: int):
         except Exception as e:
             print(f"[SGLang] Merge error ({name}): {e}")
 
-    # Batch all param metadata into ONE HTTP call.
-    # SGLang's handler will do len(params_to_sync) sequential nccl.recv() calls.
-    # We fire the HTTP POST in a background thread, then immediately broadcast
-    # each tensor in the same order so the recvs and broadcasts line up.
-    # This cuts 280 HTTP round-trips down to 1, eliminating the per-param latency.
-    import threading as _threading
+    if not params_to_sync:
+        return
 
     all_names  = [p for p, _ in params_to_sync]
     all_shapes = [list(t.shape) for _, t in params_to_sync]
     all_dtypes = ["bfloat16"] * len(params_to_sync)
 
+    # HTTP POST in background thread — SGLang enqueues async recvs on its CUDA
+    # stream and returns 200 (PyNcclCommunicator is non-blocking at Python level).
     http_result = [None]
     http_body   = [None]
-
-    def _post_all():
+    def _post():
         try:
             r = requests.post(
                 f"http://localhost:{port}/update_weights_from_distributed",
                 json={"names": all_names, "dtypes": all_dtypes, "shapes": all_shapes},
-                timeout=600,  # large: SGLang blocks until all recvs finish
+                timeout=600,
             )
             http_result[0] = r.status_code
-            http_body[0]   = r.text[:400]
-        except Exception as _e:
+            http_body[0]   = r.text[:200]
+        except Exception as e:
             http_result[0] = -1
-            http_body[0]   = str(_e)
-
-    t = _threading.Thread(target=_post_all, daemon=True)
+            http_body[0]   = str(e)
+    t = threading.Thread(target=_post, daemon=True)
     t.start()
 
-    # Broadcast each tensor in the same order SGLang will recv them
+    # Broadcast each tensor on the CUDA stream (matches SGLang's recv order)
+    stream = torch.cuda.current_stream()
     n_synced = 0
-    for param_name, tensor in params_to_sync:
-        try:
-            dist.broadcast(tensor, src=0, group=_weight_sync_group)
-            torch.cuda.synchronize()
-            n_synced += 1
-        except Exception as e:
-            print(f"[SGLang] broadcast error ({param_name}): {e}")
-            break
+    for _, tensor in params_to_sync:
+        _pynccl_comm.broadcast(tensor, src=0, stream=stream)
+        n_synced += 1
 
+    torch.cuda.synchronize()  # ensure all NCCL transfers complete before next step
     t.join(timeout=660)
+
     if http_result[0] != 200:
-        print(f"[SGLang] update_weights_from_distributed failed: "
-              f"status={http_result[0]} body={http_body[0]}")
+        print(f"[SGLang] update_weights_from_distributed: status={http_result[0]} {http_body[0]}")
 
     try:
         requests.post(f"http://localhost:{port}/flush_cache", timeout=30)
@@ -919,7 +914,7 @@ def train(config: GRPOConfig = None):
         import threading as _threading
         _threading.Thread(
             target=init_weight_sync_group,
-            args=(config.sglang_port, config.sglang_tp),
+            args=(config.sglang_port, config.sglang_tp, config.sglang_python or None),
             daemon=True,
         ).start()
         # Give NCCL init time to complete before first sync is needed
