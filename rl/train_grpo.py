@@ -498,7 +498,7 @@ def _run_group_episodes(
 # GRPO core
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 3072
+MAX_SEQ_LEN = 4096
 
 
 def _get_token_log_probs(
@@ -508,8 +508,13 @@ def _get_token_log_probs(
 ) -> torch.Tensor:
     """
     Forward pass for one turn. Returns per-token log probs [R].
-    Truncates context from the left if total length exceeds MAX_SEQ_LEN.
+    Truncates response from the right and context from the left so total
+    sequence never exceeds MAX_SEQ_LEN (prevents OOM on long think+code responses).
     """
+    # Truncate response first — keep the beginning (think block + code start)
+    max_resp = MAX_SEQ_LEN - 64  # reserve 64 tokens minimum for context
+    if len(response_ids) > max_resp:
+        response_ids = response_ids[:max_resp]
     R = len(response_ids)
     max_ctx = max(MAX_SEQ_LEN - R, 64)
     if len(context_ids) > max_ctx:
