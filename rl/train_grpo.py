@@ -352,57 +352,70 @@ def init_weight_sync_group(port: int, tp_size: int = 1, sglang_python: str = Non
     master_port = _NCCL_MASTER_PORT
     world_size = tp_size + 1  # rank 0 = trainer, ranks 1..tp_size = SGLang
 
-    # SGLang's HTTP handler creates StatelessProcessGroup(rank=1) AND
-    # PyNcclCommunicator(rank=1) synchronously before returning 200.
-    # Trainer must create both concurrently in a background thread so
-    # NCCL init on both sides happens at the same time and can rendezvous.
-    comm_result = [None]
-    comm_error  = [None]
+    # PyNcclCommunicator (wraps ncclCommInitRank) MUST be created on a thread
+    # that already has an active CUDA context — that is the MAIN thread, which
+    # loaded the model.  Background daemon threads have no CUDA context and
+    # ncclCommInitRank hangs indefinitely waiting for a CUDA init that never
+    # happens.
+    #
+    # Pattern (same as TorchRL SGLangCollectiveTransport):
+    #   - HTTP request in background thread  →  triggers SGLang (rank 1)
+    #   - StatelessProcessGroup + PyNcclCommunicator in MAIN thread (rank 0)
+    # Both sides rendezvous through the TCP store at master_port.
 
-    def _create_pg_and_comm():
+    http_result = [None]
+    http_body   = [None]
+
+    def _send_http():
         try:
-            device = torch.cuda.current_device()
-            print("[SGLang]   [thread] creating StatelessProcessGroup...")
-            pg = StatelessProcessGroup.create(
-                host=master_addr, port=master_port, rank=0, world_size=world_size
+            r = requests.post(
+                f"http://localhost:{port}/init_weights_update_group",
+                json={
+                    "master_address": master_addr,
+                    "master_port":    master_port,
+                    "rank_offset":    1,
+                    "world_size":     world_size,
+                    "group_name":     "weight_update_group",
+                    "backend":        "nccl",
+                },
+                timeout=300,
             )
-            print("[SGLang]   [thread] StatelessProcessGroup done, creating PyNcclCommunicator...")
-            comm = PyNcclCommunicator(pg, device=torch.device(f"cuda:{device}"))
-            print(f"[SGLang]   [thread] PyNcclCommunicator done (device=cuda:{device})")
-            comm_result[0] = comm
+            http_result[0] = r.status_code
+            http_body[0]   = r.text[:200]
         except Exception as e:
-            import traceback as _tb
-            comm_error[0] = _tb.format_exc()
+            http_result[0] = str(e)
 
-    pg_thread = threading.Thread(target=_create_pg_and_comm, daemon=True)
-    pg_thread.start()
-    time.sleep(1)  # ensure TCP listener is up before SGLang tries to connect
+    http_thread = threading.Thread(target=_send_http, daemon=True)
+    http_thread.start()
 
+    # Brief pause so the HTTP is dispatched and SGLang starts its side before
+    # the trainer's TCP server accepts the first connection.
+    time.sleep(2)
+
+    # Create StatelessProcessGroup (rank 0 = TCP server) and PyNcclCommunicator
+    # in the MAIN thread, which has a live CUDA context.
     try:
-        r = requests.post(
-            f"http://localhost:{port}/init_weights_update_group",
-            json={
-                "master_address": master_addr,
-                "master_port": master_port,
-                "rank_offset": 1,
-                "world_size": world_size,
-                "group_name": "weight_update_group",
-                "backend": "nccl",
-            },
-            timeout=120,
+        device = torch.cuda.current_device()
+        print(f"[SGLang] Creating StatelessProcessGroup (rank=0, port={master_port})...")
+        pg = StatelessProcessGroup.create(
+            host=master_addr, port=master_port, rank=0, world_size=world_size
         )
-        print(f"[SGLang] init_weights_update_group → {r.status_code}")
-        r.raise_for_status()
+        print(f"[SGLang] StatelessProcessGroup done. Creating PyNcclCommunicator...")
+        comm = PyNcclCommunicator(pg, device=torch.device(f"cuda:{device}"))
+        print(f"[SGLang] PyNcclCommunicator done (cuda:{device})")
     except Exception as e:
-        print(f"[SGLang] init_weights_update_group failed: {e}")
+        import traceback as _tb
+        print(f"[SGLang] NCCL communicator init failed:\n{_tb.format_exc()}")
+        http_thread.join(timeout=10)
         return False
 
-    pg_thread.join(timeout=60)
-    if comm_error[0] or comm_result[0] is None:
-        print(f"[SGLang] NCCL communicator init failed:\n{comm_error[0]}")
+    http_thread.join(timeout=120)
+    print(f"[SGLang] init_weights_update_group HTTP: status={http_result[0]} body={http_body[0]}")
+    if http_result[0] != 200:
+        print(f"[SGLang] SGLang failed to init weight sync group.")
         return False
 
-    _pynccl_comm = comm_result[0]
+    _pynccl_comm = comm
     print(f"[SGLang] NCCL communicator ready (world_size={world_size})")
     return True
 
