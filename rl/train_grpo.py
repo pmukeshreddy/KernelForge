@@ -382,8 +382,7 @@ def sync_weights_to_sglang(model, port: int):
 
     global _pynccl_comm
     if _pynccl_comm is None:
-        print("[SGLang] NCCL communicator not initialized — skipping weight sync.")
-        return
+        raise RuntimeError("[SGLang] sync_weights_to_sglang called but NCCL communicator is None")
 
     # Merge LoRA deltas into base weights (CPU to avoid OOM)
     params_to_sync = []
@@ -910,15 +909,16 @@ def train(config: GRPOConfig = None):
         )
         atexit.register(lambda: _sglang_server.terminate() if _sglang_server else None)
         print(f"[SGLang] Server running on port {config.sglang_port} (TP={config.sglang_tp})")
-        # Initialize NCCL group in background — must not block training or SGLang generation
-        import threading as _threading
-        _threading.Thread(
-            target=init_weight_sync_group,
-            args=(config.sglang_port, config.sglang_tp, config.sglang_python or None),
-            daemon=True,
-        ).start()
-        # Give NCCL init time to complete before first sync is needed
-        import time as _time; _time.sleep(10)
+        # Initialize NCCL communicator synchronously — weight sync is critical,
+        # failing silently means training runs with a stale inference policy.
+        ok = init_weight_sync_group(
+            config.sglang_port, config.sglang_tp, config.sglang_python or None
+        )
+        if not ok:
+            raise RuntimeError(
+                "[SGLang] NCCL communicator init failed — cannot proceed without weight sync. "
+                "Check that SGLANG_PYTHON points to the SGLang venv and the server is healthy."
+            )
 
     if not config.mock_mode:
         wandb.init(
