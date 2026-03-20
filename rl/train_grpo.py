@@ -140,7 +140,7 @@ class GRPOConfig:
 # Format helpers (must match agent.py)
 # ---------------------------------------------------------------------------
 
-PREFILL = "```python\nimport torch\n"
+PREFILL = ""
 
 FORMAT_EXAMPLE = """\
 Here is an example of the expected output format:
@@ -395,10 +395,13 @@ def _run_group_episodes(
     G = config.group_size
 
     user_msg = f"{FORMAT_EXAMPLE}Reference Program:\n```python\n{prompt_text}\n```"
-    prompt_str = (
-        get_system_prompt()
-        + f"<|im_start|>user\n{user_msg}<|im_end|>\n"
-        + f"<|im_start|>assistant\n{PREFILL}"
+    sys_content = get_system_prompt().replace("<|im_start|>system\n", "").replace("<|im_end|>\n", "").strip()
+    messages = [
+        {"role": "system", "content": sys_content},
+        {"role": "user", "content": user_msg},
+    ]
+    prompt_str = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
     )
     context_texts = [prompt_str] * G
 
@@ -609,12 +612,15 @@ def _run_evaluation(model, tokenizer, config: GRPOConfig, val_prompts: list[str]
 
     with torch.no_grad():
         for prompt_text in val_prompts:
-            # Build prompt in exact SFT/rollout format
+            # Build prompt matching SFT training format via apply_chat_template
             user_msg = f"{FORMAT_EXAMPLE}Reference Program:\n```python\n{prompt_text}\n```"
-            prompt_str = (
-                get_system_prompt()
-                + f"<|im_start|>user\n{user_msg}<|im_end|>\n"
-                + f"<|im_start|>assistant\n{PREFILL}"
+            sys_content = get_system_prompt().replace("<|im_start|>system\n", "").replace("<|im_end|>\n", "").strip()
+            messages = [
+                {"role": "system", "content": sys_content},
+                {"role": "user", "content": user_msg},
+            ]
+            prompt_str = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
             )
             input_ids = tokenizer(prompt_str, return_tensors="pt").input_ids.to(model.device)
             
