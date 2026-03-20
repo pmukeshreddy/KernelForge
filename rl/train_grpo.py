@@ -133,7 +133,7 @@ class GRPOConfig:
 
     # Dynamic Sampling: skip degenerate groups where all rewards are identical
     dynamic_sampling: bool = True
-    max_resample_attempts: int = 1
+    max_resample_attempts: int = 3
 
 
 # ---------------------------------------------------------------------------
@@ -481,7 +481,10 @@ def _run_group_episodes(
         length_penalty = -config.length_penalty_coef * gen_len  # max ~-0.3 at 3000 tokens
 
         if candidates[i] is None:
-            group_rewards.append(config.reward_no_code + length_penalty)
+            # DAPO overlong shaping: extra penalty if response hit the token cap
+            # (model spent all tokens thinking, never produced code)
+            overlong_penalty = -0.5 if gen_len >= int(config.max_new_tokens * 0.95) else 0.0
+            group_rewards.append(config.reward_no_code + length_penalty + overlong_penalty)
         elif eval_res is None or not eval_res.get("compiles", False):
             group_rewards.append(config.reward_compile_fail + length_penalty)
         elif not eval_res["correct"]:
@@ -835,7 +838,7 @@ def train(config: GRPOConfig = None):
 
                 # Dynamic Sampling: if all rewards are identical, resample (DAPO)
                 if config.dynamic_sampling:
-                    for attempt in range(1, config.max_resample_attempts):
+                    for attempt in range(config.max_resample_attempts):
                         reward_std = torch.tensor(group_rewards).std().item()
                         if reward_std > 1e-4:
                             break
