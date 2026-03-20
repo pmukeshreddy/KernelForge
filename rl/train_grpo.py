@@ -272,10 +272,13 @@ def sync_weights_to_sglang(model, port: int):
 
     SGLang expects:
       serialized_named_tensors: List[str]  — one element per TP rank (TP=1 → list of 1)
-      Each element = ForkingPickler(dict[name, tensor]) → base64 string
+      Each element = pickle.dumps(dict[name, cpu_tensor]) → base64 string
+
+    NOTE: Must use regular pickle (not ForkingPickler) — ForkingPickler uses
+    file-descriptor sharing which requires same process auth key. SGLang is a
+    separate process so FDs are invalid across the boundary.
     """
-    import requests, base64, io
-    from multiprocessing.reduction import ForkingPickler
+    import requests, base64, io, pickle
 
     # Collect all merged tensors: W_merged = W_base + lora_B @ lora_A * scaling
     named_tensors = {}
@@ -292,6 +295,7 @@ def sync_weights_to_sglang(model, port: int):
                 s = module.scaling
                 scaling = s['default'] if isinstance(s, dict) else float(s)
                 delta = (lora_B.float() @ lora_A.float()) * scaling
+                # Must be CPU tensor — GPU tensors use FD sharing in pickle which breaks cross-process
                 merged = (module.weight.data.float() + delta).contiguous().cpu()
 
             param_name = name + ".weight"
@@ -307,11 +311,8 @@ def sync_weights_to_sglang(model, port: int):
         print("[SGLang] No LoRA tensors found to sync.")
         return
 
-    # Serialize the entire dict with ForkingPickler (matches SGLang's MultiprocessingSerializer)
-    buf = io.BytesIO()
-    ForkingPickler(buf).dump(named_tensors)
-    buf.seek(0)
-    serialized = base64.b64encode(buf.read()).decode("utf-8")
+    # Regular pickle serializes CPU tensors as raw bytes (no file descriptors)
+    serialized = base64.b64encode(pickle.dumps(named_tensors)).decode("utf-8")
 
     # TP=1 → list of one serialized dict
     payload = {
