@@ -436,7 +436,7 @@ def _generate_with_sglang(context_texts: list[str], config: "GRPOConfig") -> lis
     resp = requests.post(
         f"http://localhost:{config.sglang_port}/generate",
         json=payload,
-        timeout=300,
+        timeout=600,
     )
     resp.raise_for_status()
     result = resp.json()
@@ -784,10 +784,10 @@ def train(config: GRPOConfig = None):
         print(f"Loading base model: {config.model_id}...")
         base_model = AutoModelForCausalLM.from_pretrained(
             config.model_id,
-            dtype=torch.bfloat16,
+            torch_dtype=torch.bfloat16,
             device_map="auto",
             trust_remote_code=True,
-            attn_implementation="kernels-community/flash-attn2",
+            attn_implementation="flash_attention_2",
         )
         print(f"Loading SFT adapter: {config.adapter_path}...")
         model = PeftModel.from_pretrained(base_model, config.adapter_path, is_trainable=True)
@@ -869,8 +869,15 @@ def train(config: GRPOConfig = None):
         )
         atexit.register(lambda: _sglang_server.terminate() if _sglang_server else None)
         print(f"[SGLang] Server running on port {config.sglang_port} (TP={config.sglang_tp})")
-        # Initialize NCCL group for weight sync (correct cross-process approach)
-        init_weight_sync_group(config.sglang_port, tp_size=config.sglang_tp)
+        # Initialize NCCL group in background — must not block training or SGLang generation
+        import threading as _threading
+        _threading.Thread(
+            target=init_weight_sync_group,
+            args=(config.sglang_port, config.sglang_tp),
+            daemon=True,
+        ).start()
+        # Give NCCL init time to complete before first sync is needed
+        import time as _time; _time.sleep(10)
 
     if not config.mock_mode:
         wandb.init(
