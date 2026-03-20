@@ -234,6 +234,7 @@ def launch_sglang_server(model_path: str, adapter_path: str, port: int, tp: int,
         "--dtype", "bfloat16",
         "--trust-remote-code",
         "--enable-lora",
+        "--lora-paths", f"{_LORA_NAME}={adapter_path}",
         "--max-loras-per-batch", "1",
         "--mem-fraction-static", "0.5",
         "--context-length", "8192",
@@ -270,21 +271,8 @@ def launch_sglang_server(model_path: str, adapter_path: str, port: int, tp: int,
         proc.terminate()
         raise RuntimeError(f"SGLang server failed to start on port {port}")
 
-    # Load initial SFT LoRA adapter
-    print(f"[SGLang] Loading initial LoRA adapter from {adapter_path} ...")
-    try:
-        r = requests.post(
-            f"http://localhost:{port}/load_lora_adapter",
-            json={"lora_name": _LORA_NAME, "lora_path": adapter_path},
-            timeout=120,
-        )
-        if r.status_code == 200:
-            print(f"[SGLang] Initial LoRA loaded (name={_LORA_NAME})")
-        else:
-            print(f"[SGLang] WARNING: load_lora_adapter status={r.status_code}: {r.text[:300]}")
-    except Exception as e:
-        print(f"[SGLang] WARNING: load_lora_adapter failed: {e}")
-
+    # Initial LoRA is loaded at server startup via --lora-paths
+    print(f"[SGLang] Server ready with LoRA '{_LORA_NAME}' loaded from {adapter_path}")
     return proc
 
 

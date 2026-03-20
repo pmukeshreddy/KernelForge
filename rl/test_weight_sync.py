@@ -55,6 +55,7 @@ def test_weight_sync(model_path: str, adapter_path: str, port: int,
         "--dtype", "bfloat16",
         "--trust-remote-code",
         "--enable-lora",
+        "--lora-paths", f"{LORA_NAME}={adapter_path}",
         "--max-loras-per-batch", "1",
         "--mem-fraction-static", "0.3",
         "--context-length", "8192",
@@ -74,16 +75,11 @@ def test_weight_sync(model_path: str, adapter_path: str, port: int,
         raise RuntimeError("SGLang server failed to start")
 
     try:
-        # ── 2. Load initial LoRA adapter ─────────────────────────────────────
-        print(f"[2] Loading initial LoRA adapter: {adapter_path}")
-        r = requests.post(
-            f"http://localhost:{port}/load_lora_adapter",
-            json={"lora_name": LORA_NAME, "lora_path": adapter_path},
-            timeout=120,
-        )
-        print(f"    load_lora_adapter → {r.status_code}  {r.text[:200]}")
-        assert r.status_code == 200, f"load_lora_adapter failed: {r.status_code} {r.text[:300]}"
-        print("    Initial LoRA loaded OK")
+        # ── 2. Verify initial LoRA is loaded (loaded at startup via --lora-paths) ──
+        print(f"[2] Verifying initial LoRA loaded at startup (name={LORA_NAME})...")
+        r = requests.get(f"http://localhost:{port}/get_model_info", timeout=10)
+        print(f"    /get_model_info → {r.status_code}  {r.text[:300]}")
+        print("    Initial LoRA ready (loaded via --lora-paths at startup)")
 
         # ── 3. Generate with initial LoRA ────────────────────────────────────
         print("[3] Generating with initial LoRA...")
