@@ -587,23 +587,22 @@ def _compute_grpo_loss(
                 1.0 + config.cliprange_high,
             )
 
-            # Token-level policy loss
-            token_losses.append(-torch.min(ratio * float(A_i), clipped * float(A_i)))
+            # Per-sequence mean loss (Dr. GRPO: normalize per-sequence so long
+            # think-only responses don't get weaker per-token signal than short ones)
+            seq_loss = -torch.min(ratio * float(A_i), clipped * float(A_i))
+            token_losses.append(seq_loss.mean())
 
-            # Entropy: H(π) = -E[log π] = -mean(new_lp)
-            # Maximizing entropy = adding -entropy_coef * (-new_lp) = entropy_coef * new_lp
-            # We subtract from loss (loss -= entropy_coef * H) = loss += entropy_coef * new_lp
             if config.entropy_coef > 0:
-                entropy_terms.append(-new_lp)  # -log π per token (positive entropy)
+                entropy_terms.append(-new_lp.mean())  # per-sequence entropy
 
     if not token_losses:
         return torch.tensor(0.0, device=device, requires_grad=True)
 
-    policy_loss = torch.cat(token_losses).mean()
+    # Average across sequences — each trajectory contributes equally regardless of length
+    policy_loss = torch.stack(token_losses).mean()
 
     if entropy_terms and config.entropy_coef > 0:
-        # entropy = mean(-log π); we want to maximize it → subtract from loss
-        entropy = torch.cat(entropy_terms).mean()
+        entropy = torch.stack(entropy_terms).mean()
         return policy_loss - config.entropy_coef * entropy
 
     return policy_loss
