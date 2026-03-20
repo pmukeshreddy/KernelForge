@@ -882,9 +882,11 @@ def train(config: GRPOConfig = None):
             # schedule completes in the expected number of training steps.
             scheduler.step()
 
-            # Sync updated LoRA weights to SGLang server after all GRPO epochs
-            if not config.mock_mode and config.use_sglang and (SGLANG_AVAILABLE or config.sglang_python):
-                sync_weights_to_sglang(model, config.sglang_port)
+            # Weight sync disabled: SGLang's SafeUnpickler rejects our serialization format
+            # and crashes the SGLang scheduler, killing the server. Off-policy generation
+            # (stale SFT weights in SGLang) is fine — GRPO clips the importance ratio.
+            # if not config.mock_mode and config.use_sglang and (SGLANG_AVAILABLE or config.sglang_python):
+            #     sync_weights_to_sglang(model, config.sglang_port)
 
             # Log metrics and print loss (always, not just when using SGLang)
             if not config.mock_mode:
