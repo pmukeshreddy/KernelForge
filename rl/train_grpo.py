@@ -200,43 +200,69 @@ Now write the complete model_new.py for the following operation:
 # ---------------------------------------------------------------------------
 
 def _strip_thinking(text: str) -> str:
-    """Remove <think>...</think> blocks so inter-turn context stays clean and short."""
+    """
+    Replace <think>...</think> with a model-written reflection summary (Kevin's approach).
+    The model is asked to end each response with 'Reflection: ...' after the code block.
+    We keep: Reflection line + code block. Strip everything else from <think>.
+    If no Reflection line found, just strip thinking entirely.
+    """
+    # Extract reflection line if present (written by model after code block)
+    reflection = ""
+    m = re.search(r"(Reflection:.{0,300})", text, re.DOTALL)
+    if m:
+        reflection = m.group(1).split("\n")[0].strip()  # first line only
+
+    # Strip thinking blocks
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
-    return text.strip()
+    text = re.sub(r"<think>.*",          "", text, flags=re.DOTALL)
+    text = text.strip()
+
+    # Append reflection if found (passes model's own diagnosis forward)
+    if reflection:
+        text = text + f"\n\n{reflection}"
+
+    return text
 
 
 def _build_turn_feedback(eval_res: dict | None) -> str:
-    """Build the user feedback message shown to the model at the start of the next turn."""
+    """
+    Build the user feedback message for the next turn (Kevin's format):
+    - Full error message (not truncated mid-sentence)
+    - Specific, actionable ask
+    """
     if eval_res is None:
         return (
             "Your previous response could not be evaluated. "
             "Please write a complete, valid CUDA kernel using load_inline()."
         )
     if not eval_res.get("compiles", False):
-        err = (eval_res.get("compiler_error") or "Unknown error")[:400]
+        # Full compile error — don't truncate, model needs to see the exact line
+        err = (eval_res.get("compiler_error") or "Unknown compile error")
         return (
             f"Your previous kernel failed to compile:\n{err}\n\n"
-            "Please fix the error and write the corrected kernel."
+            "Fix the compile error. End your response with:\n"
+            "Reflection: <one sentence on what caused the error and what you changed>"
         )
     if not eval_res.get("correct", False):
-        err = (eval_res.get("compiler_error") or "Outputs do not match reference")[:400]
+        err = (eval_res.get("compiler_error") or "Outputs do not match reference")
         return (
             f"Your previous kernel compiled but produced incorrect outputs:\n{err}\n\n"
-            "Please fix the correctness issue and write the corrected kernel."
+            "Fix the correctness issue. End your response with:\n"
+            "Reflection: <one sentence on what was wrong and how you fixed it>"
         )
     rt = eval_res.get("runtime_ms")
     bt = eval_res.get("baseline_runtime_ms")
     if rt and bt:
         speedup = bt / rt
         return (
-            f"Your previous kernel was correct and ran at {speedup:.2f}x speedup over PyTorch. "
-            "Good work! Now try to push the performance further — optimize memory access patterns, "
-            "use shared memory, increase parallelism, or tune block dimensions."
+            f"Your previous kernel was correct at {speedup:.2f}x speedup over PyTorch. "
+            "Optimize further — shared memory, vectorized loads, better parallelism, tuned block size. "
+            "End your response with:\n"
+            "Reflection: <one sentence on what optimization you applied>"
         )
     return (
-        "Your previous kernel was correct. "
-        "Try to optimize it further for better GPU performance."
+        "Your previous kernel was correct. Optimize it further for GPU performance. "
+        "End your response with:\nReflection: <one sentence on what optimization you applied>"
     )
 
 
