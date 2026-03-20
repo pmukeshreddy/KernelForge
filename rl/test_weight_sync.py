@@ -28,7 +28,6 @@ def test_weight_sync(model_path: str, port: int, sglang_python: str, tp: int = 1
         "--dtype", "bfloat16",
         "--trust-remote-code",
         "--mem-fraction-static", "0.3",
-        "--disable-cuda-graph",   # avoid JIT kernel compilation (crt/host_config.h missing)
         "--log-level", "error",
     ])
     # Wait for server
