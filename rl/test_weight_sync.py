@@ -109,9 +109,12 @@ def test_weight_sync(model_path: str, port: int, sglang_python: str, tp: int = 1
         print(f"    init_weights_update_group → {r.status_code}")
         assert r.status_code == 200, f"failed: {r.text[:200]}"
 
+        print("    waiting for StatelessProcessGroup...")
         pg_thread.join(timeout=30)
+        print(f"    pg_thread done, pg_result={pg_result[0]}")
         assert pg_result[0] is not None, "StatelessProcessGroup.create() timed out"
         device = 0
+        print("    creating PyNcclCommunicator...")
         comm = PyNcclCommunicator(pg_result[0], device=torch.device(f"cuda:{device}"))
         print("    NCCL communicator ready")
 
