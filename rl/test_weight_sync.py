@@ -74,41 +74,31 @@ def test_weight_sync(model_path: str, port: int, sglang_python: str, tp: int = 1
         print("    OK")
 
         # ── 3. Init NCCL group ───────────────────────────────────────────────
+        # TorchRL pattern: HTTP first (SGLang schedules its side and returns 200
+        # immediately), then trainer creates StatelessProcessGroup (listens).
         print("[3] Initializing NCCL communicator...")
-        import threading
         world_size = tp + 1
-        http_result = [None]
-
-        def _init_http():
-            try:
-                r = requests.post(
-                    f"http://localhost:{port}/init_weights_update_group",
-                    json={
-                        "master_address": "localhost",
-                        "master_port": NCCL_PORT,
-                        "rank_offset": 1,
-                        "world_size": world_size,
-                        "group_name": "weight_update_group",
-                        "backend": "nccl",
-                    },
-                    timeout=120,
-                )
-                http_result[0] = r.status_code
-            except Exception as e:
-                http_result[0] = str(e)
-
-        t = threading.Thread(target=_init_http, daemon=True)
-        t.start()
-        time.sleep(1)
+        r = requests.post(
+            f"http://localhost:{port}/init_weights_update_group",
+            json={
+                "master_address": "localhost",
+                "master_port": NCCL_PORT,
+                "rank_offset": 1,
+                "world_size": world_size,
+                "group_name": "weight_update_group",
+                "backend": "nccl",
+            },
+            timeout=60,
+        )
+        print(f"    init_weights_update_group → {r.status_code}")
+        assert r.status_code == 200, f"failed: {r.text[:200]}"
+        time.sleep(0.2)
 
         device = 0
         pg = StatelessProcessGroup.create(
             host="localhost", port=NCCL_PORT, rank=0, world_size=world_size
         )
         comm = PyNcclCommunicator(pg, device=torch.device(f"cuda:{device}"))
-        t.join(timeout=60)
-        print(f"    HTTP result: {http_result[0]}")
-        assert http_result[0] == 200, f"init_weights_update_group failed: {http_result[0]}"
         print("    NCCL communicator ready")
 
         # ── 4. Pick one real parameter from the model ────────────────────────

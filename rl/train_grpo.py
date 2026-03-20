@@ -362,9 +362,29 @@ def init_weight_sync_group(port: int, tp_size: int = 1, sglang_python: str = Non
         except Exception as e:
             http_result[0] = str(e)
 
-    t = threading.Thread(target=_send_init, daemon=True)
-    t.start()
-    time.sleep(1)  # give SGLang time to start its TCP listener
+    # TorchRL pattern: HTTP first (SGLang schedules its side async, returns 200
+    # immediately), THEN trainer creates StatelessProcessGroup (starts listening).
+    # SGLang's background task then connects — both sides rendezvous.
+    try:
+        r = requests.post(
+            f"http://localhost:{port}/init_weights_update_group",
+            json={
+                "master_address": master_addr,
+                "master_port": master_port,
+                "rank_offset": 1,
+                "world_size": world_size,
+                "group_name": "weight_update_group",
+                "backend": "nccl",
+            },
+            timeout=60,
+        )
+        print(f"[SGLang] init_weights_update_group → {r.status_code}")
+        r.raise_for_status()
+    except Exception as e:
+        print(f"[SGLang] init_weights_update_group failed: {e}")
+        return False
+
+    time.sleep(0.2)  # brief pause so SGLang's async task starts before we listen
 
     try:
         device = torch.cuda.current_device()
@@ -372,17 +392,11 @@ def init_weight_sync_group(port: int, tp_size: int = 1, sglang_python: str = Non
             host=master_addr, port=master_port, rank=0, world_size=world_size
         )
         _pynccl_comm = PyNcclCommunicator(pg, device=torch.device(f"cuda:{device}"))
-        t.join(timeout=60)
-        if http_result[0] == 200:
-            print(f"[SGLang] NCCL communicator ready (world_size={world_size}, device=cuda:{device})")
-            return True
-        else:
-            print(f"[SGLang] init_weights_update_group returned {http_result[0]} — sync may fail")
-            return False
+        print(f"[SGLang] NCCL communicator ready (world_size={world_size}, device=cuda:{device})")
+        return True
     except Exception as e:
         import traceback as _tb
         print(f"[SGLang] NCCL init failed: {e}\n{_tb.format_exc()}")
-        t.join(timeout=10)
         return False
 
 
