@@ -19,7 +19,18 @@ def test_weight_sync(model_path: str, port: int, sglang_python: str, tp: int = 1
 
     # ── 1. Launch SGLang server ──────────────────────────────────────────────
     print(f"[1] Launching SGLang server on port {port}...")
-    import subprocess
+    import subprocess, glob as _glob
+    # Auto-detect CUDA home and inject bin/include into subprocess env
+    cuda_homes = sorted(_glob.glob("/usr/local/cuda-*"), reverse=True) + ["/usr/local/cuda"]
+    cuda_home = next((p for p in cuda_homes if os.path.isfile(f"{p}/bin/nvcc")), None)
+    env = dict(os.environ)
+    if cuda_home:
+        cuda_bin, cuda_inc = f"{cuda_home}/bin", f"{cuda_home}/include"
+        if cuda_bin not in env.get("PATH", ""):
+            env["PATH"] = f"{cuda_bin}:{env.get('PATH', '')}"
+        if cuda_inc not in env.get("CPATH", ""):
+            env["CPATH"] = f"{cuda_inc}:{env.get('CPATH', '')}"
+        print(f"    CUDA home: {cuda_home}")
     proc = subprocess.Popen([
         sglang_python, "-m", "sglang.launch_server",
         "--model-path", model_path,
@@ -29,7 +40,7 @@ def test_weight_sync(model_path: str, port: int, sglang_python: str, tp: int = 1
         "--trust-remote-code",
         "--mem-fraction-static", "0.3",
         "--log-level", "error",
-    ])
+    ], env=env)
     # Wait for server
     for i in range(120):
         try:

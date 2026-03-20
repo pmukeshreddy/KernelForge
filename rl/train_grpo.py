@@ -287,7 +287,23 @@ def launch_sglang_server(model_path: str, adapter_path: str, port: int, tp: int,
         "--context-length", "8192",  # limit KV cache: 8192*160KB=1.3GB vs default 131K*160KB=21GB
         "--log-level", "error",
     ]
-    env = {**__import__("os").environ, "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "1"}
+    # Ensure CUDA toolkit bin/include are in the subprocess environment.
+    # On fresh servers nvcc may be symlinked to /usr/local/cuda-X.Y/bin/nvcc
+    # but cudafe++ and other tools are only in that bin dir, not /usr/bin.
+    import glob as _glob
+    cuda_homes = sorted(_glob.glob("/usr/local/cuda-*"), reverse=True) + ["/usr/local/cuda"]
+    cuda_home = next((p for p in cuda_homes if os.path.isfile(f"{p}/bin/nvcc")), None)
+    base_env = dict(os.environ)
+    if cuda_home:
+        cuda_bin = f"{cuda_home}/bin"
+        cuda_inc = f"{cuda_home}/include"
+        path = base_env.get("PATH", "")
+        if cuda_bin not in path:
+            base_env["PATH"] = f"{cuda_bin}:{path}"
+        cpath = base_env.get("CPATH", "")
+        if cuda_inc not in cpath:
+            base_env["CPATH"] = f"{cuda_inc}:{cpath}"
+    env = {**base_env, "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "1"}
     proc = subprocess.Popen(cmd, env=env)
 
     # Wait for server to be ready
