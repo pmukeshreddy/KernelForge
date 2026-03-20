@@ -98,7 +98,8 @@ class GRPOConfig:
     gamma: float = 0.4
 
     # Generation
-    max_new_tokens: int = 6000
+    max_new_tokens: int = 6000        # total budget (thinking + code)
+    think_budget: int = 2000          # phase-1 thinking cap; code gets the rest
     temperature: float = 0.7
     mock_mode: bool = False
 
@@ -391,34 +392,81 @@ def sync_lora_to_sglang(model, port: int):
 
 
 
-def _generate_with_sglang(context_texts: list[str], config: "GRPOConfig") -> list[str]:
-    """
-    Generate completions for a batch of prompts via the SGLang server.
-    Sends all prompts in one batch request — SGLang processes them in parallel.
-    RadixAttention automatically caches the shared system prompt prefix.
-    """
+def _sglang_post(port: int, contexts: list[str], max_new_tokens: int,
+                 temperature: float, stop: list[str]) -> list[str]:
+    """Raw SGLang /generate call. Returns full text (context + completion)."""
     import requests
     payload = {
-        "text": context_texts,
+        "text": contexts,
         "lora_name": _LORA_NAME,
         "sampling_params": {
-            "max_new_tokens": config.max_new_tokens,
-            "temperature": config.temperature,
-            "top_p": 1.0 if config.temperature == 0.0 else 0.95,
-            "stop": ["<|im_end|>"],
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature,
+            "top_p": 1.0 if temperature == 0.0 else 0.95,
+            "stop": stop,
         },
     }
-    resp = requests.post(
-        f"http://localhost:{config.sglang_port}/generate",
-        json=payload,
-        timeout=600,
-    )
+    resp = requests.post(f"http://localhost:{port}/generate", json=payload, timeout=600)
     resp.raise_for_status()
     result = resp.json()
-    # SGLang returns a list when input is a list
     if isinstance(result, list):
         return [r["text"] for r in result]
     return [result["text"]]
+
+
+def _generate_with_sglang(context_texts: list[str], config: "GRPOConfig") -> list[str]:
+    """
+    Budget-forcing generation:
+      Phase 1 — let the model think for up to think_budget tokens,
+                 stop early if it writes ```python or </think> on its own.
+      Phase 2 — if no code block started after phase 1, inject
+                 </think>\n```python\n and generate the code.
+
+    This prevents the model from spending all 6000 tokens in <think>
+    and never writing any code.
+    """
+    think_budget = config.think_budget
+    code_budget   = config.max_new_tokens - think_budget
+
+    # ── Phase 1: thinking ───────────────────────────────────────────────────
+    phase1_raw = _sglang_post(
+        config.sglang_port, context_texts, think_budget, config.temperature,
+        stop=["<|im_end|>", "```python"],
+    )
+    # phase1_raw contains the full text (context + partial completion)
+
+    # ── Build phase-2 contexts ───────────────────────────────────────────────
+    phase2_contexts = []
+    phase1_completions = []   # what the model produced in phase 1 (no context prefix)
+
+    for ctx, full in zip(context_texts, phase1_raw):
+        comp = full[len(ctx):] if full.startswith(ctx) else full
+        phase1_completions.append(comp)
+
+        if "```python" in comp:
+            # Model already started writing code — continue from exactly here
+            idx = comp.index("```python")
+            phase2_contexts.append(ctx + comp[:idx] + "```python\n")
+        elif "</think>" in comp:
+            # Model closed its thinking naturally — let it continue normally
+            phase2_contexts.append(ctx + comp)
+        else:
+            # Thinking budget exhausted without closing — inject the transition
+            phase2_contexts.append(ctx + comp + "\n</think>\n```python\n")
+
+    # ── Phase 2: code ────────────────────────────────────────────────────────
+    phase2_raw = _sglang_post(
+        config.sglang_port, phase2_contexts, code_budget, config.temperature,
+        stop=["<|im_end|>"],
+    )
+
+    # ── Combine: return context + phase1 + phase2 ────────────────────────────
+    results = []
+    for ctx, p2ctx, p2full in zip(context_texts, phase2_contexts, phase2_raw):
+        # p2ctx already contains ctx + phase1 prefix; p2full = p2ctx + phase2 completion
+        full_with_ctx = p2full if p2full.startswith(ctx) else (p2ctx + p2full)
+        results.append(full_with_ctx)
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -1066,6 +1114,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-6)
     parser.add_argument("--grpo_epochs", type=int, default=2, help="Gradient updates per rollout (2 reduces staleness vs original 4)")
+    parser.add_argument("--think_budget", type=int, default=2000, help="Max thinking tokens before forcing code output")
     parser.add_argument("--num_turns", type=int, default=4, help="Multi-turn refinement turns per trajectory (Kevin's recipe)")
     parser.add_argument("--gamma", type=float, default=0.4, help="Discount factor for multi-turn returns")
     parser.add_argument("--wandb_project", type=str, default="kernelforge-rl")
@@ -1092,6 +1141,7 @@ if __name__ == "__main__":
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_name,
         dynamic_sampling=not args.no_dynamic_sampling,
+        think_budget=args.think_budget,
         num_turns=args.num_turns,
         gamma=args.gamma,
         use_sglang=args.use_sglang,
