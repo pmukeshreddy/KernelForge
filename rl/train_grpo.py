@@ -61,31 +61,12 @@ def _extract_python_block(text: str) -> str:
     text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
     m = re.search(r'```python\s*(.*?)```', text, re.DOTALL)
     if m:
-        code = m.group(1).strip()
-    else:
-        # Fallback: unclosed block (truncated by max_new_tokens)
-        m = re.search(r'```python\s*(.*)', text, re.DOTALL)
-        if m:
-            code = m.group(1).strip()
-        else:
-            return ""
-    # Fix: model sometimes writes """ inside the CUDA triple-quoted string
-    # (e.g. in comments), which closes the Python string prematurely.
-    # Replace any """ that appears INSIDE cuda_source = """...""" with \"\"\".
-    def _fix_inner_quotes(c):
-        # Find the cuda_source string boundaries and escape interior """
-        parts = re.split(r'(cuda_source\s*=\s*""")', c, maxsplit=1)
-        if len(parts) < 3:
-            return c
-        before, opener, rest = parts
-        # Find the closing """ — first occurrence after the opener
-        close = rest.find('"""')
-        if close == -1:
-            return c  # unclosed — leave as-is
-        inside = rest[:close].replace('"""', r'\"\"\"')
-        after = rest[close:]
-        return before + opener + inside + after
-    return _fix_inner_quotes(code)
+        return m.group(1).strip()
+    # Fallback: unclosed block (truncated by max_new_tokens)
+    m = re.search(r'```python\s*(.*)', text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return ""
 
 
 # ---------------------------------------------------------------------------
