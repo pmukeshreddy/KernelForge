@@ -852,12 +852,18 @@ def train(config: GRPOConfig = None):
                 reward_std = torch.tensor(group_rewards).std().item()
                 print(f"  Group: mean={mean_r:.2f}, best={best_r:.2f}, std={reward_std:.3f}")
 
+            elapsed = time.time() - t0
+            step_bar.update(1)
+
+            if not all_group_rewards:
+                print(f"\n[Epoch {epoch+1} | Step {global_step+1}/{total_steps}] all prompts degenerate, skipping step.")
+                global_step += 1
+                continue
+
             batch_mean = sum(
                 sum(rs) / len(rs) for rs in all_group_rewards
             ) / len(all_group_rewards)
-            elapsed = time.time() - t0
             step_bar.set_postfix(reward=f"{batch_mean:.3f}", step_time=f"{elapsed:.0f}s")
-            step_bar.update(1)
             print(f"\n[Epoch {epoch+1} | Step {global_step+1}/{total_steps}] reward={batch_mean:.3f}  step_time={elapsed:.0f}s")
 
             torch.cuda.empty_cache()
