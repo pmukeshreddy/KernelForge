@@ -56,8 +56,17 @@ def _worker_run_eval(args):
 def _extract_python_block(text: str) -> str:
     """Extract the first ```python ... ``` block from model output."""
     import re
+    # Strip Qwen3 think blocks (base model leaks these even after SFT)
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
     m = re.search(r'```python\s*(.*?)```', text, re.DOTALL)
-    return m.group(1).strip() if m else ""
+    if m:
+        return m.group(1).strip()
+    # Fallback: unclosed block (truncated by max_new_tokens / stop token)
+    m = re.search(r'```python\s*(.*)', text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return ""
 
 
 # ---------------------------------------------------------------------------
