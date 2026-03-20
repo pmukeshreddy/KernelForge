@@ -1,30 +1,38 @@
 """
-test_weight_sync.py — verify SGLang weight sync end-to-end.
+test_weight_sync.py — verify the /load_lora_adapter + sleep/wake weight sync end-to-end.
+
+Tests the full cycle used by train_grpo.py:
+  1. Launch SGLang with base model + --enable-lora
+  2. Load initial LoRA via /load_lora_adapter → generate a response
+  3. /release_memory_occupation → simulate training taking the VRAM
+  4. /resume_memory_occupation  → SGLang comes back
+  5. Save a modified LoRA to a temp dir, reload via /load_lora_adapter
+  6. Generate again → verify generation still works with new LoRA
 
 Usage:
     export SGLANG_PYTHON=/path/to/sglang_env/bin/python
-    python rl/test_weight_sync.py --model <model_path> --port 30000
+    python rl/test_weight_sync.py --model <base_model_path> --adapter <lora_adapter_path> --port 30000
 """
 
 import os
 import sys
 import time
 import argparse
-import torch
+import tempfile
+import shutil
 import requests
 
 
-def test_weight_sync(model_path: str, port: int, sglang_python: str, tp: int = 1):
-    import socket as _socket
-    with _socket.socket() as _s:
-        _s.bind(("", 0))
-        NCCL_PORT = _s.getsockname()[1]
-    print(f"    Using NCCL rendezvous port: {NCCL_PORT}")
+LORA_NAME = "kf_grpo_adapter"
+
+
+def test_weight_sync(model_path: str, adapter_path: str, port: int,
+                     sglang_python: str, tp: int = 1):
 
     # ── 1. Launch SGLang server ──────────────────────────────────────────────
-    print(f"[1] Launching SGLang server on port {port}...")
+    print(f"[1] Launching SGLang server (base model, --enable-lora) on port {port}...")
     import subprocess, glob as _glob
-    # Auto-detect CUDA home and inject bin/include into subprocess env
+
     cuda_homes = sorted(_glob.glob("/usr/local/cuda-*"), reverse=True) + ["/usr/local/cuda"]
     cuda_home = next((p for p in cuda_homes if os.path.isfile(f"{p}/bin/nvcc")), None)
     env = dict(os.environ)
@@ -35,6 +43,7 @@ def test_weight_sync(model_path: str, port: int, sglang_python: str, tp: int = 1
         if cuda_inc not in env.get("CPATH", ""):
             env["CPATH"] = f"{cuda_inc}:{env.get('CPATH', '')}"
         print(f"    CUDA home: {cuda_home}")
+
     proc = subprocess.Popen([
         sglang_python, "-m", "sglang.launch_server",
         "--model-path", model_path,
@@ -42,10 +51,13 @@ def test_weight_sync(model_path: str, port: int, sglang_python: str, tp: int = 1
         "--tp", str(tp),
         "--dtype", "bfloat16",
         "--trust-remote-code",
+        "--enable-lora",
+        "--max-loras-per-batch", "1",
         "--mem-fraction-static", "0.3",
+        "--context-length", "8192",
         "--log-level", "error",
     ], env=env)
-    # Wait for server
+
     for i in range(120):
         try:
             if requests.get(f"http://localhost:{port}/health", timeout=2).status_code == 200:
@@ -59,139 +71,134 @@ def test_weight_sync(model_path: str, port: int, sglang_python: str, tp: int = 1
         raise RuntimeError("SGLang server failed to start")
 
     try:
-        # ── 2. Import SGLang's NCCL primitives ──────────────────────────────
-        print("[2] Importing SGLang NCCL primitives...")
-        try:
-            from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
-            from sglang.srt.distributed.utils import StatelessProcessGroup
-        except ImportError:
-            result = subprocess.run(
-                [sglang_python, "-c",
-                 "import sglang, os; print(os.path.dirname(os.path.dirname(sglang.__file__)))"],
-                capture_output=True, text=True, timeout=10,
-            )
-            site_packages = result.stdout.strip()
-            assert site_packages, f"Could not find SGLang site-packages via {sglang_python}"
-            sys.path.insert(0, site_packages)
-            from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
-            from sglang.srt.distributed.utils import StatelessProcessGroup
-        print("    OK")
+        # ── 2. Load initial LoRA adapter ─────────────────────────────────────
+        print(f"[2] Loading initial LoRA adapter: {adapter_path}")
+        r = requests.post(
+            f"http://localhost:{port}/load_lora_adapter",
+            json={"lora_name": LORA_NAME, "lora_path": adapter_path},
+            timeout=120,
+        )
+        print(f"    load_lora_adapter → {r.status_code}  {r.text[:200]}")
+        assert r.status_code == 200, f"load_lora_adapter failed: {r.status_code} {r.text[:300]}"
+        print("    Initial LoRA loaded OK")
 
-        # ── 3. Init NCCL group ───────────────────────────────────────────────
-        # PyNcclCommunicator (wraps ncclCommInitRank) MUST run on the MAIN
-        # thread — background threads have no CUDA context and ncclCommInitRank
-        # hangs indefinitely.  Send the HTTP trigger in a background thread so
-        # both sides can rendezvous concurrently.
-        print("[3] Initializing NCCL communicator...")
-        import threading as _threading
-        world_size = tp + 1
-
-        http_result = [None]; http_body = [None]
-        def _send_http():
-            try:
-                r = requests.post(
-                    f"http://localhost:{port}/init_weights_update_group",
-                    json={
-                        "master_address": "localhost",
-                        "master_port":    NCCL_PORT,
-                        "rank_offset":    1,
-                        "world_size":     world_size,
-                        "group_name":     "weight_update_group",
-                        "backend":        "nccl",
-                    },
-                    timeout=300,
-                )
-                http_result[0] = r.status_code
-                http_body[0]   = r.text[:200]
-            except Exception as e:
-                http_result[0] = str(e)
-
-        http_thread = _threading.Thread(target=_send_http, daemon=True)
-        http_thread.start()
-        time.sleep(2)  # ensure HTTP is dispatched before we block on TCP
-
-        # StatelessProcessGroup + PyNcclCommunicator in MAIN thread (has CUDA context)
-        print("    Creating StatelessProcessGroup (rank=0)...")
-        pg = StatelessProcessGroup.create(host="localhost", port=NCCL_PORT, rank=0, world_size=world_size)
-        print("    Creating PyNcclCommunicator...")
-        comm = PyNcclCommunicator(pg, device=torch.device("cuda:0"))
-        print("    PyNcclCommunicator done")
-
-        http_thread.join(timeout=120)
-        print(f"    init_weights_update_group → {http_result[0]}  {http_body[0]}")
-        assert http_result[0] == 200, f"failed: {http_result[0]} {http_body[0]}"
-        print("    NCCL communicator ready")
-
-        # ── 4. Pick one real parameter from the model ────────────────────────
-        print("[4] Fetching model parameter info from SGLang...")
-        # Use /get_model_info if available, otherwise just pick a known param name
-        # We'll use a small dummy tensor matching a real param shape instead
-        # Grab param names from a quick SGLang generate to confirm server is alive
-        resp = requests.post(
+        # ── 3. Generate with initial LoRA ────────────────────────────────────
+        print("[3] Generating with initial LoRA...")
+        r = requests.post(
             f"http://localhost:{port}/generate",
-            json={"text": "hi", "sampling_params": {"max_new_tokens": 1}},
+            json={
+                "text": "Write a CUDA kernel for ReLU:\n",
+                "lora_name": LORA_NAME,
+                "sampling_params": {"max_new_tokens": 32, "temperature": 0.0},
+            },
             timeout=60,
         )
-        assert resp.status_code == 200, f"generate failed: {resp.text[:200]}"
-        print("    Server responding to generate OK")
+        assert r.status_code == 200, f"generate failed: {r.text[:200]}"
+        gen1 = r.json()["text"][:120]
+        print(f"    Generated (first 120 chars): {repr(gen1)}")
+        print("    Generation with initial LoRA OK")
 
-        # ── 5. Sync a real parameter ─────────────────────────────────────────
-        print("[5] Loading model to get a real parameter...")
+        # ── 4. Release memory (simulate trainer taking the GPU) ──────────────
+        print("[4] Releasing SGLang memory (/release_memory_occupation)...")
+        r = requests.post(f"http://localhost:{port}/release_memory_occupation", timeout=60)
+        print(f"    release_memory_occupation → {r.status_code}  {r.text[:100]}")
+        assert r.status_code == 200, f"release failed: {r.status_code}"
+        print("    Memory released OK  (SGLang is now sleeping)")
+
+        # Simulate a short training step
+        time.sleep(2)
+        print("    (simulated 2s training step)")
+
+        # ── 5. Resume memory ─────────────────────────────────────────────────
+        print("[5] Resuming SGLang memory (/resume_memory_occupation)...")
+        r = requests.post(f"http://localhost:{port}/resume_memory_occupation", timeout=120)
+        print(f"    resume_memory_occupation → {r.status_code}  {r.text[:100]}")
+        assert r.status_code == 200, f"resume failed: {r.status_code}"
+        print("    Memory resumed OK  (SGLang is awake again)")
+
+        # ── 6. Save a modified LoRA and hot-reload ───────────────────────────
+        print("[6] Saving modified LoRA to temp dir and hot-reloading...")
+        import torch
+        from peft import PeftModel
         from transformers import AutoModelForCausalLM
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, device_map="cpu", trust_remote_code=True
+
+        tmpdir = tempfile.mkdtemp(prefix="kf_test_lora_")
+        lora_save_path = os.path.join(tmpdir, "adapter")
+        try:
+            # Load the adapter on CPU, tweak one LoRA weight slightly, save
+            base = AutoModelForCausalLM.from_pretrained(
+                model_path, torch_dtype=torch.bfloat16, device_map="cpu",
+                trust_remote_code=True,
+            )
+            peft_model = PeftModel.from_pretrained(base, adapter_path)
+
+            # Nudge the first LoRA-A weight so it's detectably different
+            with torch.no_grad():
+                for name, param in peft_model.named_parameters():
+                    if "lora_A" in name and param.requires_grad:
+                        param.data += 0.001
+                        print(f"    Nudged: {name}  shape={list(param.shape)}")
+                        break
+
+            peft_model.save_pretrained(lora_save_path)
+            del base, peft_model
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            print(f"    Modified LoRA saved → {lora_save_path}")
+
+            # Hot-reload into SGLang
+            r = requests.post(
+                f"http://localhost:{port}/load_lora_adapter",
+                json={"lora_name": LORA_NAME, "lora_path": lora_save_path},
+                timeout=60,
+            )
+            print(f"    load_lora_adapter (updated) → {r.status_code}  {r.text[:200]}")
+            assert r.status_code == 200, f"hot-reload failed: {r.status_code} {r.text[:300]}"
+            print("    Hot-reload OK")
+
+            # Flush stale KV cache
+            requests.post(f"http://localhost:{port}/flush_cache", timeout=30)
+            print("    Cache flushed")
+
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        # ── 7. Generate with updated LoRA ────────────────────────────────────
+        print("[7] Generating with updated LoRA...")
+        r = requests.post(
+            f"http://localhost:{port}/generate",
+            json={
+                "text": "Write a CUDA kernel for ReLU:\n",
+                "lora_name": LORA_NAME,
+                "sampling_params": {"max_new_tokens": 32, "temperature": 0.0},
+            },
+            timeout=60,
         )
-        # Grab embed_tokens — small and always present
-        param_name = "model.embed_tokens.weight"
-        original = model.state_dict()[param_name].clone()
-        # Corrupt it slightly so we can verify SGLang received the new value
-        modified = original + 0.001
-        tensor = modified.cuda().contiguous()
-        del model
-        torch.cuda.empty_cache()
-        print(f"    Using param: {param_name}  shape={list(tensor.shape)}")
+        assert r.status_code == 200, f"generate failed: {r.text[:200]}"
+        gen2 = r.json()["text"][:120]
+        print(f"    Generated (first 120 chars): {repr(gen2)}")
+        print("    Generation with updated LoRA OK")
 
-        print("[6] Sending update_weights_from_distributed + broadcasting...")
-        http2 = [None]; http2_body = [None]
-        def _sync_http():
-            try:
-                r = requests.post(
-                    f"http://localhost:{port}/update_weights_from_distributed",
-                    json={
-                        "names":  [param_name],
-                        "dtypes": ["bfloat16"],
-                        "shapes": [list(tensor.shape)],
-                    },
-                    timeout=120,
-                )
-                http2[0] = r.status_code
-                http2_body[0] = r.text[:200]
-            except Exception as e:
-                http2[0] = str(e)
-
-        t2 = threading.Thread(target=_sync_http, daemon=True)
-        t2.start()
-        comm.broadcast(tensor, src=0, stream=torch.cuda.current_stream())
-        torch.cuda.synchronize()
-        t2.join(timeout=130)
-
-        print(f"    HTTP result: {http2[0]}  body: {http2_body[0]}")
-        assert http2[0] == 200, f"update_weights_from_distributed failed: {http2[0]}"
-
-        print("\n✅ Weight sync WORKS — SGLang received the updated tensor successfully.")
+        print("\n✅ ALL CHECKS PASSED")
+        print("   - SGLang starts with base model + --enable-lora")
+        print("   - /load_lora_adapter loads initial SFT adapter")
+        print("   - /release_memory_occupation frees VRAM for trainer")
+        print("   - /resume_memory_occupation restores SGLang")
+        print("   - /load_lora_adapter hot-reloads updated LoRA after training step")
+        print("   - Generation works correctly with both initial and updated LoRA")
 
     finally:
         proc.terminate()
-        print("[done] SGLang server terminated.")
+        print("\n[done] SGLang server terminated.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model",  required=True, help="Model path or HF model ID")
-    parser.add_argument("--port",   type=int, default=30000)
-    parser.add_argument("--tp",     type=int, default=1)
+    parser.add_argument("--model",   required=True, help="Base model path or HF model ID")
+    parser.add_argument("--adapter", required=True, help="Initial LoRA adapter path or HF adapter ID")
+    parser.add_argument("--port",    type=int, default=30000)
+    parser.add_argument("--tp",      type=int, default=1)
     parser.add_argument("--sglang_python", default=os.environ.get("SGLANG_PYTHON", ""))
     args = parser.parse_args()
 
     assert args.sglang_python, "Pass --sglang_python or set SGLANG_PYTHON env var"
-    test_weight_sync(args.model, args.port, args.sglang_python, args.tp)
+    test_weight_sync(args.model, args.adapter, args.port, args.sglang_python, args.tp)

@@ -198,61 +198,24 @@ Now write the complete model_new.py for the following operation:
 # ---------------------------------------------------------------------------
 
 _sglang_server = None  # global handle so we can shut it down at exit
-_pynccl_comm = None   # SGLang's own PyNcclCommunicator (not torch.distributed)
-
-
-def _free_port() -> int:
-    """Find a free TCP port."""
-    import socket
-    with socket.socket() as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
-
-
-_NCCL_MASTER_PORT = _free_port()  # chosen at import time, free at that moment
-
-
-def _ensure_sglang_importable(sglang_python: str = None):
-    """Add SGLang's site-packages to sys.path if not already importable."""
-    try:
-        import sglang.srt.distributed  # noqa
-        return
-    except ImportError:
-        pass
-    import subprocess, sys as _sys
-    python = sglang_python or os.environ.get("SGLANG_PYTHON", "")
-    if not python:
-        raise ImportError(
-            "SGLang not importable and SGLANG_PYTHON not set. "
-            "Set SGLANG_PYTHON=/path/to/sglang_env/bin/python"
-        )
-    result = subprocess.run(
-        [python, "-c",
-         "import sglang, os; print(os.path.dirname(os.path.dirname(sglang.__file__)))"],
-        capture_output=True, text=True, timeout=10,
-    )
-    site_packages = result.stdout.strip()
-    if site_packages and site_packages not in _sys.path:
-        _sys.path.insert(0, site_packages)
-        print(f"[SGLang] Added to sys.path: {site_packages}")
+_lora_temp_dir = None  # temp dir for LoRA sync between trainer and SGLang
+_LORA_NAME = "kf_grpo_adapter"  # name SGLang uses for the live LoRA adapter
 
 
 def launch_sglang_server(model_path: str, adapter_path: str, port: int, tp: int,
                          sglang_python: str = None):
     """
-    Launch SGLang as an inference server in a subprocess.
-    Uses LoRA-merged weights so the server sees the SFT-initialized model.
+    Launch SGLang as an inference server in a subprocess using the base model
+    + LoRA loaded dynamically via /load_lora_adapter (no merge needed).
 
-    SGLang must be installed in a separate venv to avoid dependency conflicts
-    with the training stack. Pass sglang_python to point at that environment's
-    Python, e.g. /root/sglang_env/bin/python. Defaults to the env variable
-    SGLANG_PYTHON, then falls back to the current interpreter (not recommended).
+    After each training step: save LoRA → /release_memory_occupation →
+    backward pass → /resume_memory_occupation → /load_lora_adapter (hot-reload).
+    No NCCL required.
 
     Returns the server process handle.
     """
     import subprocess, sys, time, requests, os
 
-    # Resolve which Python to use for the SGLang subprocess
     python_bin = (
         sglang_python
         or os.environ.get("SGLANG_PYTHON")
@@ -263,43 +226,20 @@ def launch_sglang_server(model_path: str, adapter_path: str, port: int, tp: int,
               "Set SGLANG_PYTHON=/path/to/sglang_env/bin/python to avoid "
               "dependency conflicts.")
 
-    # Merge LoRA into base weights and save to a temp dir for SGLang to load
-    merged_path = os.path.join(os.path.dirname(adapter_path), "_sglang_merged")
-    if not os.path.exists(merged_path):
-        print(f"[SGLang] Merging LoRA into base model for server launch → {merged_path}")
-        from peft import PeftModel
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        base = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16, trust_remote_code=True)
-        merged = PeftModel.from_pretrained(base, adapter_path).merge_and_unload()
-        merged.save_pretrained(merged_path)
-        AutoTokenizer.from_pretrained(model_path, trust_remote_code=True).save_pretrained(merged_path)
-        # Fix Qwen3 tokenizer_config.json: extra_special_tokens saved as list, SGLang needs dict
-        import json as _json
-        tok_cfg_path = os.path.join(merged_path, "tokenizer_config.json")
-        with open(tok_cfg_path) as _f:
-            tok_cfg = _json.load(_f)
-        if isinstance(tok_cfg.get("extra_special_tokens"), list):
-            tok_cfg["extra_special_tokens"] = {}
-            with open(tok_cfg_path, "w") as _f:
-                _json.dump(tok_cfg, _f, indent=2)
-        del base, merged
-        torch.cuda.empty_cache()
-        print(f"[SGLang] Merge complete.")
-
     cmd = [
         python_bin, "-m", "sglang.launch_server",
-        "--model-path", merged_path,
+        "--model-path", model_path,
         "--port", str(port),
         "--tp", str(tp),
         "--dtype", "bfloat16",
         "--trust-remote-code",
+        "--enable-lora",
+        "--max-loras-per-batch", "1",
         "--mem-fraction-static", "0.5",
-        "--context-length", "8192",  # limit KV cache: 8192*160KB=1.3GB vs default 131K*160KB=21GB
+        "--context-length", "8192",
         "--log-level", "error",
     ]
-    # Ensure CUDA toolkit bin/include are in the subprocess environment.
-    # On fresh servers nvcc may be symlinked to /usr/local/cuda-X.Y/bin/nvcc
-    # but cudafe++ and other tools are only in that bin dir, not /usr/bin.
+
     import glob as _glob
     cuda_homes = sorted(_glob.glob("/usr/local/cuda-*"), reverse=True) + ["/usr/local/cuda"]
     cuda_home = next((p for p in cuda_homes if os.path.isfile(f"{p}/bin/nvcc")), None)
@@ -322,189 +262,91 @@ def launch_sglang_server(model_path: str, adapter_path: str, port: int, tp: int,
         try:
             if requests.get(url, timeout=2).status_code == 200:
                 print(f"[SGLang] Server ready on port {port}")
-                return proc
+                break
         except Exception:
             pass
         time.sleep(2)
-    raise RuntimeError(f"SGLang server failed to start on port {port}")
+    else:
+        proc.terminate()
+        raise RuntimeError(f"SGLang server failed to start on port {port}")
 
-
-def init_weight_sync_group(port: int, tp_size: int = 1, sglang_python: str = None) -> bool:
-    """
-    Initialize NCCL communicator for weight sync between trainer and SGLang.
-    Uses SGLang's own StatelessProcessGroup + PyNcclCommunicator (same as TorchRL/verl).
-
-    torch.distributed uses a different rendezvous protocol than StatelessProcessGroup;
-    mixing them means the NCCL comm IDs are never exchanged and collectives hang.
-    """
-    import requests, time, threading
-
-    global _pynccl_comm
-    if _pynccl_comm is not None:
-        print("[SGLang] NCCL communicator already initialized.")
-        return True
-
-    _ensure_sglang_importable(sglang_python)
-    from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
-    from sglang.srt.distributed.utils import StatelessProcessGroup
-
-    master_addr = "localhost"
-    master_port = _NCCL_MASTER_PORT
-    world_size = tp_size + 1  # rank 0 = trainer, ranks 1..tp_size = SGLang
-
-    # PyNcclCommunicator (wraps ncclCommInitRank) MUST be created on a thread
-    # that already has an active CUDA context — that is the MAIN thread, which
-    # loaded the model.  Background daemon threads have no CUDA context and
-    # ncclCommInitRank hangs indefinitely waiting for a CUDA init that never
-    # happens.
-    #
-    # Pattern (same as TorchRL SGLangCollectiveTransport):
-    #   - HTTP request in background thread  →  triggers SGLang (rank 1)
-    #   - StatelessProcessGroup + PyNcclCommunicator in MAIN thread (rank 0)
-    # Both sides rendezvous through the TCP store at master_port.
-
-    http_result = [None]
-    http_body   = [None]
-
-    def _send_http():
-        try:
-            r = requests.post(
-                f"http://localhost:{port}/init_weights_update_group",
-                json={
-                    "master_address": master_addr,
-                    "master_port":    master_port,
-                    "rank_offset":    1,
-                    "world_size":     world_size,
-                    "group_name":     "weight_update_group",
-                    "backend":        "nccl",
-                },
-                timeout=300,
-            )
-            http_result[0] = r.status_code
-            http_body[0]   = r.text[:200]
-        except Exception as e:
-            http_result[0] = str(e)
-
-    http_thread = threading.Thread(target=_send_http, daemon=True)
-    http_thread.start()
-
-    # Brief pause so the HTTP is dispatched and SGLang starts its side before
-    # the trainer's TCP server accepts the first connection.
-    time.sleep(2)
-
-    # Create StatelessProcessGroup (rank 0 = TCP server) and PyNcclCommunicator
-    # in the MAIN thread, which has a live CUDA context.
+    # Load initial SFT LoRA adapter
+    print(f"[SGLang] Loading initial LoRA adapter from {adapter_path} ...")
     try:
-        device = torch.cuda.current_device()
-        print(f"[SGLang] Creating StatelessProcessGroup (rank=0, port={master_port})...")
-        pg = StatelessProcessGroup.create(
-            host=master_addr, port=master_port, rank=0, world_size=world_size
+        r = requests.post(
+            f"http://localhost:{port}/load_lora_adapter",
+            json={"lora_name": _LORA_NAME, "lora_path": adapter_path},
+            timeout=120,
         )
-        print(f"[SGLang] StatelessProcessGroup done. Creating PyNcclCommunicator...")
-        comm = PyNcclCommunicator(pg, device=torch.device(f"cuda:{device}"))
-        print(f"[SGLang] PyNcclCommunicator done (cuda:{device})")
+        if r.status_code == 200:
+            print(f"[SGLang] Initial LoRA loaded (name={_LORA_NAME})")
+        else:
+            print(f"[SGLang] WARNING: load_lora_adapter status={r.status_code}: {r.text[:300]}")
     except Exception as e:
-        import traceback as _tb
-        print(f"[SGLang] NCCL communicator init failed:\n{_tb.format_exc()}")
-        http_thread.join(timeout=10)
-        return False
+        print(f"[SGLang] WARNING: load_lora_adapter failed: {e}")
 
-    http_thread.join(timeout=120)
-    print(f"[SGLang] init_weights_update_group HTTP: status={http_result[0]} body={http_body[0]}")
-    if http_result[0] != 200:
-        print(f"[SGLang] SGLang failed to init weight sync group.")
-        return False
-
-    _pynccl_comm = comm
-    print(f"[SGLang] NCCL communicator ready (world_size={world_size})")
-    return True
+    return proc
 
 
-def sync_weights_to_sglang(model, port: int):
+def release_sglang_memory(port: int):
+    """Release SGLang's GPU allocation so the trainer can use full VRAM for backward pass."""
+    import requests
+    try:
+        r = requests.post(f"http://localhost:{port}/release_memory_occupation", timeout=60)
+        print(f"[SGLang] Memory released (status={r.status_code})")
+    except Exception as e:
+        print(f"[SGLang] release_memory_occupation failed: {e}")
+
+
+def resume_sglang_memory(port: int):
+    """Restore SGLang's GPU allocation after the training step is done."""
+    import requests
+    try:
+        r = requests.post(f"http://localhost:{port}/resume_memory_occupation", timeout=120)
+        print(f"[SGLang] Memory resumed (status={r.status_code})")
+    except Exception as e:
+        print(f"[SGLang] resume_memory_occupation failed: {e}")
+
+
+def sync_lora_to_sglang(model, port: int):
     """
-    Push updated LoRA-merged weights to SGLang via NCCL broadcast.
-    Follows TorchRL's SGLangCollectiveTransport pattern exactly:
-      1. HTTP POST all param metadata (SGLang enqueues async recvs, returns 200)
-      2. pynccl_comm.broadcast() each tensor on CUDA stream (non-blocking)
-      3. torch.cuda.synchronize() to ensure all transfers complete
+    Save the updated LoRA adapter to a temp dir and hot-reload it in SGLang.
+    Called after each optimizer step so SGLang always generates with the latest policy.
     """
-    import requests, threading
+    import requests, tempfile, os
 
-    global _pynccl_comm
-    if _pynccl_comm is None:
-        raise RuntimeError("[SGLang] sync_weights_to_sglang called but NCCL communicator is None")
+    global _lora_temp_dir
+    if _lora_temp_dir is None:
+        import tempfile as _tmp
+        _lora_temp_dir = _tmp.mkdtemp(prefix="kf_lora_sync_")
 
-    # Merge LoRA deltas into base weights (CPU to avoid OOM)
-    params_to_sync = []
-    for name, module in model.named_modules():
-        if not (hasattr(module, 'lora_A') and hasattr(module, 'lora_B')
-                and 'default' in getattr(module, 'lora_A', {})):
-            continue
-        if not hasattr(module, 'weight') or module.weight is None:
-            continue
-        try:
-            with torch.no_grad():
-                lora_A  = module.lora_A['default'].weight.detach().cpu()
-                lora_B  = module.lora_B['default'].weight.detach().cpu()
-                s       = module.scaling
-                scaling = s['default'] if isinstance(s, dict) else float(s)
-                delta   = (lora_B.float() @ lora_A.float()) * scaling
-                base_w  = module.weight.data.detach().cpu()
-                merged  = (base_w.float() + delta).to(torch.bfloat16).cuda().contiguous()
-            param_name = name + ".weight"
-            for pfx in ("base_model.model.", "base_model."):
-                if param_name.startswith(pfx):
-                    param_name = param_name[len(pfx):]
-                    break
-            params_to_sync.append((param_name, merged))
-        except Exception as e:
-            print(f"[SGLang] Merge error ({name}): {e}")
+    lora_path = os.path.join(_lora_temp_dir, "adapter")
+    os.makedirs(lora_path, exist_ok=True)
 
-    if not params_to_sync:
-        return
+    # Save only the LoRA adapter weights (small — ~100MB)
+    model.save_pretrained(lora_path)
 
-    all_names  = [p for p, _ in params_to_sync]
-    all_shapes = [list(t.shape) for _, t in params_to_sync]
-    all_dtypes = ["bfloat16"] * len(params_to_sync)
+    # Hot-reload in SGLang
+    try:
+        r = requests.post(
+            f"http://localhost:{port}/load_lora_adapter",
+            json={"lora_name": _LORA_NAME, "lora_path": lora_path},
+            timeout=60,
+        )
+        if r.status_code == 200:
+            print(f"[SGLang] LoRA hot-reloaded (step saved → {lora_path})")
+        else:
+            print(f"[SGLang] load_lora_adapter: status={r.status_code} {r.text[:200]}")
+    except Exception as e:
+        print(f"[SGLang] load_lora_adapter failed: {e}")
 
-    # HTTP POST in background thread — SGLang enqueues async recvs on its CUDA
-    # stream and returns 200 (PyNcclCommunicator is non-blocking at Python level).
-    http_result = [None]
-    http_body   = [None]
-    def _post():
-        try:
-            r = requests.post(
-                f"http://localhost:{port}/update_weights_from_distributed",
-                json={"names": all_names, "dtypes": all_dtypes, "shapes": all_shapes},
-                timeout=600,
-            )
-            http_result[0] = r.status_code
-            http_body[0]   = r.text[:200]
-        except Exception as e:
-            http_result[0] = -1
-            http_body[0]   = str(e)
-    t = threading.Thread(target=_post, daemon=True)
-    t.start()
-
-    # Broadcast each tensor on the CUDA stream (matches SGLang's recv order)
-    stream = torch.cuda.current_stream()
-    n_synced = 0
-    for _, tensor in params_to_sync:
-        _pynccl_comm.broadcast(tensor, src=0, stream=stream)
-        n_synced += 1
-
-    torch.cuda.synchronize()  # ensure all NCCL transfers complete before next step
-    t.join(timeout=660)
-
-    if http_result[0] != 200:
-        print(f"[SGLang] update_weights_from_distributed: status={http_result[0]} {http_body[0]}")
-
+    # Flush stale KV cache (entries computed with old weights are invalid)
     try:
         requests.post(f"http://localhost:{port}/flush_cache", timeout=30)
     except Exception:
         pass
 
-    print(f"[SGLang] Weight sync: {n_synced}/{len(params_to_sync)} params via NCCL")
+
 
 
 def _generate_with_sglang(context_texts: list[str], config: "GRPOConfig") -> list[str]:
@@ -516,6 +358,7 @@ def _generate_with_sglang(context_texts: list[str], config: "GRPOConfig") -> lis
     import requests
     payload = {
         "text": context_texts,
+        "lora_name": _LORA_NAME,
         "sampling_params": {
             "max_new_tokens": config.max_new_tokens,
             "temperature": config.temperature,
@@ -959,16 +802,6 @@ def train(config: GRPOConfig = None):
         )
         atexit.register(lambda: _sglang_server.terminate() if _sglang_server else None)
         print(f"[SGLang] Server running on port {config.sglang_port} (TP={config.sglang_tp})")
-        # Initialize NCCL communicator synchronously — weight sync is critical,
-        # failing silently means training runs with a stale inference policy.
-        ok = init_weight_sync_group(
-            config.sglang_port, config.sglang_tp, config.sglang_python or None
-        )
-        if not ok:
-            raise RuntimeError(
-                "[SGLang] NCCL communicator init failed — cannot proceed without weight sync. "
-                "Check that SGLANG_PYTHON points to the SGLang venv and the server is healthy."
-            )
 
     if not config.mock_mode:
         wandb.init(
@@ -1025,6 +858,10 @@ def train(config: GRPOConfig = None):
 
             torch.cuda.empty_cache()
 
+            # ── Sleep SGLang to free VRAM for the backward pass ─────────
+            if not config.mock_mode and config.use_sglang:
+                release_sglang_memory(config.sglang_port)
+
             # ── Collect old log probs (before gradient updates) ─────────
             model.eval()
             all_old_lps: list[list[list[torch.Tensor]]] = []  # [B][G][turns]
@@ -1065,9 +902,10 @@ def train(config: GRPOConfig = None):
             # schedule completes in the expected number of training steps.
             scheduler.step()
 
-            # Sync updated weights to SGLang via NCCL broadcast
+            # ── Wake SGLang and hot-reload updated LoRA ──────────────────
             if not config.mock_mode and config.use_sglang:
-                sync_weights_to_sglang(model, config.sglang_port)
+                resume_sglang_memory(config.sglang_port)
+                sync_lora_to_sglang(model, config.sglang_port)
 
             # Log metrics and print loss (always, not just when using SGLang)
             if not config.mock_mode:
