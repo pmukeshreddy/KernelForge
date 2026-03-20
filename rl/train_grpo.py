@@ -189,6 +189,8 @@ Now write the complete model_new.py for the following operation:
 # ---------------------------------------------------------------------------
 
 _sglang_server = None  # global handle so we can shut it down at exit
+_weight_sync_group = None  # NCCL process group for weight sync
+_NCCL_MASTER_PORT = 65501  # separate port from SGLang HTTP port
 
 
 def launch_sglang_server(model_path: str, adapter_path: str, port: int, tp: int,
@@ -266,22 +268,88 @@ def launch_sglang_server(model_path: str, adapter_path: str, port: int, tp: int,
     raise RuntimeError(f"SGLang server failed to start on port {port}")
 
 
+def init_weight_sync_group(port: int, tp_size: int = 1) -> bool:
+    """
+    Initialize NCCL process group for weight sync between trainer and SGLang.
+    This is the correct cross-process approach used by verl/OpenRLHF/TorchRL.
+
+    - Trainer joins as rank 0
+    - SGLang worker(s) join as ranks 1..tp_size
+    - NCCL handles the actual tensor transfer — no serialization needed
+    """
+    import requests, time
+    import torch.distributed as dist
+
+    global _weight_sync_group
+
+    if dist.is_initialized():
+        print("[SGLang] torch.distributed already initialized — skipping NCCL group init.")
+        return False
+
+    master_addr = "localhost"
+    master_port = _NCCL_MASTER_PORT
+    world_size = tp_size + 1  # trainer + SGLang worker(s)
+
+    # Tell SGLang to join the NCCL group (non-blocking on SGLang side)
+    try:
+        resp = requests.post(
+            f"http://localhost:{port}/init_weights_update_group",
+            json={
+                "master_address": master_addr,
+                "master_port": master_port,
+                "rank_offset": 1,          # SGLang workers take ranks 1..tp_size
+                "world_size": world_size,
+                "group_name": "kf_weight_sync",
+                "backend": "nccl",
+            },
+            timeout=120,
+        )
+        if resp.status_code != 200:
+            print(f"[SGLang] init_weights_update_group failed: {resp.status_code} {resp.text[:200]}")
+            return False
+    except Exception as e:
+        print(f"[SGLang] init_weights_update_group error: {e}")
+        return False
+
+    # Give SGLang time to start its NCCL init before we rendezvous
+    time.sleep(5)
+
+    # Trainer joins as rank 0 — this blocks until SGLang also connects
+    try:
+        dist.init_process_group(
+            backend="nccl",
+            init_method=f"tcp://{master_addr}:{master_port}",
+            world_size=world_size,
+            rank=0,
+        )
+        _weight_sync_group = dist.GroupMember.WORLD
+        print(f"[SGLang] NCCL weight sync group initialized (world_size={world_size})")
+        return True
+    except Exception as e:
+        print(f"[SGLang] NCCL group init failed: {e}")
+        return False
+
+
 def sync_weights_to_sglang(model, port: int):
     """
-    Push updated LoRA-merged weights to SGLang via update_weights_from_tensor.
+    Push updated LoRA-merged weights to SGLang via NCCL broadcast.
 
-    SGLang expects:
-      serialized_named_tensors: List[str]  — one element per TP rank (TP=1 → list of 1)
-      Each element = pickle.dumps(dict[name, cpu_tensor]) → base64 string
+    Correct cross-process approach (used by verl, OpenRLHF, TorchRL):
+      1. Signal SGLang via HTTP with parameter name/dtype/shape
+      2. NCCL broadcast the merged tensor from trainer (rank 0) to SGLang (rank 1)
+      3. Flush KV cache so stale cached prompts are invalidated
 
-    NOTE: Must use regular pickle (not ForkingPickler) — ForkingPickler uses
-    file-descriptor sharing which requires same process auth key. SGLang is a
-    separate process so FDs are invalid across the boundary.
+    No serialization, no pickle, no size limit.
     """
-    import requests, base64, io, pickle
+    import requests
+    import torch.distributed as dist
 
-    # Collect all merged tensors: W_merged = W_base + lora_B @ lora_A * scaling
-    named_tensors = {}
+    global _weight_sync_group
+    if _weight_sync_group is None or not dist.is_initialized():
+        print("[SGLang] NCCL group not initialized — skipping weight sync.")
+        return
+
+    params_to_sync = []
     for name, module in model.named_modules():
         if not (hasattr(module, 'lora_A') and hasattr(module, 'lora_B')
                 and 'default' in getattr(module, 'lora_A', {})):
@@ -295,43 +363,48 @@ def sync_weights_to_sglang(model, port: int):
                 s = module.scaling
                 scaling = s['default'] if isinstance(s, dict) else float(s)
                 delta = (lora_B.float() @ lora_A.float()) * scaling
-                # Must be CPU tensor — GPU tensors use FD sharing in pickle which breaks cross-process
-                merged = (module.weight.data.float() + delta).contiguous().cpu()
+                # Keep on GPU for NCCL broadcast
+                merged = (module.weight.data.float() + delta).contiguous().cuda()
 
             param_name = name + ".weight"
             for pfx in ("base_model.model.", "base_model."):
                 if param_name.startswith(pfx):
                     param_name = param_name[len(pfx):]
                     break
-            named_tensors[param_name] = merged
+            params_to_sync.append((param_name, merged))
         except Exception as e:
             print(f"[SGLang] Merge error ({name}): {e}")
 
-    if not named_tensors:
-        print("[SGLang] No LoRA tensors found to sync.")
-        return
+    n_synced = 0
+    for param_name, tensor in params_to_sync:
+        try:
+            # Signal SGLang to prepare to receive this parameter
+            resp = requests.post(
+                f"http://localhost:{port}/update_weights_from_distributed",
+                json={
+                    "name": param_name,
+                    "dtype": "float32",
+                    "shape": list(tensor.shape),
+                },
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                print(f"[SGLang] update signal failed ({param_name}): {resp.status_code}")
+                continue
+            # NCCL broadcast: trainer rank 0 → SGLang rank 1
+            dist.broadcast(tensor, src=0, group=_weight_sync_group)
+            torch.cuda.synchronize()
+            n_synced += 1
+        except Exception as e:
+            print(f"[SGLang] Sync error ({param_name}): {e}")
+            break
 
-    # Regular pickle serializes CPU tensors as raw bytes (no file descriptors)
-    serialized = base64.b64encode(pickle.dumps(named_tensors)).decode("utf-8")
-
-    # TP=1 → list of one serialized dict
-    payload = {
-        "serialized_named_tensors": [serialized],
-        "load_format": None,
-        "flush_cache": True,
-    }
     try:
-        resp = requests.post(
-            f"http://localhost:{port}/update_weights_from_tensor",
-            json=payload,
-            timeout=300,
-        )
-        if resp.status_code == 200:
-            print(f"[SGLang] Weight sync: {len(named_tensors)} tensors pushed OK")
-        else:
-            print(f"[SGLang] Sync failed: {resp.status_code} {resp.text[:200]}")
-    except Exception as e:
-        print(f"[SGLang] Sync error: {e}")
+        requests.post(f"http://localhost:{port}/flush_cache", timeout=30)
+    except Exception:
+        pass
+
+    print(f"[SGLang] Weight sync: {n_synced}/{len(params_to_sync)} params via NCCL")
 
 
 def _generate_with_sglang(context_texts: list[str], config: "GRPOConfig") -> list[str]:
@@ -786,6 +859,8 @@ def train(config: GRPOConfig = None):
         )
         atexit.register(lambda: _sglang_server.terminate() if _sglang_server else None)
         print(f"[SGLang] Server running on port {config.sglang_port} (TP={config.sglang_tp})")
+        # Initialize NCCL group for weight sync (correct cross-process approach)
+        init_weight_sync_group(config.sglang_port, tp_size=config.sglang_tp)
 
     if not config.mock_mode:
         wandb.init(
@@ -882,11 +957,9 @@ def train(config: GRPOConfig = None):
             # schedule completes in the expected number of training steps.
             scheduler.step()
 
-            # Weight sync disabled: SGLang's SafeUnpickler rejects our serialization format
-            # and crashes the SGLang scheduler, killing the server. Off-policy generation
-            # (stale SFT weights in SGLang) is fine — GRPO clips the importance ratio.
-            # if not config.mock_mode and config.use_sglang and (SGLANG_AVAILABLE or config.sglang_python):
-            #     sync_weights_to_sglang(model, config.sglang_port)
+            # Sync updated weights to SGLang via NCCL broadcast
+            if not config.mock_mode and config.use_sglang:
+                sync_weights_to_sglang(model, config.sglang_port)
 
             # Log metrics and print loss (always, not just when using SGLang)
             if not config.mock_mode:
