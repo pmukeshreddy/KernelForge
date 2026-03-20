@@ -615,41 +615,51 @@ def _get_token_log_probs(
     return token_log_probs
 
 
-def _compute_grpo_loss(
+def _compute_grpo_loss_and_backward(
     model,
     group_turns: list[list[TurnData]],
     group_rewards: list[list[float]],
     old_log_probs: list[list[torch.Tensor]],
     config: GRPOConfig,
-) -> torch.Tensor:
+) -> float:
     """
     GRPO loss with Kevin's multi-turn discounted advantages.
+    Calls backward() one sequence at a time to avoid OOM from holding
+    G×T=32 computation graphs simultaneously.
 
-    1. Discounted return:      R_i_t = Σ_{k=t}^{T-1} γ^{k-t} * r_i_k
-    2. Per-turn group norm:    A_i_t = (R_i_t - mean_t) / (std_t + ε)
-       (normalize over all G trajectories at each turn, not across turns)
-    3. Token-level DAPO Clip-Higher: asymmetric clip [1-ε_lo, 1+ε_hi]
-    4. Dr. GRPO per-sequence mean: long think-only responses get equal gradient
-    5. Entropy bonus: prevents collapse
+    1. Discounted return:   R_i_t = Σ_{k=t}^{T-1} γ^{k-t} * r_i_k
+    2. Per-turn group norm: A_i_t = (R_i_t - mean_t) / (std_t + ε)
+    3. Token-level DAPO Clip-Higher
+    4. Dr. GRPO per-sequence mean
+    5. Entropy bonus
+
+    Returns scalar loss value for logging (gradients already applied).
     """
     G = len(group_rewards)
     T = len(group_rewards[0])
-    device = next(model.parameters()).device
 
     # Discounted returns [G, T]
-    rewards_t = torch.tensor(group_rewards, dtype=torch.float32)  # [G, T]
+    rewards_t = torch.tensor(group_rewards, dtype=torch.float32)
     disc_returns = torch.zeros(G, T, dtype=torch.float32)
     for t in range(T):
         for k in range(t, T):
             disc_returns[:, t] += (config.gamma ** (k - t)) * rewards_t[:, k]
 
     # Per-turn group normalization → advantages [G, T]
-    mean_t = disc_returns.mean(dim=0, keepdim=True)   # [1, T]
-    std_t  = disc_returns.std(dim=0, keepdim=True) + 1e-8
-    advantages = (disc_returns - mean_t) / std_t       # [G, T]
+    mean_t = disc_returns.mean(dim=0, keepdim=True)
+    std_t  = disc_returns.std(dim=0,  keepdim=True) + 1e-8
+    advantages = (disc_returns - mean_t) / std_t
 
-    token_losses  = []
-    entropy_terms = []
+    # Count valid sequences upfront for loss normalization
+    n_seqs = sum(
+        1 for i in range(G)
+        for (_, resp) in group_turns[i]
+        if len(resp) > 0
+    )
+    if n_seqs == 0:
+        return 0.0
+
+    total_loss = 0.0
 
     for i in range(G):
         for turn_idx, (ctx, resp) in enumerate(group_turns[i]):
@@ -664,23 +674,19 @@ def _compute_grpo_loss(
             ratio   = torch.exp(new_lp - old_lp.detach())
             clipped = torch.clamp(ratio, 1.0 - config.cliprange_low, 1.0 + config.cliprange_high)
 
-            # Dr. GRPO: per-sequence mean so length doesn't dilute gradient
             seq_loss = -torch.min(ratio * float(A_i_t), clipped * float(A_i_t))
-            token_losses.append(seq_loss.mean())
+            loss_term = seq_loss.mean()
 
             if config.entropy_coef > 0:
-                entropy_terms.append(-new_lp.mean())
+                loss_term = loss_term - config.entropy_coef * (-new_lp.mean())
 
-    if not token_losses:
-        return torch.tensor(0.0, device=device, requires_grad=True)
+            # Divide by n_seqs so the sum of all backward() calls = proper mean loss.
+            # Call backward immediately — frees this sequence's computation graph,
+            # keeping peak activation memory to 1 sequence at a time.
+            (loss_term / n_seqs).backward()
+            total_loss += loss_term.item()
 
-    policy_loss = torch.stack(token_losses).mean()
-
-    if entropy_terms and config.entropy_coef > 0:
-        entropy = torch.stack(entropy_terms).mean()
-        return policy_loss - config.entropy_coef * entropy
-
-    return policy_loss
+    return total_loss / n_seqs
 
 
 def _run_evaluation(model, tokenizer, config: GRPOConfig, val_prompts: list[str]) -> dict:
@@ -977,11 +983,12 @@ def train(config: GRPOConfig = None):
                 for group_turns, group_rewards, group_old_lps in zip(
                     all_group_turns, all_group_rewards, all_old_lps
                 ):
-                    loss = _compute_grpo_loss(
+                    # backward() called per-sequence inside to avoid OOM from
+                    # holding G×T computation graphs simultaneously
+                    loss_val = _compute_grpo_loss_and_backward(
                         model, group_turns, group_rewards, group_old_lps, config
                     )
-                    loss.backward()
-                    total_loss_val += loss.item()
+                    total_loss_val += loss_val
 
                 torch.nn.utils.clip_grad_norm_(trainable_params, config.max_grad_norm)
                 optimizer.step()
