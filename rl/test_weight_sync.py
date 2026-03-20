@@ -78,10 +78,22 @@ def test_weight_sync(model_path: str, port: int, sglang_python: str, tp: int = 1
         print("    OK")
 
         # ── 3. Init NCCL group ───────────────────────────────────────────────
-        # TorchRL pattern: HTTP first (SGLang schedules its side and returns 200
-        # immediately), then trainer creates StatelessProcessGroup (listens).
+        # /init_weights_update_group blocks on SGLang's side until rendezvous.
+        # Start rank-0 listener first, then send HTTP so SGLang can connect.
         print("[3] Initializing NCCL communicator...")
+        import threading as _threading
         world_size = tp + 1
+        pg_result = [None]
+
+        def _create_pg():
+            pg_result[0] = StatelessProcessGroup.create(
+                host="localhost", port=NCCL_PORT, rank=0, world_size=world_size
+            )
+
+        pg_thread = _threading.Thread(target=_create_pg, daemon=True)
+        pg_thread.start()
+        time.sleep(1)  # ensure listener is up
+
         r = requests.post(
             f"http://localhost:{port}/init_weights_update_group",
             json={
@@ -92,17 +104,15 @@ def test_weight_sync(model_path: str, port: int, sglang_python: str, tp: int = 1
                 "group_name": "weight_update_group",
                 "backend": "nccl",
             },
-            timeout=60,
+            timeout=120,
         )
         print(f"    init_weights_update_group → {r.status_code}")
         assert r.status_code == 200, f"failed: {r.text[:200]}"
-        time.sleep(0.2)
 
+        pg_thread.join(timeout=30)
+        assert pg_result[0] is not None, "StatelessProcessGroup.create() timed out"
         device = 0
-        pg = StatelessProcessGroup.create(
-            host="localhost", port=NCCL_PORT, rank=0, world_size=world_size
-        )
-        comm = PyNcclCommunicator(pg, device=torch.device(f"cuda:{device}"))
+        comm = PyNcclCommunicator(pg_result[0], device=torch.device(f"cuda:{device}"))
         print("    NCCL communicator ready")
 
         # ── 4. Pick one real parameter from the model ────────────────────────

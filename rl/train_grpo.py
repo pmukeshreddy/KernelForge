@@ -372,9 +372,28 @@ def init_weight_sync_group(port: int, tp_size: int = 1, sglang_python: str = Non
         except Exception as e:
             http_result[0] = str(e)
 
-    # TorchRL pattern: HTTP first (SGLang schedules its side async, returns 200
-    # immediately), THEN trainer creates StatelessProcessGroup (starts listening).
-    # SGLang's background task then connects — both sides rendezvous.
+    # /init_weights_update_group is synchronous on SGLang's side — it blocks
+    # until StatelessProcessGroup rendezvous completes. So both sides must run
+    # concurrently: trainer starts listening (rank 0) first, then we send HTTP
+    # so SGLang (rank 1) connects to the already-listening trainer.
+    pg_result = [None]
+    pg_error  = [None]
+
+    def _create_pg():
+        try:
+            device = torch.cuda.current_device()
+            pg = StatelessProcessGroup.create(
+                host=master_addr, port=master_port, rank=0, world_size=world_size
+            )
+            pg_result[0] = (pg, device)
+        except Exception as e:
+            import traceback as _tb
+            pg_error[0] = _tb.format_exc()
+
+    pg_thread = threading.Thread(target=_create_pg, daemon=True)
+    pg_thread.start()
+    time.sleep(1)  # ensure TCP listener is up before SGLang tries to connect
+
     try:
         r = requests.post(
             f"http://localhost:{port}/init_weights_update_group",
@@ -386,7 +405,7 @@ def init_weight_sync_group(port: int, tp_size: int = 1, sglang_python: str = Non
                 "group_name": "weight_update_group",
                 "backend": "nccl",
             },
-            timeout=60,
+            timeout=120,
         )
         print(f"[SGLang] init_weights_update_group → {r.status_code}")
         r.raise_for_status()
@@ -394,20 +413,15 @@ def init_weight_sync_group(port: int, tp_size: int = 1, sglang_python: str = Non
         print(f"[SGLang] init_weights_update_group failed: {e}")
         return False
 
-    time.sleep(0.2)  # brief pause so SGLang's async task starts before we listen
-
-    try:
-        device = torch.cuda.current_device()
-        pg = StatelessProcessGroup.create(
-            host=master_addr, port=master_port, rank=0, world_size=world_size
-        )
-        _pynccl_comm = PyNcclCommunicator(pg, device=torch.device(f"cuda:{device}"))
-        print(f"[SGLang] NCCL communicator ready (world_size={world_size}, device=cuda:{device})")
-        return True
-    except Exception as e:
-        import traceback as _tb
-        print(f"[SGLang] NCCL init failed: {e}\n{_tb.format_exc()}")
+    pg_thread.join(timeout=30)
+    if pg_error[0] or pg_result[0] is None:
+        print(f"[SGLang] StatelessProcessGroup failed:\n{pg_error[0]}")
         return False
+
+    pg, device = pg_result[0]
+    _pynccl_comm = PyNcclCommunicator(pg, device=torch.device(f"cuda:{device}"))
+    print(f"[SGLang] NCCL communicator ready (world_size={world_size}, device=cuda:{device})")
+    return True
 
 
 def sync_weights_to_sglang(model, port: int):
