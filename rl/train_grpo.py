@@ -283,8 +283,8 @@ def launch_sglang_server(model_path: str, adapter_path: str, port: int, tp: int,
         "--enable-lora",
         "--lora-paths", f"{_LORA_NAME}={adapter_path}",
         "--max-loras-per-batch", "1",
-        "--mem-fraction-static", "0.5",
-        "--context-length", "10240",
+        "--mem-fraction-static", "0.45",
+        "--context-length", "16384",
         "--log-level", "error",
     ]
 
@@ -394,8 +394,34 @@ def sync_lora_to_sglang(model, port: int):
 
 def _sglang_post(port: int, contexts: list[str], max_new_tokens: int,
                  temperature: float, stop: list[str]) -> list[str]:
-    """Raw SGLang /generate call. Returns full text (context + completion)."""
+    """
+    Raw SGLang /generate call. Returns full text (context + completion).
+    If a batch request fails (e.g. context too long), falls back to
+    per-request calls so one long context doesn't crash the whole batch.
+    """
     import requests
+
+    def _single(ctx):
+        payload = {
+            "text": ctx,
+            "lora_name": _LORA_NAME,
+            "sampling_params": {
+                "max_new_tokens": max_new_tokens,
+                "temperature": temperature,
+                "top_p": 1.0 if temperature == 0.0 else 0.95,
+                "stop": stop,
+            },
+        }
+        try:
+            r = requests.post(f"http://localhost:{port}/generate", json=payload, timeout=600)
+            r.raise_for_status()
+            res = r.json()
+            return res["text"] if isinstance(res, dict) else res[0]["text"]
+        except Exception as e:
+            print(f"  [SGLang] single request failed (context too long?): {e}")
+            return ctx  # return context unchanged → empty completion
+
+    # Try batch first (fast path)
     payload = {
         "text": contexts,
         "lora_name": _LORA_NAME,
@@ -406,12 +432,17 @@ def _sglang_post(port: int, contexts: list[str], max_new_tokens: int,
             "stop": stop,
         },
     }
-    resp = requests.post(f"http://localhost:{port}/generate", json=payload, timeout=600)
-    resp.raise_for_status()
-    result = resp.json()
-    if isinstance(result, list):
-        return [r["text"] for r in result]
-    return [result["text"]]
+    try:
+        resp = requests.post(f"http://localhost:{port}/generate", json=payload, timeout=600)
+        resp.raise_for_status()
+        result = resp.json()
+        if isinstance(result, list):
+            return [r["text"] for r in result]
+        return [result["text"]]
+    except Exception:
+        # Batch failed — fall back to per-request so one bad context doesn't kill all 8
+        print("  [SGLang] Batch request failed, falling back to per-request mode...")
+        return [_single(ctx) for ctx in contexts]
 
 
 def _generate_with_sglang(context_texts: list[str], config: "GRPOConfig") -> list[str]:
