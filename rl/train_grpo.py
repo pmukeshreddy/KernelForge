@@ -86,11 +86,16 @@ class GRPOConfig:
     # GRPO + DAPO hyperparameters
     grpo_epochs: int = 2              # gradient updates per batch
     batch_size: int = 4               # prompts per batch
-    learning_rate: float = 1e-6
+    learning_rate: float = 2e-6
     warmup_steps: int = 10            # cosine schedule warmup (noisy advantages early in training)
     cliprange_low: float = 0.2        # standard lower clip
     cliprange_high: float = 0.28      # DAPO Clip-Higher (asymmetric)
-    max_grad_norm: float = 1.0
+    max_grad_norm: float = 0.05
+
+    # Multi-turn (Kevin's recipe): T refinement turns per trajectory
+    # γ=0.4 discounts later turns so getting it right on turn 1 is worth more.
+    num_turns: int = 4
+    gamma: float = 0.4
 
     # Generation
     max_new_tokens: int = 6000
@@ -187,6 +192,51 @@ Now write the complete model_new.py for the following operation:
 """
 
 
+
+
+# ---------------------------------------------------------------------------
+# Multi-turn helpers (Kevin's recipe)
+# ---------------------------------------------------------------------------
+
+def _strip_thinking(text: str) -> str:
+    """Remove <think>...</think> blocks so inter-turn context stays clean and short."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
+    return text.strip()
+
+
+def _build_turn_feedback(eval_res: dict | None) -> str:
+    """Build the user feedback message shown to the model at the start of the next turn."""
+    if eval_res is None:
+        return (
+            "Your previous response could not be evaluated. "
+            "Please write a complete, valid CUDA kernel using load_inline()."
+        )
+    if not eval_res.get("compiles", False):
+        err = (eval_res.get("compiler_error") or "Unknown error")[:400]
+        return (
+            f"Your previous kernel failed to compile:\n{err}\n\n"
+            "Please fix the error and write the corrected kernel."
+        )
+    if not eval_res.get("correct", False):
+        err = (eval_res.get("compiler_error") or "Outputs do not match reference")[:400]
+        return (
+            f"Your previous kernel compiled but produced incorrect outputs:\n{err}\n\n"
+            "Please fix the correctness issue and write the corrected kernel."
+        )
+    rt = eval_res.get("runtime_ms")
+    bt = eval_res.get("baseline_runtime_ms")
+    if rt and bt:
+        speedup = bt / rt
+        return (
+            f"Your previous kernel was correct and ran at {speedup:.2f}x speedup over PyTorch. "
+            "Good work! Now try to push the performance further — optimize memory access patterns, "
+            "use shared memory, increase parallelism, or tune block dimensions."
+        )
+    return (
+        "Your previous kernel was correct. "
+        "Try to optimize it further for better GPU performance."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -384,117 +434,144 @@ def _run_group_episodes(
     model,
     tokenizer,
     config: GRPOConfig,
-) -> tuple[list[list[TurnData]], list[float]]:
+) -> tuple[list[list[TurnData]], list[list[float]]]:
     """
-    Generate G trajectories for one prompt, evaluate in parallel, return rewards.
+    Generate G trajectories × T turns (Kevin's multi-turn recipe).
+
+    Each turn: generate → evaluate → build feedback → build next-turn context.
+    Thinking is stripped from inter-turn context so the model only sees its code + feedback.
 
     Returns:
-      group_turns:   list[G] of single-element turn lists [(ctx_ids, resp_ids)]
-      group_rewards: list[G] of scalar rewards
+      group_turns:   list[G] of list[T] of (ctx_ids, resp_ids)
+      group_rewards: list[G] of list[T] of scalar rewards
     """
     G = config.group_size
+    T = config.num_turns
 
-    user_msg = f"{FORMAT_EXAMPLE}Reference Program:\n```python\n{prompt_text}\n```"
     sys_content = get_system_prompt().replace("<|im_start|>system\n", "").replace("<|im_end|>\n", "").strip()
-    messages = [
+    user_msg = f"{FORMAT_EXAMPLE}Reference Program:\n```python\n{prompt_text}\n```"
+    base_messages = [
         {"role": "system", "content": sys_content},
         {"role": "user", "content": user_msg},
     ]
-    prompt_str = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    context_texts = [prompt_str] * G
 
-    # 1. Generate G completions
-    if not config.mock_mode:
-        if config.use_sglang and (SGLANG_AVAILABLE or config.sglang_python):
-            t_gen = time.time()
-            print(f"  Generating {G} responses...", end=" ", flush=True)
-            raw_completions = _generate_with_sglang(context_texts, config)
-            print(f"done ({time.time()-t_gen:.1f}s)")
-            generated_texts = []
-            for ctx, full in zip(context_texts, raw_completions):
-                completion = full[len(ctx):] if full.startswith(ctx) else full
-                generated_texts.append(completion)
+    group_turns:   list[list[TurnData]]   = [[] for _ in range(G)]
+    group_rewards: list[list[float]]      = [[] for _ in range(G)]
+
+    # Per-trajectory conversation state across turns
+    traj_responses: list[list[str]]  = [[] for _ in range(G)]  # raw completions (keep <think>)
+    traj_evals:     list[list[dict]] = [[] for _ in range(G)]  # eval results per turn
+
+    for turn_idx in range(T):
+        turn_label = f"Turn {turn_idx+1}/{T}"
+
+        # Build context texts: base prompt + [stripped_response + feedback] for each prior turn
+        context_texts = []
+        for i in range(G):
+            msgs = list(base_messages)
+            for t in range(turn_idx):
+                stripped = _strip_thinking(traj_responses[i][t])
+                msgs.append({"role": "assistant", "content": stripped})
+                msgs.append({"role": "user", "content": _build_turn_feedback(traj_evals[i][t])})
+            context_texts.append(
+                tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+            )
+
+        # Generate G completions for this turn
+        if not config.mock_mode:
+            if config.use_sglang and (SGLANG_AVAILABLE or config.sglang_python):
+                t_gen = time.time()
+                print(f"  [{turn_label}] Generating {G} responses...", end=" ", flush=True)
+                raw_completions = _generate_with_sglang(context_texts, config)
+                print(f"done ({time.time()-t_gen:.1f}s)")
+                completions = [
+                    full[len(ctx):] if full.startswith(ctx) else full
+                    for ctx, full in zip(context_texts, raw_completions)
+                ]
+            else:
+                tokenizer.padding_side = "left"
+                inputs = tokenizer(context_texts, return_tensors="pt", padding=True)
+                input_ids_tensor = inputs.input_ids.to(next(model.parameters()).device)
+                attention_mask = inputs.attention_mask.to(next(model.parameters()).device)
+                with torch.no_grad():
+                    outputs = model.generate(
+                        input_ids=input_ids_tensor,
+                        attention_mask=attention_mask,
+                        max_new_tokens=config.max_new_tokens,
+                        temperature=config.temperature,
+                        do_sample=True,
+                        pad_token_id=tokenizer.eos_token_id,
+                    )
+                completions = [
+                    tokenizer.decode(outputs[i][input_ids_tensor[i].shape[0]:], skip_special_tokens=True)
+                    for i in range(G)
+                ]
         else:
-            tokenizer.padding_side = "left"
-            inputs = tokenizer(context_texts, return_tensors="pt", padding=True)
-            input_ids_tensor = inputs.input_ids.to(next(model.parameters()).device)
-            attention_mask = inputs.attention_mask.to(next(model.parameters()).device)
-            with torch.no_grad():
-                outputs = model.generate(
-                    input_ids=input_ids_tensor,
-                    attention_mask=attention_mask,
-                    max_new_tokens=config.max_new_tokens,
-                    temperature=config.temperature,
-                    do_sample=True,
-                    pad_token_id=tokenizer.eos_token_id,
-                )
-            generated_texts = [
-                tokenizer.decode(outputs[i][input_ids_tensor[i].shape[0]:], skip_special_tokens=True)
-                for i in range(G)
-            ]
-    else:
-        generated_texts = [
-            "```python\nimport torch\nimport torch.nn as nn\nclass ModelNew(nn.Module):\n    def forward(self, a): return a\n```"
-        ] * G
+            completions = [
+                "```python\nimport torch\nimport torch.nn as nn\nclass ModelNew(nn.Module):\n    def forward(self, a): return a\n```"
+            ] * G
 
-    # 2. Tokenize context + response for GRPO loss computation
-    turns_list: list[list[TurnData]] = []
-    for i, gen_text in enumerate(generated_texts):
-        if config.mock_mode:
-            ctx_ids = torch.tensor([1, 2, 3])
-            resp_ids = torch.tensor([4, 5, 6])
-        else:
-            ctx_ids = tokenizer(context_texts[i], return_tensors="pt").input_ids[0]
-            resp_ids = tokenizer(gen_text, return_tensors="pt").input_ids[0]
-        turns_list.append([(ctx_ids.cpu(), resp_ids.cpu())])
+        # Tokenize context + response for GRPO loss
+        for i, (ctx_text, gen_text) in enumerate(zip(context_texts, completions)):
+            if config.mock_mode:
+                ctx_ids  = torch.tensor([1, 2, 3])
+                resp_ids = torch.tensor([4, 5, 6])
+            else:
+                ctx_ids  = tokenizer(ctx_text, return_tensors="pt").input_ids[0]
+                resp_ids = tokenizer(gen_text,  return_tensors="pt").input_ids[0]
+            group_turns[i].append((ctx_ids.cpu(), resp_ids.cpu()))
 
-    # 3. Extract complete model_new.py from model output — no wrapper needed
-    candidates = []
-    for i, gen_text in enumerate(generated_texts):
-        model_new_py = _extract_python_block(gen_text)
-        if i < 2:
-            print(f"  [CODE DUMP traj={i}]:\n{(model_new_py or gen_text)[:800]}")
-        candidates.append(model_new_py if model_new_py else None)
+        # Extract code and evaluate
+        candidates = []
+        for i, gen_text in enumerate(completions):
+            model_new_py = _extract_python_block(gen_text)
+            if turn_idx == 0 and i < 2:
+                print(f"  [CODE DUMP turn=0 traj={i}]:\n{(model_new_py or gen_text)[:800]}")
+            candidates.append(model_new_py if model_new_py else None)
 
-    # 4. Parallel evaluation
-    n_valid = sum(1 for c in candidates if c is not None)
-    t_eval = time.time()
-    print(f"  Evaluating {n_valid}/{G} valid kernels...", end=" ", flush=True)
-    with ProcessPoolExecutor(max_workers=min(G, 16), mp_context=_MP_SPAWN_CTX) as pool:
-        eval_results = list(pool.map(
-            _worker_run_eval,
-            [(c, prompt_text) for c in candidates]
-        ))
-    n_compiled = sum(1 for r in eval_results if r is not None and r.get("compiles", r.get("correct", False)))
-    print(f"done ({time.time()-t_eval:.1f}s) | compiled={n_compiled}/{n_valid}")
+        n_valid = sum(1 for c in candidates if c is not None)
+        t_eval = time.time()
+        print(f"  [{turn_label}] Evaluating {n_valid}/{G} valid kernels...", end=" ", flush=True)
+        with ProcessPoolExecutor(max_workers=min(G, 16), mp_context=_MP_SPAWN_CTX) as pool:
+            eval_results = list(pool.map(
+                _worker_run_eval,
+                [(c, prompt_text) for c in candidates],
+            ))
+        n_compiled = sum(1 for r in eval_results if r is not None and r.get("compiles", False))
+        n_correct  = sum(1 for r in eval_results if r is not None and r.get("correct",  False))
+        print(f"done ({time.time()-t_eval:.1f}s) | compiled={n_compiled}/{n_valid} correct={n_correct}/{G}")
 
-    for i, res in enumerate(eval_results):
-        if res and not res.get("compiles", False) and res.get("compiler_error"):
-            print(f"  [COMPILE ERROR traj={i}]: {res['compiler_error'][:400]}")
+        # Only print compile errors on turn 1 to avoid log spam
+        if turn_idx == 0:
+            for i, res in enumerate(eval_results):
+                if res and not res.get("compiles", False) and res.get("compiler_error"):
+                    print(f"  [COMPILE ERROR traj={i}]: {res['compiler_error'][:300]}")
 
-    # 5. Compute rewards
-    group_rewards = []
-    for i, eval_res in enumerate(eval_results):
-        gen_len = len(turns_list[i][0][1])
-        length_penalty = -config.length_penalty_coef * gen_len  # max ~-0.3 at 3000 tokens
+        # Compute per-turn rewards
+        for i, (eval_res, gen_text) in enumerate(zip(eval_results, completions)):
+            gen_len = len(group_turns[i][turn_idx][1])
+            length_penalty = -config.length_penalty_coef * gen_len
 
-        if candidates[i] is None:
-            # DAPO overlong shaping: extra penalty if response hit the token cap
-            # (model spent all tokens thinking, never produced code)
-            overlong_penalty = -0.5 if gen_len >= int(config.max_new_tokens * 0.95) else 0.0
-            group_rewards.append(config.reward_no_code + length_penalty + overlong_penalty)
-        elif eval_res is None or not eval_res.get("compiles", False):
-            group_rewards.append(config.reward_compile_fail + length_penalty)
-        elif not eval_res["correct"]:
-            group_rewards.append(config.reward_wrong_output + length_penalty)
-        else:
-            reward = config.reward_correct_base + calculate_reward(eval_res) + length_penalty
-            print(f"    ✅ Traj {i}: {eval_res['runtime_ms']:.3f}ms reward={reward:.3f}")
-            group_rewards.append(reward)
+            if candidates[i] is None:
+                overlong_penalty = -0.5 if gen_len >= int(config.max_new_tokens * 0.95) else 0.0
+                r = config.reward_no_code + length_penalty + overlong_penalty
+            elif eval_res is None or not eval_res.get("compiles", False):
+                r = config.reward_compile_fail + length_penalty
+            elif not eval_res["correct"]:
+                r = config.reward_wrong_output + length_penalty
+            else:
+                r = config.reward_correct_base + calculate_reward(eval_res) + length_penalty
+                if i < 3:
+                    print(f"    ✅ Turn {turn_idx+1} Traj {i}: {eval_res['runtime_ms']:.3f}ms reward={r:.3f}")
 
-    return turns_list, group_rewards
+            group_rewards[i].append(r)
+
+        # Store for next-turn context building
+        for i in range(G):
+            traj_responses[i].append(completions[i])
+            traj_evals[i].append(eval_results[i])
+
+    return group_turns, group_rewards
 
 
 # ---------------------------------------------------------------------------
@@ -541,64 +618,62 @@ def _get_token_log_probs(
 def _compute_grpo_loss(
     model,
     group_turns: list[list[TurnData]],
-    group_rewards: list[float],
+    group_rewards: list[list[float]],
     old_log_probs: list[list[torch.Tensor]],
     config: GRPOConfig,
 ) -> torch.Tensor:
     """
-    Compute GRPO loss for one group of G trajectories from the same prompt.
+    GRPO loss with Kevin's multi-turn discounted advantages.
 
-    1. Group-relative advantage: A_i = (r_i - mean) / (std + ε)
-    2. Token-level clipped loss with DAPO Clip-Higher
-    3. Entropy bonus: -entropy_coef * H(π) prevents entropy collapse
+    1. Discounted return:      R_i_t = Σ_{k=t}^{T-1} γ^{k-t} * r_i_k
+    2. Per-turn group norm:    A_i_t = (R_i_t - mean_t) / (std_t + ε)
+       (normalize over all G trajectories at each turn, not across turns)
+    3. Token-level DAPO Clip-Higher: asymmetric clip [1-ε_lo, 1+ε_hi]
+    4. Dr. GRPO per-sequence mean: long think-only responses get equal gradient
+    5. Entropy bonus: prevents collapse
     """
     G = len(group_rewards)
-    rewards = torch.tensor(group_rewards, dtype=torch.float32)
-
-    # Group-relative advantage normalization (the core GRPO idea)
-    mean_r = rewards.mean()
-    std_r = rewards.std() + 1e-8
-    advantages = (rewards - mean_r) / std_r  # [G]
-
+    T = len(group_rewards[0])
     device = next(model.parameters()).device
-    token_losses = []
+
+    # Discounted returns [G, T]
+    rewards_t = torch.tensor(group_rewards, dtype=torch.float32)  # [G, T]
+    disc_returns = torch.zeros(G, T, dtype=torch.float32)
+    for t in range(T):
+        for k in range(t, T):
+            disc_returns[:, t] += (config.gamma ** (k - t)) * rewards_t[:, k]
+
+    # Per-turn group normalization → advantages [G, T]
+    mean_t = disc_returns.mean(dim=0, keepdim=True)   # [1, T]
+    std_t  = disc_returns.std(dim=0, keepdim=True) + 1e-8
+    advantages = (disc_returns - mean_t) / std_t       # [G, T]
+
+    token_losses  = []
     entropy_terms = []
 
     for i in range(G):
-        A_i = advantages[i].item()
-        turns = group_turns[i]
-        old_lps = old_log_probs[i]
-
-        for turn_idx, (ctx, resp) in enumerate(turns):
+        for turn_idx, (ctx, resp) in enumerate(group_turns[i]):
             if len(resp) == 0:
                 continue
 
-            # Current policy log probs (with gradients)
+            A_i_t = advantages[i, turn_idx].item()
+
             new_lp = _get_token_log_probs(model, ctx, resp)
-            old_lp = old_lps[turn_idx].to(new_lp.device)
+            old_lp = old_log_probs[i][turn_idx].to(new_lp.device)
 
-            # Policy ratio
-            ratio = torch.exp(new_lp - old_lp.detach())
+            ratio   = torch.exp(new_lp - old_lp.detach())
+            clipped = torch.clamp(ratio, 1.0 - config.cliprange_low, 1.0 + config.cliprange_high)
 
-            # DAPO Clip-Higher: asymmetric clipping
-            clipped = torch.clamp(
-                ratio,
-                1.0 - config.cliprange_low,
-                1.0 + config.cliprange_high,
-            )
-
-            # Per-sequence mean loss (Dr. GRPO: normalize per-sequence so long
-            # think-only responses don't get weaker per-token signal than short ones)
-            seq_loss = -torch.min(ratio * float(A_i), clipped * float(A_i))
+            # Dr. GRPO: per-sequence mean so length doesn't dilute gradient
+            seq_loss = -torch.min(ratio * float(A_i_t), clipped * float(A_i_t))
             token_losses.append(seq_loss.mean())
 
             if config.entropy_coef > 0:
-                entropy_terms.append(-new_lp.mean())  # per-sequence entropy
+                entropy_terms.append(-new_lp.mean())
 
     if not token_losses:
         return torch.tensor(0.0, device=device, requires_grad=True)
 
-    # Average across sequences — each trajectory contributes equally regardless of length
     policy_loss = torch.stack(token_losses).mean()
 
     if entropy_terms and config.entropy_coef > 0:
@@ -826,8 +901,8 @@ def train(config: GRPOConfig = None):
             batch = epoch_prompts[batch_start : batch_start + config.batch_size]
 
             # ── Rollout: G trajectories per prompt ──────────────────────
-            all_group_turns:   list[list[list[TurnData]]] = []  # [B][G][turns]
-            all_group_rewards: list[list[float]] = []            # [B][G]
+            all_group_turns:   list[list[list[TurnData]]] = []       # [B][G][T]
+            all_group_rewards: list[list[list[float]]] = []           # [B][G][T]
 
             n_degenerate = 0
             t0 = time.time()
@@ -835,10 +910,11 @@ def train(config: GRPOConfig = None):
                 print(f"\n[Prompt {p_idx+1}/{len(batch)}] Generating {config.group_size} trajectories (batched/parallel)...")
                 group_turns, group_rewards = _run_group_episodes(prompt_text, model, tokenizer, config)
 
-                # Dynamic Sampling: skip degenerate groups (DAPO)
-                # Don't resample the same hard prompt — just skip it entirely.
+                # Dynamic Sampling: skip degenerate groups (DAPO).
+                # Use mean-reward-per-trajectory as the degeneracy signal.
                 if config.dynamic_sampling:
-                    reward_std = torch.tensor(group_rewards).std().item()
+                    traj_means = [sum(rews) / len(rews) for rews in group_rewards]
+                    reward_std = torch.tensor(traj_means).std().item()
                     if reward_std <= 1e-4:
                         n_degenerate += 1
                         print(f"  [Dynamic Sampling] Degenerate group (std={reward_std:.6f}), skipping prompt.")
@@ -847,9 +923,10 @@ def train(config: GRPOConfig = None):
                 all_group_turns.append(group_turns)
                 all_group_rewards.append(group_rewards)
 
-                mean_r = sum(group_rewards) / len(group_rewards)
-                best_r = max(group_rewards)
-                reward_std = torch.tensor(group_rewards).std().item()
+                traj_means = [sum(rews) / len(rews) for rews in group_rewards]
+                mean_r = sum(traj_means) / len(traj_means)
+                best_r = max(traj_means)
+                reward_std = torch.tensor(traj_means).std().item()
                 print(f"  Group: mean={mean_r:.2f}, best={best_r:.2f}, std={reward_std:.3f}")
 
             elapsed = time.time() - t0
@@ -861,7 +938,8 @@ def train(config: GRPOConfig = None):
                 continue
 
             batch_mean = sum(
-                sum(rs) / len(rs) for rs in all_group_rewards
+                sum(sum(rews) / len(rews) for rews in group) / len(group)
+                for group in all_group_rewards
             ) / len(all_group_rewards)
             step_bar.set_postfix(reward=f"{batch_mean:.3f}", step_time=f"{elapsed:.0f}s")
             print(f"\n[Epoch {epoch+1} | Step {global_step+1}/{total_steps}] reward={batch_mean:.3f}  step_time={elapsed:.0f}s")
@@ -928,11 +1006,21 @@ def train(config: GRPOConfig = None):
                 ]
                 mean_entropy = float(-torch.cat(all_lp_vals).mean()) if all_lp_vals else 0.0
 
+                # Not-Okay Ratio: fraction of trajectories where final-turn reward < 0
+                # High = model still mostly failing; should drop as training progresses.
+                all_final_rewards = [
+                    group[g][-1]
+                    for group in all_group_rewards
+                    for g in range(len(group))
+                ]
+                not_okay_ratio = sum(1 for r in all_final_rewards if r < 0) / max(1, len(all_final_rewards))
+
                 wandb.log({
                     "train/loss": total_loss_val,
                     "train/batch_mean_reward": batch_mean,
-                    "train/mean_entropy": mean_entropy,  # track entropy — collapse = this dropping
+                    "train/mean_entropy": mean_entropy,
                     "train/degenerate_groups": n_degenerate,
+                    "train/not_okay_ratio": not_okay_ratio,
                     "train/learning_rate": scheduler.get_last_lr()[0],
                     "epoch": epoch + (global_step / max(1, len(train_prompts) // config.batch_size))
                 }, step=global_step)
@@ -971,6 +1059,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-6)
     parser.add_argument("--grpo_epochs", type=int, default=2, help="Gradient updates per rollout (2 reduces staleness vs original 4)")
+    parser.add_argument("--num_turns", type=int, default=4, help="Multi-turn refinement turns per trajectory (Kevin's recipe)")
+    parser.add_argument("--gamma", type=float, default=0.4, help="Discount factor for multi-turn returns")
     parser.add_argument("--wandb_project", type=str, default="kernelforge-rl")
     parser.add_argument("--wandb_name", type=str, default="grpo-qwen-14b")
     parser.add_argument("--resume", action="store_true", help="Resume from output_dir if it exists")
@@ -995,6 +1085,8 @@ if __name__ == "__main__":
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_name,
         dynamic_sampling=not args.no_dynamic_sampling,
+        num_turns=args.num_turns,
+        gamma=args.gamma,
         use_sglang=args.use_sglang,
         sglang_python=args.sglang_python,
         sglang_port=args.sglang_port,
