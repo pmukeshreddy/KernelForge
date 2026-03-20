@@ -270,17 +270,15 @@ def sync_weights_to_sglang(model, port: int):
     """
     Push updated LoRA-merged weights to SGLang via update_weights_from_tensor.
 
-    SGLang loaded merged weights (no LoRA layers), so we compute
-    W_merged = W_base + lora_B @ lora_A * scaling and batch-push all tensors.
-
-    SGLang's API changed in 0.4+: now expects a single request with
-    serialized_named_tensors dict (name → base64 bytes) rather than
-    one request per tensor.
+    SGLang expects:
+      serialized_named_tensors: List[str]  — one element per TP rank (TP=1 → list of 1)
+      Each element = ForkingPickler(dict[name, tensor]) → base64 string
     """
     import requests, base64, io
+    from multiprocessing.reduction import ForkingPickler
 
-    # Collect all merged tensors
-    tensors_to_push = {}
+    # Collect all merged tensors: W_merged = W_base + lora_B @ lora_A * scaling
+    named_tensors = {}
     for name, module in model.named_modules():
         if not (hasattr(module, 'lora_A') and hasattr(module, 'lora_B')
                 and 'default' in getattr(module, 'lora_A', {})):
@@ -301,75 +299,38 @@ def sync_weights_to_sglang(model, port: int):
                 if param_name.startswith(pfx):
                     param_name = param_name[len(pfx):]
                     break
-            tensors_to_push[param_name] = merged
+            named_tensors[param_name] = merged
         except Exception as e:
             print(f"[SGLang] Merge error ({name}): {e}")
 
-    if not tensors_to_push:
+    if not named_tensors:
         print("[SGLang] No LoRA tensors found to sync.")
         return
 
-    # Send in batches of 20 to keep request size manageable
-    BATCH = 20
-    names = list(tensors_to_push.keys())
-    n_synced = 0
-    errors = 0
+    # Serialize the entire dict with ForkingPickler (matches SGLang's MultiprocessingSerializer)
+    buf = io.BytesIO()
+    ForkingPickler(buf).dump(named_tensors)
+    buf.seek(0)
+    serialized = base64.b64encode(buf.read()).decode("utf-8")
 
-    for i in range(0, len(names), BATCH):
-        batch_names = names[i:i + BATCH]
-        # Try new API format first (SGLang 0.4+): serialized_named_tensors dict
-        payload_new = {
-            "serialized_named_tensors": {
-                n: {
-                    "data": base64.b64encode(tensors_to_push[n].numpy().tobytes()).decode("ascii"),
-                    "dtype": "float32",
-                    "shape": list(tensors_to_push[n].shape),
-                }
-                for n in batch_names
-            }
-        }
-        try:
-            resp = requests.post(
-                f"http://localhost:{port}/update_weights_from_tensor",
-                json=payload_new,
-                timeout=120,
-            )
-            if resp.status_code == 200:
-                n_synced += len(batch_names)
-                continue
-            # New format also rejected — try old format (one tensor at a time)
-            if "serialized_tensor" in resp.text or resp.status_code != 400:
-                errors += len(batch_names)
-                if errors <= 4:
-                    print(f"[SGLang] Sync warn batch {i//BATCH}: {resp.status_code} {resp.text[:120]}")
-                continue
-        except Exception as e:
-            errors += len(batch_names)
-            if errors <= 2:
-                print(f"[SGLang] Sync batch error: {e}")
-            continue
-
-        # Fallback: old per-tensor format
-        for n in batch_names:
-            t = tensors_to_push[n]
-            encoded = base64.b64encode(t.numpy().tobytes()).decode("ascii")
-            try:
-                r2 = requests.post(
-                    f"http://localhost:{port}/update_weights_from_tensor",
-                    json={"name": n, "dtype": "float32",
-                          "shape": list(t.shape), "serialized_tensor": encoded},
-                    timeout=60,
-                )
-                if r2.status_code == 200:
-                    n_synced += 1
-                else:
-                    errors += 1
-                    if errors <= 2:
-                        print(f"[SGLang] Sync warn ({n}): {r2.status_code} {r2.text[:80]}")
-            except Exception as e2:
-                errors += 1
-
-    print(f"[SGLang] Weight sync: {n_synced}/{len(names)} tensors pushed, {errors} errors")
+    # TP=1 → list of one serialized dict
+    payload = {
+        "serialized_named_tensors": [serialized],
+        "load_format": None,
+        "flush_cache": True,
+    }
+    try:
+        resp = requests.post(
+            f"http://localhost:{port}/update_weights_from_tensor",
+            json=payload,
+            timeout=300,
+        )
+        if resp.status_code == 200:
+            print(f"[SGLang] Weight sync: {len(named_tensors)} tensors pushed OK")
+        else:
+            print(f"[SGLang] Sync failed: {resp.status_code} {resp.text[:200]}")
+    except Exception as e:
+        print(f"[SGLang] Sync error: {e}")
 
 
 def _generate_with_sglang(context_texts: list[str], config: "GRPOConfig") -> list[str]:
