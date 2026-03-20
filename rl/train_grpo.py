@@ -415,7 +415,7 @@ def _run_group_episodes(
             generated_texts = []
             for ctx, full in zip(context_texts, raw_completions):
                 completion = full[len(ctx):] if full.startswith(ctx) else full
-                generated_texts.append(PREFILL + completion)
+                generated_texts.append(completion)
         else:
             tokenizer.padding_side = "left"
             inputs = tokenizer(context_texts, return_tensors="pt", padding=True)
@@ -431,7 +431,7 @@ def _run_group_episodes(
                     pad_token_id=tokenizer.eos_token_id,
                 )
             generated_texts = [
-                PREFILL + tokenizer.decode(outputs[i][input_ids_tensor[i].shape[0]:], skip_special_tokens=True)
+                tokenizer.decode(outputs[i][input_ids_tensor[i].shape[0]:], skip_special_tokens=True)
                 for i in range(G)
             ]
     else:
