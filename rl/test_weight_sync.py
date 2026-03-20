@@ -33,6 +33,9 @@ def test_weight_sync(model_path: str, adapter_path: str, port: int,
     print(f"[1] Launching SGLang server (base model, --enable-lora) on port {port}...")
     import subprocess, glob as _glob
 
+    # Kill any stale server on this port so we always start fresh with --enable-lora
+    subprocess.run(f"fuser -k {port}/tcp 2>/dev/null; sleep 1", shell=True)
+
     cuda_homes = sorted(_glob.glob("/usr/local/cuda-*"), reverse=True) + ["/usr/local/cuda"]
     cuda_home = next((p for p in cuda_homes if os.path.isfile(f"{p}/bin/nvcc")), None)
     env = dict(os.environ)
