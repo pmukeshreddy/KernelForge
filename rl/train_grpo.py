@@ -93,7 +93,7 @@ class GRPOConfig:
     max_grad_norm: float = 1.0
 
     # Generation
-    max_new_tokens: int = 3000
+    max_new_tokens: int = 4096
     temperature: float = 0.3
     mock_mode: bool = False
 
@@ -495,7 +495,7 @@ def _run_group_episodes(
 # GRPO core
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 3072
+MAX_SEQ_LEN = 4096
 
 
 def _get_token_log_probs(
