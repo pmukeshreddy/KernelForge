@@ -291,31 +291,36 @@ def init_weight_sync_group(port: int, tp_size: int = 1) -> bool:
     master_port = _NCCL_MASTER_PORT
     world_size = tp_size + 1  # trainer + SGLang worker(s)
 
-    # Tell SGLang to join the NCCL group (non-blocking on SGLang side)
-    try:
-        resp = requests.post(
-            f"http://localhost:{port}/init_weights_update_group",
-            json={
-                "master_address": master_addr,
-                "master_port": master_port,
-                "rank_offset": 1,          # SGLang workers take ranks 1..tp_size
-                "world_size": world_size,
-                "group_name": "kf_weight_sync",
-                "backend": "nccl",
-            },
-            timeout=120,
-        )
-        if resp.status_code != 200:
-            print(f"[SGLang] init_weights_update_group failed: {resp.status_code} {resp.text[:200]}")
-            return False
-    except Exception as e:
-        print(f"[SGLang] init_weights_update_group error: {e}")
-        return False
+    # Send HTTP request in a background thread — it may block until NCCL forms.
+    # Trainer must call dist.init_process_group concurrently to avoid deadlock.
+    import threading
+    http_result = [None]
 
-    # Give SGLang time to start its NCCL init before we rendezvous
-    time.sleep(5)
+    def _send_init_request():
+        try:
+            r = requests.post(
+                f"http://localhost:{port}/init_weights_update_group",
+                json={
+                    "master_address": master_addr,
+                    "master_port": master_port,
+                    "rank_offset": 1,
+                    "world_size": world_size,
+                    "group_name": "kf_weight_sync",
+                    "backend": "nccl",
+                },
+                timeout=300,
+            )
+            http_result[0] = r.status_code
+        except Exception as e:
+            http_result[0] = str(e)
 
-    # Trainer joins as rank 0 — this blocks until SGLang also connects
+    t = threading.Thread(target=_send_init_request, daemon=True)
+    t.start()
+
+    # Small delay so SGLang starts its NCCL init before trainer tries to rendezvous
+    time.sleep(3)
+
+    # Trainer joins as rank 0 concurrently with SGLang joining as rank 1
     try:
         dist.init_process_group(
             backend="nccl",
@@ -323,11 +328,15 @@ def init_weight_sync_group(port: int, tp_size: int = 1) -> bool:
             world_size=world_size,
             rank=0,
         )
+        t.join(timeout=60)
+        if http_result[0] != 200:
+            print(f"[SGLang] init_weights_update_group response: {http_result[0]}")
         _weight_sync_group = dist.GroupMember.WORLD
         print(f"[SGLang] NCCL weight sync group initialized (world_size={world_size})")
         return True
     except Exception as e:
         print(f"[SGLang] NCCL group init failed: {e}")
+        t.join(timeout=10)
         return False
 
 
