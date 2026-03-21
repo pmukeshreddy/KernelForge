@@ -178,25 +178,29 @@ try:
     new_model = ModelNew(*get_init_inputs()).to(dev).eval()
     
     # Align parameters so both models use the same randomly initialized weights.
-    # If the state dicts have different keys (ModelNew uses a different internal
-    # structure), fall back to matching by shape+order so pure-CUDA kernels that
-    # wrap parameters differently still get a fair correctness test.
+    # Strategy: exact key match first, then greedy shape-based match.
+    # Shape-based match handles cases where ModelNew uses different key names
+    # (e.g. self.weights vs conv.weight) or has fewer parameters than the
+    # reference (e.g. ref has conv.weight+conv.bias+self.bias, new has
+    # self.weights+self.bias).  Each new param gets the first unused ref param
+    # of the same shape; unmatched params keep their own random init.
     try:
         new_model.load_state_dict(ref_model.state_dict())
     except Exception:
-        # Key-name mismatch — try shape-based alignment
-        ref_params = [p for p in ref_model.parameters()]
-        new_params = [p for p in new_model.parameters()]
-        if len(ref_params) == len(new_params) and all(
-            rp.shape == np.shape for rp, np in zip(ref_params, new_params)
-        ):
-            with torch.no_grad():
-                for rp, np_ in zip(ref_params, new_params):
-                    np_.copy_(rp)
-        # If shapes don't match, both models keep their own random init.
-        # Correctness test will still run — a correct kernel must produce
-        # the same output as the reference for any valid input, including
-        # the reference's randomly initialized weights fed manually.
+        # Build a shape → [param, ...] pool from the reference model
+        from collections import defaultdict
+        ref_pool = defaultdict(list)
+        for p in ref_model.parameters():
+            ref_pool[tuple(p.shape)].append(p.data)
+        ref_used = defaultdict(int)
+        with torch.no_grad():
+            for p in new_model.parameters():
+                key = tuple(p.shape)
+                idx = ref_used[key]
+                if idx < len(ref_pool[key]):
+                    p.copy_(ref_pool[key][idx])
+                    ref_used[key] += 1
+                # else: no ref param of this shape — keep random init
     
     # 2. Dynamic Security Check (Thread Count)
     # Exclude the main thread and any Pytorch internal daemon threads gracefully
