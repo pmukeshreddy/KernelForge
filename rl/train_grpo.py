@@ -962,31 +962,66 @@ def train(config: GRPOConfig = None):
     else:
         random.shuffle(rows)
 
-    # Filter out broken reference prompts — ones where get_init_inputs() or Model(...)
-    # fails at import time (e.g. references `bias` at module level without defining it).
-    # These prompts waste entire episodes: every generated kernel fails with a misleading
-    # error that has nothing to do with the kernel code itself.
+    # Filter broken reference prompts using a fast AST check (no subprocess/torch needed).
+    # Catches the most common failure: get_init_inputs() references a module-level name
+    # (e.g. `bias`) that was never defined, causing every generated kernel to fail with
+    # a misleading NameError that has nothing to do with the kernel code itself.
+    import ast, hashlib, json as _json
+
+    _cache_path = os.path.join(os.path.dirname(config.dataset_path), ".ref_valid_cache.json")
+    try:
+        with open(_cache_path) as _f:
+            _valid_cache = _json.load(_f)
+    except Exception:
+        _valid_cache = {}
+
     def _ref_is_runnable(pytorch_code: str) -> bool:
-        import tempfile, subprocess, sys
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-            f.write(pytorch_code)
-            fpath = f.name
+        h = hashlib.md5(pytorch_code.encode()).hexdigest()
+        if h in _valid_cache:
+            return _valid_cache[h]
         try:
-            r = subprocess.run(
-                [sys.executable, "-c",
-                 f"import importlib.util, sys; spec=importlib.util.spec_from_file_location('ref',{repr(fpath)}); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m); m.get_init_inputs(); m.get_inputs()"],
-                capture_output=True, text=True, timeout=10,
-            )
-            return r.returncode == 0
-        except Exception:
+            tree = ast.parse(pytorch_code)
+        except SyntaxError:
+            _valid_cache[h] = False
             return False
-        finally:
-            import os; os.unlink(fpath)
+        # Collect all names defined at module level (assignments, function defs, class defs, imports)
+        defined = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                defined.add(node.name)
+            elif isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name):
+                        defined.add(t.id)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    defined.add(alias.asname or alias.name.split(".")[0])
+        # Check that get_inputs and get_init_inputs are defined
+        if "get_inputs" not in defined or "get_init_inputs" not in defined:
+            _valid_cache[h] = False
+            return False
+        # Check for NameErrors inside get_init_inputs by finding all Name loads and
+        # checking they are defined at module level or are builtins
+        builtins = set(dir(__builtins__)) if isinstance(__builtins__, dict) else set(dir(__builtins__))
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef,)) and node.name == "get_init_inputs":
+                for child in ast.walk(node):
+                    if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
+                        if child.id not in defined and child.id not in builtins:
+                            _valid_cache[h] = False
+                            return False
+        _valid_cache[h] = True
+        return True
 
     valid_rows = [r for r in rows if _ref_is_runnable(r["pytorch_code"])]
     n_broken = len(rows) - len(valid_rows)
     if n_broken:
-        print(f"[Dataset] Filtered {n_broken} broken reference prompts (get_init_inputs/get_inputs failed). {len(valid_rows)} remain.")
+        print(f"[Dataset] Filtered {n_broken} broken reference prompts. {len(valid_rows)} remain.")
+    try:
+        with open(_cache_path, "w") as _f:
+            _json.dump(_valid_cache, _f)
+    except Exception:
+        pass
     rows = valid_rows
 
     prompts = [row["pytorch_code"] for row in rows]
