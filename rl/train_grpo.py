@@ -251,9 +251,24 @@ def _build_turn_feedback(eval_res: dict | None) -> str:
         )
     if not eval_res.get("correct", False):
         err = (eval_res.get("compiler_error") or "Outputs do not match reference")
+        # CUDA DSA message is a runtime hint, not a diagnostic — translate it.
+        import re as _re
+        if "TORCH_USE_CUDA_DSA" in err or "device-side assert" in err.lower():
+            err = (
+                "CUDA out-of-bounds memory access: a thread read/wrote past array bounds. "
+                "Common causes: (1) threadIdx.y used as batch index but blockDim.y > batch_size — "
+                "threads with threadIdx.y >= batch_size go out of bounds; "
+                "(2) shared memory loaded by only threadIdx.x threads but indexed up to in_features; "
+                "(3) output index calculation does not match tensor layout [batch, out_features]. "
+                "Fix: ensure every thread index stays within the tensor dimensions it accesses. "
+                "If you changed from a flat 1D kernel to a 2D block layout, verify blockDim.x/y "
+                "and your index formula match the new launch configuration."
+            )
         return (
             f"Your previous kernel compiled but produced incorrect outputs:\n{err}\n\n"
-            "Fix the correctness issue. End your response with:\n"
+            "Fix the correctness issue. If you recently changed the parallelization strategy "
+            "and broke a previously correct kernel, consider reverting to the last working approach "
+            "and making a smaller, safer change. End your response with:\n"
             "Reflection: <2-3 sentences: (1) what was wrong in your previous kernel, (2) what you changed to fix it, (3) your parallelization strategy>"
         )
     rt = eval_res.get("runtime_ms")
