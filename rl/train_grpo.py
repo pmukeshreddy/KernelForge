@@ -668,7 +668,7 @@ def _run_group_episodes(
         for i, gen_text in enumerate(completions):
             model_new_py = _extract_python_block(gen_text)
             if i == 0:  # always print traj=0 every turn so we can trace the full repair loop
-                print(f"  [CODE DUMP turn={turn_idx} traj=0]:\n{(model_new_py or gen_text)[:1200]}")
+                print(f"  [CODE DUMP turn={turn_idx} traj=0]:\n{(model_new_py or gen_text)}")
             candidates.append(model_new_py if model_new_py else None)
 
         n_valid = sum(1 for c in candidates if c is not None)
