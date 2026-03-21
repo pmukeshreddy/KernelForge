@@ -218,11 +218,6 @@ def _strip_thinking(text: str) -> str:
     text = text.strip()
 
     # Append reflection if found (passes model's own diagnosis forward)
-    # Truncate long code blocks to last 60 lines to limit context growth
-    lines = text.split("\n")
-    if len(lines) > 70:
-        text = "\n".join(lines[:5]) + "\n... [truncated] ...\n" + "\n".join(lines[-60:])
-
     if reflection:
         text = text + f"\n\n{reflection}"
 
