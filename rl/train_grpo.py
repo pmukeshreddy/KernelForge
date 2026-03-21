@@ -238,11 +238,24 @@ def _build_turn_feedback(eval_res: dict | None) -> str:
             "Please write a complete, valid CUDA kernel using load_inline()."
         )
     if not eval_res.get("compiles", False):
-        # Full compile error — don't truncate, model needs to see the exact line
         err = (eval_res.get("compiler_error") or "Unknown compile error")
+        # Detect Python scoping errors and give specific fix guidance
+        import re as _re
+        name_match = _re.search(r"name '(\w+)' is not defined", err)
+        if name_match:
+            var = name_match.group(1)
+            hint = (
+                f"This is a Python scoping error: '{var}' is not available at module level. "
+                f"load_inline() is called when the module is imported, before any __init__ runs, "
+                f"so constructor parameters like '{var}' do not exist yet. "
+                f"Fix: move load_inline() inside __init__ where '{var}' is accessible, "
+                f"OR remove '{var}' from the cuda_source string and pass it as a kernel argument at runtime."
+            )
+        else:
+            hint = "Fix the compile error above."
         return (
             f"Your previous kernel failed to compile:\n{err}\n\n"
-            "Fix the compile error. End your response with:\n"
+            f"{hint} End your response with:\n"
             "Reflection: <2-3 sentences: (1) what caused the error, (2) what you changed to fix it, (3) your parallelization strategy>"
         )
     if not eval_res.get("correct", False):
