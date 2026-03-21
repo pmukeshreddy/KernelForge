@@ -190,7 +190,7 @@ class ModelNew(nn.Module):
 ```
 
 Now write the complete model_new.py for the following operation. End your response with:
-Reflection: <one sentence on your implementation approach and key optimizations used>
+Reflection: <2-3 sentences covering: (1) your parallelization strategy and block/grid dimensions, (2) memory optimizations used (shared memory, vectorized loads, etc.), (3) what you would try next to improve performance>
 """
 
 
@@ -217,9 +217,11 @@ def _strip_thinking(text: str) -> str:
     to write them), return an empty string so the turn still appears in the
     conversation history but contributes minimal tokens.
     """
-    m = re.search(r"(Reflection:.{0,300})", text, re.DOTALL)
+    m = re.search(r"(Reflection:.{0,600})", text, re.DOTALL)
     if m:
-        return m.group(1).split("\n")[0].strip()  # first line only, ~80 chars
+        # Keep up to 3 lines of the summary (2-3 sentence format)
+        lines = m.group(1).strip().splitlines()
+        return "\n".join(lines[:3]).strip()
     # No reflection — strip thinking and return empty (model saw the turn, no summary)
     return ""
 
@@ -241,14 +243,14 @@ def _build_turn_feedback(eval_res: dict | None) -> str:
         return (
             f"Your previous kernel failed to compile:\n{err}\n\n"
             "Fix the compile error. End your response with:\n"
-            "Reflection: <one sentence on what caused the error and what you changed>"
+            "Reflection: <2-3 sentences: (1) what caused the error, (2) what you changed to fix it, (3) your parallelization strategy>"
         )
     if not eval_res.get("correct", False):
         err = (eval_res.get("compiler_error") or "Outputs do not match reference")
         return (
             f"Your previous kernel compiled but produced incorrect outputs:\n{err}\n\n"
             "Fix the correctness issue. End your response with:\n"
-            "Reflection: <one sentence on what was wrong and how you fixed it>"
+            "Reflection: <2-3 sentences: (1) what was wrong in your previous kernel, (2) what you changed to fix it, (3) your parallelization strategy>"
         )
     rt = eval_res.get("runtime_ms")
     bt = eval_res.get("baseline_runtime_ms")
@@ -259,12 +261,13 @@ def _build_turn_feedback(eval_res: dict | None) -> str:
             "Try to optimize it further — shared memory, vectorized loads, better parallelism, tuned block size. "
             "IMPORTANT: preserve correctness. Only submit if your optimized version still produces correct outputs. "
             "End your response with:\n"
-            "Reflection: <one sentence on what optimization you applied>"
+            "Reflection: <2-3 sentences: (1) what you changed vs your previous kernel, (2) why you expected it to be faster, (3) what you would try next>"
         )
     return (
         "Your previous kernel was correct. Try to optimize it for GPU performance. "
         "IMPORTANT: preserve correctness. "
-        "End your response with:\nReflection: <one sentence on what optimization you applied>"
+        "End your response with:\n"
+        "Reflection: <2-3 sentences: (1) what you changed vs your previous kernel, (2) why you expected it to be faster, (3) what you would try next>"
     )
 
 
