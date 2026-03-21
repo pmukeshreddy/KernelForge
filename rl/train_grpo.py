@@ -687,7 +687,7 @@ def _run_group_episodes(
         if turn_idx == 0:
             for i, res in enumerate(eval_results):
                 if res and not res.get("compiles", False) and res.get("compiler_error"):
-                    print(f"  [COMPILE ERROR traj={i}]: {res['compiler_error'][:300]}")
+                    print(f"  [COMPILE ERROR traj={i}]: {res['compiler_error']}")
 
         # Compute per-turn rewards
         for i, (eval_res, gen_text) in enumerate(zip(eval_results, completions)):

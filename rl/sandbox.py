@@ -166,7 +166,7 @@ except Exception as e:
         R["compiler_error"] = '\\n'.join(error_lines[-20:])
     else:
         # Unknown error — show full traceback with file/line so root cause is visible
-        R["compiler_error"] = tb_str[-1500:]
+        R["compiler_error"] = "TB:" + tb_str[-1500:]
     save(R); sys.exit(0)
 
 save(R)  # Save early so timeout knows compilation passed
