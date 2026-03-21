@@ -201,27 +201,26 @@ Now write the complete model_new.py for the following operation:
 
 def _strip_thinking(text: str) -> str:
     """
-    Replace <think>...</think> with a model-written reflection summary (Kevin's approach).
-    The model is asked to end each response with 'Reflection: ...' after the code block.
-    We keep: Reflection line + code block. Strip everything else from <think>.
-    If no Reflection line found, just strip thinking entirely.
+    Reduce a prior-turn response to only its Reflection summary line.
+
+    Kevin-32B (arXiv 2507.11948) found that carrying the full previous kernel
+    into the next-turn context causes context explosion — a conv3d kernel can be
+    11k chars, making turn-3 context 6500+ tokens. Their fix: drop the code and
+    keep only the model-generated one-sentence summary of what was tried/failed.
+
+    The model already has the reference PyTorch code in the user prompt, so it
+    can regenerate from scratch. The Reflection + error feedback is sufficient
+    context to tell it what went wrong.
+
+    Fallback: if no Reflection line found (early training, before model learns
+    to write them), return an empty string so the turn still appears in the
+    conversation history but contributes minimal tokens.
     """
-    # Extract reflection line if present (written by model after code block)
-    reflection = ""
     m = re.search(r"(Reflection:.{0,300})", text, re.DOTALL)
     if m:
-        reflection = m.group(1).split("\n")[0].strip()  # first line only
-
-    # Strip thinking blocks
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-    text = re.sub(r"<think>.*",          "", text, flags=re.DOTALL)
-    text = text.strip()
-
-    # Append reflection if found (passes model's own diagnosis forward)
-    if reflection:
-        text = text + f"\n\n{reflection}"
-
-    return text
+        return m.group(1).split("\n")[0].strip()  # first line only, ~80 chars
+    # No reflection — strip thinking and return empty (model saw the turn, no summary)
+    return ""
 
 
 def _build_turn_feedback(eval_res: dict | None) -> str:
@@ -734,23 +733,23 @@ def _get_token_log_probs(
     model,
     context_ids: torch.Tensor,
     response_ids: torch.Tensor,
-) -> torch.Tensor | None:
+) -> torch.Tensor:
     """
-    Forward pass for one turn. Returns per-token log probs [R], or None if the
-    sequence exceeds MAX_SEQ_LEN.
-
-    Returning None implements DAPO "Overlong Filtering" (arXiv 2503.14476 §3.3):
-    when a sample would be truncated to fit the training window, we mask its loss
-    entirely rather than compute gradients on a partial sequence. Truncation breaks
-    the Markov structure assumed by GRPO — the model generated the response seeing
-    the full context (e.g. 6518 tokens via SGLang), but training would see only the
-    tail (e.g. ~1096 tokens), making exp(new_lp - old_lp) meaningless.
+    Forward pass for one turn. Returns per-token log probs [R].
+    Truncates response from the right and context from the left so total
+    sequence never exceeds MAX_SEQ_LEN (prevents OOM on long think+code responses).
+    With reflection-only inter-turn context (Kevin's approach), contexts stay
+    small (~1000-1300 tokens across all turns) so truncation rarely triggers.
     """
-    if len(context_ids) + len(response_ids) > MAX_SEQ_LEN:
-        return None
+    max_resp = MAX_SEQ_LEN - 64
+    if len(response_ids) > max_resp:
+        response_ids = response_ids[:max_resp]
+    R = len(response_ids)
+    max_ctx = max(MAX_SEQ_LEN - R, 64)
+    if len(context_ids) > max_ctx:
+        context_ids = context_ids[-max_ctx:]
 
     device = next(model.parameters()).device
-    R = len(response_ids)
     input_ids = torch.cat([context_ids, response_ids]).unsqueeze(0).to(device)
     Q = len(context_ids)
     r_ids = response_ids.to(device)
@@ -782,7 +781,6 @@ def _compute_grpo_loss_and_backward(
     3. Token-level DAPO Clip-Higher
     4. Dr. GRPO per-sequence mean
     5. Entropy bonus
-    6. DAPO Overlong Filtering: turns where ctx+resp > MAX_SEQ_LEN are skipped
 
     Returns scalar loss value for logging (gradients already applied).
     """
@@ -807,39 +805,27 @@ def _compute_grpo_loss_and_backward(
     print(f"  [DEBUG] advantages range: min={advantages.min().item():.3f} max={advantages.max().item():.3f}")
     # ── END DEBUG ────────────────────────────────────────────────────────────
 
-    # Count valid (non-overlong) sequences upfront for loss normalization.
-    # Overlong sequences (None old_log_probs) are skipped per DAPO overlong filtering.
-    n_seqs = 0
-    for i in range(G):
-        for turn_idx, (ctx, resp) in enumerate(group_turns[i]):
-            if len(resp) > 0 and old_log_probs[i][turn_idx] is not None:
-                n_seqs += 1
+    # Count valid sequences upfront for loss normalization
+    n_seqs = sum(
+        1 for i in range(G)
+        for (_, resp) in group_turns[i]
+        if len(resp) > 0
+    )
     if n_seqs == 0:
         return 0.0
 
     total_loss = 0.0
-    n_overlong = 0
 
     for i in range(G):
         for turn_idx, (ctx, resp) in enumerate(group_turns[i]):
             if len(resp) == 0:
                 continue
 
-            old_lp = old_log_probs[i][turn_idx]
-            if old_lp is None:
-                # DAPO overlong filtering: skip — context exceeded MAX_SEQ_LEN at rollout time
-                n_overlong += 1
-                continue
-
             A_i_t = advantages[i, turn_idx].item()
 
             new_lp = _get_token_log_probs(model, ctx, resp)
-            if new_lp is None:
-                # Shouldn't happen (same sequence as old_lp pass), but guard defensively
-                n_overlong += 1
-                continue
+            old_lp = old_log_probs[i][turn_idx].to(new_lp.device)
 
-            old_lp = old_lp.to(new_lp.device)
             ratio   = torch.exp(new_lp - old_lp.detach())
             clipped = torch.clamp(ratio, 1.0 - config.cliprange_low, 1.0 + config.cliprange_high)
 
@@ -854,9 +840,6 @@ def _compute_grpo_loss_and_backward(
             # keeping peak activation memory to 1 sequence at a time.
             (loss_term / n_seqs).backward()
             total_loss += loss_term.item()
-
-    if n_overlong > 0:
-        print(f"  [DEBUG] Overlong filtering: skipped {n_overlong} turns (ctx+resp > {MAX_SEQ_LEN} tokens)")
 
     return total_loss / n_seqs
 
@@ -1153,7 +1136,7 @@ def train(config: GRPOConfig = None):
                         else:
                             with torch.no_grad():
                                 lp = _get_token_log_probs(model, ctx, resp)
-                            turn_lps.append(lp.detach().cpu() if lp is not None else None)
+                            turn_lps.append(lp.detach().cpu())
                     group_old.append(turn_lps)
                 all_old_lps.append(group_old)
             model.train()
