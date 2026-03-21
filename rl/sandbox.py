@@ -242,7 +242,7 @@ try:
                 bias = (nf - rf).mean().item()
                 # Diagnose error pattern to give actionable feedback
                 if wrong_frac > 0.9:
-                    pattern = "nearly all elements wrong (likely wrong formula or missing operation)"
+                    pattern = "FUNDAMENTAL ALGORITHMIC ERROR (>90% outputs wrong): your core formula is incorrect — do NOT make incremental tweaks, rewrite the kernel from scratch"
                 elif wrong_frac > 0.3:
                     pattern = f"{{wrong_frac*100:.0f}}% of elements wrong (likely indexing error or off-by-one in loop bounds)"
                 else:

@@ -264,11 +264,16 @@ def _build_turn_feedback(eval_res: dict | None) -> str:
                 "If you changed from a flat 1D kernel to a 2D block layout, verify blockDim.x/y "
                 "and your index formula match the new launch configuration."
             )
+        if "FUNDAMENTAL ALGORITHMIC ERROR" in err:
+            return (
+                f"Your previous kernel compiled but produced incorrect outputs:\n{err}\n\n"
+                "Rewrite the kernel completely from scratch — do not modify the existing code. "
+                "Study the reference implementation carefully before writing. End your response with:\n"
+                "Reflection: <2-3 sentences: (1) what was fundamentally wrong, (2) what algorithm you are using in the rewrite, (3) your parallelization strategy>"
+            )
         return (
             f"Your previous kernel compiled but produced incorrect outputs:\n{err}\n\n"
-            "Fix the correctness issue. If you recently changed the parallelization strategy "
-            "and broke a previously correct kernel, consider reverting to the last working approach "
-            "and making a smaller, safer change. End your response with:\n"
+            "Fix the correctness issue. End your response with:\n"
             "Reflection: <2-3 sentences: (1) what was wrong in your previous kernel, (2) what you changed to fix it, (3) your parallelization strategy>"
         )
     rt = eval_res.get("runtime_ms")
