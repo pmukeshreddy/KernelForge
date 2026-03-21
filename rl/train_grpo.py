@@ -569,6 +569,14 @@ def _run_group_episodes(
     traj_responses: list[list[str]]  = [[] for _ in range(G)]  # raw completions (keep <think>)
     traj_evals:     list[list[dict]] = [[] for _ in range(G)]  # eval results per turn
 
+    # ── DEBUG: what operation is this prompt? ───────────────────────────────
+    # Extract first torch call from prompt to label the operation
+    op_match = re.search(r'torch\.\w+|nn\.\w+', prompt_text)
+    op_label = op_match.group(0) if op_match else "unknown_op"
+    prompt_lines = prompt_text.strip().count('\n') + 1
+    print(f"  [DEBUG] Prompt: {op_label}, {prompt_lines} lines, {len(prompt_text)} chars")
+    # ── END DEBUG ────────────────────────────────────────────────────────────
+
     for turn_idx in range(T):
         turn_label = f"Turn {turn_idx+1}/{T}"
 
@@ -578,11 +586,22 @@ def _run_group_episodes(
             msgs = list(base_messages)
             for t in range(turn_idx):
                 stripped = _strip_thinking(traj_responses[i][t])
+                # ── DEBUG: did we find a Reflection line? ───────────────────
+                has_ref = "Reflection:" in stripped
+                if i == 0:
+                    print(f"  [DEBUG] Turn {t+1}→{turn_idx+1} traj=0: reflection={'YES' if has_ref else 'NO'}, "
+                          f"stripped_len={len(stripped)} chars")
+                # ── END DEBUG ────────────────────────────────────────────────
                 msgs.append({"role": "assistant", "content": stripped})
-                msgs.append({"role": "user", "content": _build_turn_feedback(traj_evals[i][t])})
-            context_texts.append(
-                tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-            )
+                feedback = _build_turn_feedback(traj_evals[i][t])
+                if i == 0:
+                    print(f"  [DEBUG] Feedback traj=0 turn {t+1}→{turn_idx+1}: {feedback[:120]!r}")
+                msgs.append({"role": "user", "content": feedback})
+            ctx_str = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+            if i == 0:
+                ctx_tokens = len(tokenizer(ctx_str).input_ids)
+                print(f"  [DEBUG] Context traj=0 turn {turn_idx+1}: {ctx_tokens} tokens")
+            context_texts.append(ctx_str)
 
         # Generate G completions for this turn
         if not config.mock_mode:
@@ -673,10 +692,33 @@ def _run_group_episodes(
 
             group_rewards[i].append(r)
 
+        # ── DEBUG: reward breakdown this turn ───────────────────────────────
+        turn_rewards = [group_rewards[i][turn_idx] for i in range(G)]
+        reward_categories = {"no_code": 0, "compile_fail": 0, "wrong_output": 0, "correct": 0}
+        for i in range(G):
+            if candidates[i] is None:
+                reward_categories["no_code"] += 1
+            elif eval_results[i] is None or not eval_results[i].get("compiles", False):
+                reward_categories["compile_fail"] += 1
+            elif not eval_results[i].get("correct", False):
+                reward_categories["wrong_output"] += 1
+            else:
+                reward_categories["correct"] += 1
+        print(f"  [DEBUG] Turn {turn_idx+1} rewards: {reward_categories} "
+              f"| min={min(turn_rewards):.2f} max={max(turn_rewards):.2f} "
+              f"std={torch.tensor(turn_rewards).std().item():.3f}")
+        # ── END DEBUG ────────────────────────────────────────────────────────
+
         # Store for next-turn context building
         for i in range(G):
             traj_responses[i].append(completions[i])
             traj_evals[i].append(eval_results[i])
+
+    # ── DEBUG: final reward matrix ───────────────────────────────────────────
+    print(f"  [DEBUG] Reward matrix [G={G} x T={T}]:")
+    for i in range(G):
+        print(f"    traj {i}: {[f'{r:.2f}' for r in group_rewards[i]]}")
+    # ── END DEBUG ────────────────────────────────────────────────────────────
 
     return group_turns, group_rewards
 
@@ -756,6 +798,12 @@ def _compute_grpo_loss_and_backward(
     mean_t = disc_returns.mean(dim=0, keepdim=True)
     std_t  = disc_returns.std(dim=0,  keepdim=True) + 1e-8
     advantages = (disc_returns - mean_t) / std_t
+
+    # ── DEBUG: discounted returns and advantages ─────────────────────────────
+    print(f"  [DEBUG] disc_returns per turn (mean): {disc_returns.mean(dim=0).tolist()}")
+    print(f"  [DEBUG] disc_returns std per turn:    {disc_returns.std(dim=0).tolist()}")
+    print(f"  [DEBUG] advantages range: min={advantages.min().item():.3f} max={advantages.max().item():.3f}")
+    # ── END DEBUG ────────────────────────────────────────────────────────────
 
     # Count valid sequences upfront for loss normalization
     n_seqs = sum(
@@ -879,8 +927,19 @@ def train(config: GRPOConfig = None):
         return
     rows = list(raw)
 
+    # ── DEBUG: dataset fields and level distribution ─────────────────────────
+    print(f"\n[DEBUG] Dataset fields: {list(rows[0].keys())}")
+    has_level = "level_id" in rows[0]
+    if has_level:
+        from collections import Counter
+        level_counts = Counter(r.get("level_id", "?") for r in rows)
+        print(f"[DEBUG] level_id distribution: {dict(sorted(level_counts.items()))}")
+    else:
+        print(f"[DEBUG] No level_id field — curriculum disabled, random shuffle")
+    # ── END DEBUG ─────────────────────────────────────────────────────────────
+
     # Curriculum: sort by level_id (easy first) if available and enabled
-    if config.curriculum and "level_id" in rows[0]:
+    if config.curriculum and has_level:
         rows.sort(key=lambda r: (r.get("level_id", 99), random.random()))
         print(f"Curriculum enabled: sorted {len(rows)} tasks by level_id (easy-first).")
     else:
@@ -1097,7 +1156,10 @@ def train(config: GRPOConfig = None):
                     )
                     total_loss_val += loss_val
 
-                torch.nn.utils.clip_grad_norm_(trainable_params, config.max_grad_norm)
+                # ── DEBUG: gradient norm before clipping ────────────────────
+                total_norm = torch.nn.utils.clip_grad_norm_(trainable_params, config.max_grad_norm)
+                print(f"  [DEBUG] grad_norm={total_norm:.4f} (clip={config.max_grad_norm}) loss={total_loss_val:.4f}")
+                # ── END DEBUG ────────────────────────────────────────────────
                 optimizer.step()
 
             # One scheduler step per batch step (not per grpo_epoch) so LR
