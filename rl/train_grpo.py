@@ -200,30 +200,21 @@ Reflection: <2-3 sentences covering: (1) your parallelization strategy and block
 # Multi-turn helpers (Kevin's recipe)
 # ---------------------------------------------------------------------------
 
-def _strip_thinking(text: str, keep_code: bool = False) -> str:
+def _strip_thinking(text: str) -> str:
     """
-    Reduce a prior-turn response for inter-turn context.
+    Strip internal <think> blocks from a prior-turn response, keeping all
+    code and the Reflection line intact.
 
-    keep_code=True  (most recent prior turn):
-        Strip <think> blocks only — preserve the full code + Reflection.
-        The model MUST see its own last kernel to fix indexing/shape bugs
-        rather than hallucinating a completely new kernel from scratch.
+    This is the correct ReAct approach: the model's "action" (the kernel it
+    wrote) must remain visible in context so subsequent turns can make targeted
+    fixes rather than hallucinating a new kernel from scratch.
 
-    keep_code=False (older turns):
-        Kevin-32B (arXiv 2507.11948) approach — keep only the Reflection
-        line to avoid context explosion from accumulating multiple code blocks.
-
-    Fallback: if no Reflection line found, return empty string.
+    Context length is handled downstream by _get_token_log_probs which
+    truncates sequences exceeding MAX_SEQ_LEN (DAPO overlong handling).
     """
-    if keep_code:
-        cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-        cleaned = re.sub(r"<think>.*", "", cleaned, flags=re.DOTALL)
-        return cleaned.strip()
-    m = re.search(r"(Reflection:.{0,600})", text, re.DOTALL)
-    if m:
-        lines = m.group(1).strip().splitlines()
-        return "\n".join(lines[:3]).strip()
-    return ""
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    cleaned = re.sub(r"<think>.*", "", cleaned, flags=re.DOTALL)
+    return cleaned.strip()
 
 
 def _build_turn_feedback(eval_res: dict | None) -> str:
@@ -601,13 +592,12 @@ def _run_group_episodes(
         for i in range(G):
             msgs = list(base_messages)
             for t in range(turn_idx):
-                is_last_prior = (t == turn_idx - 1)
-                stripped = _strip_thinking(traj_responses[i][t], keep_code=is_last_prior)
+                stripped = _strip_thinking(traj_responses[i][t])
                 # ── DEBUG: did we find a Reflection line? ───────────────────
                 has_ref = "Reflection:" in stripped
                 if i == 0:
                     print(f"  [DEBUG] Turn {t+1}→{turn_idx+1} traj=0: reflection={'YES' if has_ref else 'NO'}, "
-                          f"stripped_len={len(stripped)} chars, keep_code={is_last_prior}")
+                          f"stripped_len={len(stripped)} chars")
                 # ── END DEBUG ────────────────────────────────────────────────
                 msgs.append({"role": "assistant", "content": stripped})
                 feedback = _build_turn_feedback(traj_evals[i][t])
