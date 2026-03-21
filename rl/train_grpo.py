@@ -611,7 +611,7 @@ def _run_group_episodes(
                 msgs.append({"role": "assistant", "content": stripped})
                 feedback = _build_turn_feedback(traj_evals[i][t])
                 if i == 0:
-                    print(f"  [DEBUG] Feedback traj=0 turn {t+1}→{turn_idx+1}: {feedback[:120]!r}")
+                    print(f"  [DEBUG] Feedback traj=0 turn {t+1}→{turn_idx+1}:\n{feedback}")
                 msgs.append({"role": "user", "content": feedback})
             ctx_str = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
             if i == 0:
