@@ -218,6 +218,11 @@ def _strip_thinking(text: str) -> str:
     text = text.strip()
 
     # Append reflection if found (passes model's own diagnosis forward)
+    # Truncate long code blocks to last 60 lines to limit context growth
+    lines = text.split("\n")
+    if len(lines) > 70:
+        text = "\n".join(lines[:5]) + "\n... [truncated] ...\n" + "\n".join(lines[-60:])
+
     if reflection:
         text = text + f"\n\n{reflection}"
 
@@ -256,12 +261,14 @@ def _build_turn_feedback(eval_res: dict | None) -> str:
         speedup = bt / rt
         return (
             f"Your previous kernel was correct at {speedup:.2f}x speedup over PyTorch. "
-            "Optimize further — shared memory, vectorized loads, better parallelism, tuned block size. "
+            "Try to optimize it further — shared memory, vectorized loads, better parallelism, tuned block size. "
+            "IMPORTANT: preserve correctness. Only submit if your optimized version still produces correct outputs. "
             "End your response with:\n"
             "Reflection: <one sentence on what optimization you applied>"
         )
     return (
-        "Your previous kernel was correct. Optimize it further for GPU performance. "
+        "Your previous kernel was correct. Try to optimize it for GPU performance. "
+        "IMPORTANT: preserve correctness. "
         "End your response with:\nReflection: <one sentence on what optimization you applied>"
     )
 
