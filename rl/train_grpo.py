@@ -54,22 +54,15 @@ def _worker_run_eval(args):
 
 
 def _extract_python_block(text: str) -> str:
-    """Extract the last ```python ... ``` block from model output.
-
-    The model sometimes emits multiple python blocks — e.g. quoting the reference
-    code in analysis before writing the actual kernel. The real implementation is
-    always the last block. Taking the first block was silently submitting the model's
-    quoted reference code instead of its kernel, causing spurious NameErrors.
-    """
+    """Extract the first ```python ... ``` block from model output."""
     import re
     # Strip Qwen3 think blocks
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
-    # Find all closed blocks and take the last one
-    matches = list(re.finditer(r'```python\s*(.*?)```', text, re.DOTALL))
-    if matches:
-        return matches[-1].group(1).strip()
-    # Fallback: unclosed block (truncated by max_new_tokens) — only one can exist
+    m = re.search(r'```python\s*(.*?)```', text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    # Fallback: unclosed block (truncated by max_new_tokens)
     m = re.search(r'```python\s*(.*)', text, re.DOTALL)
     if m:
         return m.group(1).strip()
