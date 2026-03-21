@@ -14,6 +14,8 @@ import shutil
 import json
 from antihack import check_security
 
+print(f"[SANDBOX] Loaded sandbox.py v3 (pid={__import__('os').getpid()})", flush=True)
+
 
 def evaluate(kernel_code: str, reference_code: str, timeout: int = 300,
              n_correctness: int = 10, n_warmup: int = 3, n_timed: int = 10) -> dict:
@@ -83,7 +85,10 @@ def evaluate(kernel_code: str, reference_code: str, timeout: int = 300,
         if os.path.exists(result_path):
             with open(result_path) as f:
                 result = json.load(f)
+            if not result.get("compiles", False):
+                print(f"[SBX_DBG] rc={proc.returncode} result_exists=True err={result.get('compiler_error','')!r:.200}", flush=True)
         elif proc.returncode != 0:
+            print(f"[SBX_DBG] rc={proc.returncode} result_exists=False stderr={proc.stderr!r:.300}", flush=True)
             # Clean compiler output: extract only error lines, strip build flag noise
             raw_err = proc.stderr or ""
             error_lines = []
