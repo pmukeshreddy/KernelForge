@@ -221,6 +221,8 @@ try:
                 trial_ok = False
                 diff = (rf - nf).abs()
                 max_err = diff.max().item()
+                mean_err = diff.mean().item()
+                wrong_frac = (diff > 1e-3).float().mean().item()
                 max_pos = diff.argmax().item()
                 # Convert flat index to multi-dim for readability
                 shape = rf.shape
@@ -232,7 +234,20 @@ try:
                 coords = list(reversed(coords))
                 exp_val = rf.flatten()[max_pos].item()
                 got_val = nf.flatten()[max_pos].item()
-                correctness_detail = f"Output tensor {{t_idx}}: max_abs_error={{max_err:.6f}} at position {{coords}}, expected={{exp_val:.6f}}, got={{got_val:.6f}}, shape={{list(shape)}}"
+                bias = (nf - rf).mean().item()
+                # Diagnose error pattern to give actionable feedback
+                if wrong_frac > 0.9:
+                    pattern = "nearly all elements wrong (likely wrong formula or missing operation)"
+                elif wrong_frac > 0.3:
+                    pattern = f"{{wrong_frac*100:.0f}}% of elements wrong (likely indexing error or off-by-one in loop bounds)"
+                else:
+                    pattern = f"{{wrong_frac*100:.1f}}% of elements wrong (likely boundary/edge case or incorrect stride)"
+                bias_note = f"systematic bias={{bias:+.4f}} (output is consistently {'too high' if bias > 0 else 'too low'})" if abs(bias) > 0.1 else "no systematic bias"
+                correctness_detail = (
+                    f"Output tensor {{t_idx}}: {pattern}. "
+                    f"max_abs_error={{max_err:.5f}}, mean_abs_error={{mean_err:.5f}}, {{bias_note}}. "
+                    f"Worst at position {{coords}}: expected={{exp_val:.5f}}, got={{got_val:.5f}}. shape={{list(shape)}}"
+                )
                 break
         matches.append(trial_ok)
         if not trial_ok:
