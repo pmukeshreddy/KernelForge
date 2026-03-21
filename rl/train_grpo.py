@@ -189,7 +189,8 @@ class ModelNew(nn.Module):
         return ext.add_cuda(a, b)
 ```
 
-Now write the complete model_new.py for the following operation:
+Now write the complete model_new.py for the following operation. End your response with:
+Reflection: <one sentence on your implementation approach and key optimizations used>
 """
 
 
