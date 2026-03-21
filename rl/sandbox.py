@@ -124,7 +124,8 @@ def save(r):
         json.dump(r, f)
 
 R = {{"compiles": False, "compiler_error": None, "correct": False,
-     "outputs_match": [], "runtime_ms": None, "baseline_runtime_ms": None}}
+     "outputs_match": [], "runtime_ms": None, "baseline_runtime_ms": None,
+     "wrong_frac": None, "shape_ok": None}}
 
 import torch
 
@@ -220,14 +221,17 @@ try:
             rf, nf = r.float(), n.float()
             if rf.shape != nf.shape:
                 trial_ok = False
+                R["shape_ok"] = False
                 correctness_detail = f"Output tensor {{t_idx}}: SHAPE MISMATCH - expected shape {{list(rf.shape)}}, got {{list(nf.shape)}}."
                 break
+            R["shape_ok"] = True
             if not torch.allclose(rf, nf, atol=1e-3, rtol=1e-3):
                 trial_ok = False
                 diff = (rf - nf).abs()
                 max_err = diff.max().item()
                 mean_err = diff.mean().item()
                 wrong_frac = (diff > 1e-3).float().mean().item()
+                R["wrong_frac"] = wrong_frac
                 max_pos = diff.argmax().item()
                 # Convert flat index to multi-dim for readability
                 shape = rf.shape

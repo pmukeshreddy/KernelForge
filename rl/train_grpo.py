@@ -95,7 +95,7 @@ class GRPOConfig:
     # Multi-turn (Kevin's recipe): T refinement turns per trajectory
     # γ=0.4 discounts later turns so getting it right on turn 1 is worth more.
     num_turns: int = 4
-    gamma: float = 0.4
+    gamma: float = 0.7
 
     # Generation
     max_new_tokens: int = 6000        # total budget (thinking + code)
@@ -119,10 +119,14 @@ class GRPOConfig:
     wandb_run_name: str = "grpo-qwen-14b"
 
     # Reward shaping (graduated — creates gradient signal at every failure stage)
-    reward_no_code: float = -1.0      # no ```python block found at all
-    reward_compile_fail: float = -0.5 # code found but fails to compile or wrap
-    reward_wrong_output: float = -0.1 # compiles but produces wrong outputs
-    reward_correct_base: float = 0.3  # base bonus for any correct kernel (Kevin's approach)
+    reward_no_code: float = -1.0        # no ```python block found at all
+    reward_compile_fail: float = -0.5   # code found but fails to compile or wrap
+    reward_shape_mismatch: float = -0.25 # compiles but output shape is wrong
+    reward_mostly_wrong: float = -0.1   # >90% of values wrong (fundamental algo error)
+    reward_partially_wrong: float = -0.05 # 30-90% of values wrong (indexing bug)
+    reward_nearly_correct: float = 0.05  # <30% of values wrong (boundary/edge case)
+    reward_wrong_output: float = -0.1   # fallback when wrong_frac unavailable
+    reward_correct_base: float = 0.3    # base bonus for any correct kernel (Kevin's approach)
 
     # Length penalty — scaled to be minor relative to reward signal
     # At 3000 tokens: -0.0001 * 3000 = -0.3 (won't swamp the correctness signal)
@@ -221,7 +225,7 @@ def _build_turn_feedback(eval_res: dict | None) -> str:
     """
     Build the user feedback message for the next turn (Kevin's format):
     - Full error message (not truncated mid-sentence)
-    - Specific, actionable ask
+    - Specific, actionable ask, scaled to how close the kernel is
     """
     if eval_res is None:
         return (
@@ -230,7 +234,6 @@ def _build_turn_feedback(eval_res: dict | None) -> str:
         )
     if not eval_res.get("compiles", False):
         err = (eval_res.get("compiler_error") or "Unknown compile error")
-        # Detect Python scoping errors and give specific fix guidance
         import re as _re
         name_match = _re.search(r"name '(\w+)' is not defined", err)
         if name_match:
@@ -251,7 +254,9 @@ def _build_turn_feedback(eval_res: dict | None) -> str:
         )
     if not eval_res.get("correct", False):
         err = (eval_res.get("compiler_error") or "Outputs do not match reference")
-        # CUDA DSA message is a runtime hint, not a diagnostic — translate it.
+        wrong_frac = eval_res.get("wrong_frac")
+        shape_ok = eval_res.get("shape_ok")
+
         import re as _re
         if "TORCH_USE_CUDA_DSA" in err or "device-side assert" in err.lower():
             err = (
@@ -264,6 +269,32 @@ def _build_turn_feedback(eval_res: dict | None) -> str:
                 "If you changed from a flat 1D kernel to a 2D block layout, verify blockDim.x/y "
                 "and your index formula match the new launch configuration."
             )
+
+        # Shape wrong — the algorithm may be fine, only dimensions need fixing
+        if shape_ok is False:
+            return (
+                f"Your previous kernel compiled but produced incorrect outputs:\n{err}\n\n"
+                "Fix the correctness issue. End your response with:\n"
+                "Reflection: <2-3 sentences: (1) what was wrong in your previous kernel, (2) what you changed to fix it, (3) your parallelization strategy>"
+            )
+
+        # Nearly correct (<30% wrong) — small fix, don't rewrite
+        if wrong_frac is not None and wrong_frac < 0.30:
+            return (
+                f"Your previous kernel compiled but produced incorrect outputs:\n{err}\n\n"
+                "Fix the correctness issue. End your response with:\n"
+                "Reflection: <2-3 sentences: (1) what was wrong in your previous kernel, (2) what you changed to fix it, (3) your parallelization strategy>"
+            )
+
+        # Partially wrong (30-90%) — indexing bug
+        if wrong_frac is not None and wrong_frac < 0.90:
+            return (
+                f"Your previous kernel compiled but produced incorrect outputs:\n{err}\n\n"
+                "Fix the correctness issue. End your response with:\n"
+                "Reflection: <2-3 sentences: (1) what was wrong in your previous kernel, (2) what you changed to fix it, (3) your parallelization strategy>"
+            )
+
+        # Mostly wrong (>90%) — fundamental error, rewrite
         if "FUNDAMENTAL ALGORITHMIC ERROR" in err:
             return (
                 f"Your previous kernel compiled but produced incorrect outputs:\n{err}\n\n"
@@ -276,6 +307,7 @@ def _build_turn_feedback(eval_res: dict | None) -> str:
             "Fix the correctness issue. End your response with:\n"
             "Reflection: <2-3 sentences: (1) what was wrong in your previous kernel, (2) what you changed to fix it, (3) your parallelization strategy>"
         )
+
     rt = eval_res.get("runtime_ms")
     bt = eval_res.get("baseline_runtime_ms")
     if rt and bt:
@@ -607,18 +639,18 @@ def _run_group_episodes(
     for turn_idx in range(T):
         turn_label = f"Turn {turn_idx+1}/{T}"
 
-        # Build context texts: base prompt + [stripped_response + feedback] for each prior turn
+        # Build context texts: base prompt + most recent turn's [code + feedback].
+        # Showing only the last turn (not all) keeps context O(1) regardless of T.
         context_texts = []
         for i in range(G):
             msgs = list(base_messages)
-            for t in range(turn_idx):
+            if turn_idx > 0:
+                t = turn_idx - 1
                 stripped = _strip_thinking(traj_responses[i][t])
-                # ── DEBUG: did we find a Reflection line? ───────────────────
-                has_ref = "Reflection:" in stripped
                 if i == 0:
-                    print(f"  [DEBUG] Turn {t+1}→{turn_idx+1} traj=0: reflection={'YES' if has_ref else 'NO'}, "
-                          f"stripped_len={len(stripped)} chars")
-                # ── END DEBUG ────────────────────────────────────────────────
+                    has_ref = "Reflection:" in stripped
+                    print(f"  [DEBUG] Turn {t+1}→{turn_idx+1} traj=0: "
+                          f"reflection={'YES' if has_ref else 'NO'}, stripped_len={len(stripped)} chars")
                 msgs.append({"role": "assistant", "content": stripped})
                 feedback = _build_turn_feedback(traj_evals[i][t])
                 if i == 0:
@@ -711,7 +743,16 @@ def _run_group_episodes(
             elif eval_res is None or not eval_res.get("compiles", False):
                 r = config.reward_compile_fail + length_penalty
             elif not eval_res["correct"]:
-                r = config.reward_wrong_output + length_penalty
+                wrong_frac = eval_res.get("wrong_frac")
+                shape_ok = eval_res.get("shape_ok")
+                if shape_ok is False:
+                    r = config.reward_shape_mismatch + length_penalty
+                elif wrong_frac is not None and wrong_frac < 0.30:
+                    r = config.reward_nearly_correct + length_penalty
+                elif wrong_frac is not None and wrong_frac < 0.90:
+                    r = config.reward_partially_wrong + length_penalty
+                else:
+                    r = config.reward_mostly_wrong + length_penalty
             else:
                 r = config.reward_correct_base + calculate_reward(eval_res) + length_penalty
                 if i < 3:
@@ -721,14 +762,24 @@ def _run_group_episodes(
 
         # ── DEBUG: reward breakdown this turn ───────────────────────────────
         turn_rewards = [group_rewards[i][turn_idx] for i in range(G)]
-        reward_categories = {"no_code": 0, "compile_fail": 0, "wrong_output": 0, "correct": 0}
+        reward_categories = {"no_code": 0, "compile_fail": 0, "shape_mismatch": 0,
+                             "mostly_wrong": 0, "partially_wrong": 0, "nearly_correct": 0, "correct": 0}
         for i in range(G):
             if candidates[i] is None:
                 reward_categories["no_code"] += 1
             elif eval_results[i] is None or not eval_results[i].get("compiles", False):
                 reward_categories["compile_fail"] += 1
             elif not eval_results[i].get("correct", False):
-                reward_categories["wrong_output"] += 1
+                wf = eval_results[i].get("wrong_frac")
+                so = eval_results[i].get("shape_ok")
+                if so is False:
+                    reward_categories["shape_mismatch"] += 1
+                elif wf is not None and wf < 0.30:
+                    reward_categories["nearly_correct"] += 1
+                elif wf is not None and wf < 0.90:
+                    reward_categories["partially_wrong"] += 1
+                else:
+                    reward_categories["mostly_wrong"] += 1
             else:
                 reward_categories["correct"] += 1
         print(f"  [DEBUG] Turn {turn_idx+1} rewards: {reward_categories} "
