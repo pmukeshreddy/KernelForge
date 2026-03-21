@@ -14,8 +14,6 @@ import shutil
 import json
 from antihack import check_security
 
-print(f"[SANDBOX] Loaded sandbox.py v3 (pid={__import__('os').getpid()})", flush=True)
-
 
 def evaluate(kernel_code: str, reference_code: str, timeout: int = 300,
              n_correctness: int = 10, n_warmup: int = 3, n_timed: int = 10) -> dict:
@@ -85,10 +83,7 @@ def evaluate(kernel_code: str, reference_code: str, timeout: int = 300,
         if os.path.exists(result_path):
             with open(result_path) as f:
                 result = json.load(f)
-            if not result.get("compiles", False):
-                print(f"[SBX_DBG] rc={proc.returncode} result_exists=True err={result.get('compiler_error','')!r:.200}", flush=True)
         elif proc.returncode != 0:
-            print(f"[SBX_DBG] rc={proc.returncode} result_exists=False stderr={proc.stderr!r:.300}", flush=True)
             # Clean compiler output: extract only error lines, strip build flag noise
             raw_err = proc.stderr or ""
             error_lines = []
@@ -171,7 +166,7 @@ except Exception as e:
         R["compiler_error"] = '\\n'.join(error_lines[-20:])
     else:
         # Unknown error — show full traceback with file/line so root cause is visible
-        R["compiler_error"] = "TB:" + tb_str[-1500:]
+        R["compiler_error"] = tb_str[-1500:]
     save(R); sys.exit(0)
 
 save(R)  # Save early so timeout knows compilation passed
@@ -248,9 +243,9 @@ try:
                     pattern = f"{{wrong_frac*100:.0f}}% of elements wrong (likely indexing error or off-by-one in loop bounds)"
                 else:
                     pattern = f"{{wrong_frac*100:.1f}}% of elements wrong (likely boundary/edge case or incorrect stride)"
-                bias_note = f"systematic bias={{bias:+.4f}} (output is consistently {'too high' if bias > 0 else 'too low'})" if abs(bias) > 0.1 else "no systematic bias"
+                bias_note = f"systematic bias={{bias:+.4f}} (output is consistently {{'too high' if bias > 0 else 'too low'}})" if abs(bias) > 0.1 else "no systematic bias"
                 correctness_detail = (
-                    f"Output tensor {{t_idx}}: {pattern}. "
+                    f"Output tensor {{t_idx}}: {{pattern}}. "
                     f"max_abs_error={{max_err:.5f}}, mean_abs_error={{mean_err:.5f}}, {{bias_note}}. "
                     f"Worst at position {{coords}}: expected={{exp_val:.5f}}, got={{got_val:.5f}}. shape={{list(shape)}}"
                 )
