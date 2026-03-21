@@ -727,7 +727,7 @@ def _run_group_episodes(
 # GRPO core
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 4096
+MAX_SEQ_LEN = 8192
 
 
 def _get_token_log_probs(
@@ -1233,7 +1233,7 @@ if __name__ == "__main__":
     parser.add_argument("--adapter", type=str, default="../sft/sft_qwen3_14b_lora")
     parser.add_argument("--group_size", type=int, default=16)
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=1e-6)
+    parser.add_argument("--lr", type=float, default=2e-6)
     parser.add_argument("--grpo_epochs", type=int, default=2, help="Gradient updates per rollout (2 reduces staleness vs original 4)")
     parser.add_argument("--think_budget", type=int, default=2000, help="Max thinking tokens before forcing code output")
     parser.add_argument("--num_turns", type=int, default=4, help="Multi-turn refinement turns per trajectory (Kevin's recipe)")
