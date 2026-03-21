@@ -163,9 +163,8 @@ except Exception as e:
     if error_lines:
         R["compiler_error"] = '\\n'.join(error_lines[-20:])
     else:
-        # Fallback: last lines usually have "error: X" summary
-        last = [l.strip() for l in err_str.strip().split('\\n')[-15:] if l.strip()]
-        R["compiler_error"] = '\\n'.join(last)
+        # Fallback: show full traceback so we can diagnose where the error comes from
+        R["compiler_error"] = err_str[-1000:]
     save(R); sys.exit(0)
 
 save(R)  # Save early so timeout knows compilation passed
