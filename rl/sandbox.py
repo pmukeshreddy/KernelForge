@@ -145,6 +145,8 @@ except Exception as e:
     # load_inline throws a RuntimeError whose string contains the entire ninja
     # build log (thousands of chars of -isystem flags) followed by the actual
     # CUDA/C++ error. Extract only the meaningful lines.
+    import traceback as _tb
+    tb_str = _tb.format_exc()
     err_str = str(e)
     error_lines = []
     for line in err_str.split('\\n'):
@@ -163,8 +165,8 @@ except Exception as e:
     if error_lines:
         R["compiler_error"] = '\\n'.join(error_lines[-20:])
     else:
-        # Fallback: show full traceback so we can diagnose where the error comes from
-        R["compiler_error"] = err_str[-1000:]
+        # Unknown error — show full traceback with file/line so root cause is visible
+        R["compiler_error"] = tb_str[-1500:]
     save(R); sys.exit(0)
 
 save(R)  # Save early so timeout knows compilation passed
