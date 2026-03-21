@@ -200,29 +200,29 @@ Reflection: <2-3 sentences covering: (1) your parallelization strategy and block
 # Multi-turn helpers (Kevin's recipe)
 # ---------------------------------------------------------------------------
 
-def _strip_thinking(text: str) -> str:
+def _strip_thinking(text: str, keep_code: bool = False) -> str:
     """
-    Reduce a prior-turn response to only its Reflection summary line.
+    Reduce a prior-turn response for inter-turn context.
 
-    Kevin-32B (arXiv 2507.11948) found that carrying the full previous kernel
-    into the next-turn context causes context explosion — a conv3d kernel can be
-    11k chars, making turn-3 context 6500+ tokens. Their fix: drop the code and
-    keep only the model-generated one-sentence summary of what was tried/failed.
+    keep_code=True  (most recent prior turn):
+        Strip <think> blocks only — preserve the full code + Reflection.
+        The model MUST see its own last kernel to fix indexing/shape bugs
+        rather than hallucinating a completely new kernel from scratch.
 
-    The model already has the reference PyTorch code in the user prompt, so it
-    can regenerate from scratch. The Reflection + error feedback is sufficient
-    context to tell it what went wrong.
+    keep_code=False (older turns):
+        Kevin-32B (arXiv 2507.11948) approach — keep only the Reflection
+        line to avoid context explosion from accumulating multiple code blocks.
 
-    Fallback: if no Reflection line found (early training, before model learns
-    to write them), return an empty string so the turn still appears in the
-    conversation history but contributes minimal tokens.
+    Fallback: if no Reflection line found, return empty string.
     """
+    if keep_code:
+        cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+        cleaned = re.sub(r"<think>.*", "", cleaned, flags=re.DOTALL)
+        return cleaned.strip()
     m = re.search(r"(Reflection:.{0,600})", text, re.DOTALL)
     if m:
-        # Keep up to 3 lines of the summary (2-3 sentence format)
         lines = m.group(1).strip().splitlines()
         return "\n".join(lines[:3]).strip()
-    # No reflection — strip thinking and return empty (model saw the turn, no summary)
     return ""
 
 
@@ -601,12 +601,13 @@ def _run_group_episodes(
         for i in range(G):
             msgs = list(base_messages)
             for t in range(turn_idx):
-                stripped = _strip_thinking(traj_responses[i][t])
+                is_last_prior = (t == turn_idx - 1)
+                stripped = _strip_thinking(traj_responses[i][t], keep_code=is_last_prior)
                 # ── DEBUG: did we find a Reflection line? ───────────────────
                 has_ref = "Reflection:" in stripped
                 if i == 0:
                     print(f"  [DEBUG] Turn {t+1}→{turn_idx+1} traj=0: reflection={'YES' if has_ref else 'NO'}, "
-                          f"stripped_len={len(stripped)} chars")
+                          f"stripped_len={len(stripped)} chars, keep_code={is_last_prior}")
                 # ── END DEBUG ────────────────────────────────────────────────
                 msgs.append({"role": "assistant", "content": stripped})
                 feedback = _build_turn_feedback(traj_evals[i][t])
