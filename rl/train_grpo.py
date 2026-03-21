@@ -962,6 +962,33 @@ def train(config: GRPOConfig = None):
     else:
         random.shuffle(rows)
 
+    # Filter out broken reference prompts — ones where get_init_inputs() or Model(...)
+    # fails at import time (e.g. references `bias` at module level without defining it).
+    # These prompts waste entire episodes: every generated kernel fails with a misleading
+    # error that has nothing to do with the kernel code itself.
+    def _ref_is_runnable(pytorch_code: str) -> bool:
+        import tempfile, subprocess, sys
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write(pytorch_code)
+            fpath = f.name
+        try:
+            r = subprocess.run(
+                [sys.executable, "-c",
+                 f"import importlib.util, sys; spec=importlib.util.spec_from_file_location('ref',{repr(fpath)}); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m); m.get_init_inputs(); m.get_inputs()"],
+                capture_output=True, text=True, timeout=10,
+            )
+            return r.returncode == 0
+        except Exception:
+            return False
+        finally:
+            import os; os.unlink(fpath)
+
+    valid_rows = [r for r in rows if _ref_is_runnable(r["pytorch_code"])]
+    n_broken = len(rows) - len(valid_rows)
+    if n_broken:
+        print(f"[Dataset] Filtered {n_broken} broken reference prompts (get_init_inputs/get_inputs failed). {len(valid_rows)} remain.")
+    rows = valid_rows
+
     prompts = [row["pytorch_code"] for row in rows]
     # Split to train/val (10% val, max 20)
     val_size = min(int(len(prompts) * 0.1), 20)
