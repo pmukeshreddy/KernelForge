@@ -290,7 +290,18 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None) -
             bias       = eval_res.get("systematic_bias")
 
             if wrong_frac is not None and max_err is not None:
-                if wrong_frac > 0.3 and max_err > 5.0:
+                is_mem_corruption = (max_err > 1e5 or max_err != max_err)  # inf/nan check
+                if is_mem_corruption:
+                    hint = (
+                        f"\nDiagnosis: MEMORY CORRUPTION or uninitialized memory "
+                        f"(max_err={max_err:.2g}, {wrong_frac*100:.1f}% wrong). "
+                        "The kernel is reading invalid memory. Common causes: "
+                        "(1) launching more threads than CUDA allows (max 1024 per block), "
+                        "(2) index out of bounds in the kernel, "
+                        "(3) shared memory size mismatch, "
+                        "(4) weight tensors in a Python list instead of nn.ParameterList."
+                    )
+                elif wrong_frac > 0.3 and max_err > 5.0:
                     hint = (
                         f"\nDiagnosis: {wrong_frac*100:.0f}% of outputs wrong with large "
                         f"max error ({max_err:.1f}). This pattern means the core algorithm "

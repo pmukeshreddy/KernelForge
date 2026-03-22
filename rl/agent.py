@@ -45,6 +45,17 @@ def _fix_cuda_api(cuda_code: str) -> str:
     for fn in ('fabsf', 'fabs', 'sqrtf', 'sqrt', 'expf', 'exp', 'logf', 'log'):
         cuda_code = cuda_code.replace(f'__{fn}(', f'{fn}(')
 
+    # Deprecated warp shuffle intrinsics → _sync variants (required on sm_70+, H100)
+    # __shfl_down(val, delta) → __shfl_down_sync(0xffffffff, val, delta)
+    for shfl in ('__shfl_down', '__shfl_up', '__shfl_xor', '__shfl'):
+        sync_ver = f'{shfl}_sync'
+        if shfl in cuda_code and sync_ver not in cuda_code:
+            cuda_code = re.sub(
+                rf'{re.escape(shfl)}\s*\(',
+                f'{sync_ver}(0xffffffff, ',
+                cuda_code,
+            )
+
     # std:: math functions are not available in device code
     cuda_code = re.sub(r'std::(max|min|abs|fabs)\s*\(', lambda m: {
         'max': 'fmaxf(', 'min': 'fminf(', 'abs': 'fabsf(', 'fabs': 'fabsf('
