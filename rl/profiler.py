@@ -203,28 +203,55 @@ def _generate_feedback(metrics: Dict[str, float]) -> str:
     feedback += f"Compute Throughput: {compute:>5.1f}% of peak\n"
     feedback += f"Warp Occupancy:     {occupancy:>5.1f}% of theoretical peak\n"
 
-    # Diagnose bottleneck and suggest techniques based on actual metrics
+    # Diagnose bottleneck and suggest techniques based on ALL three metrics
     feedback += f"\n--- Bottleneck Analysis ---\n"
 
-    if memory < 30 and compute < 30:
-        # Both low → kernel is latency-bound (not doing enough work)
+    issues = []  # collect all issues, then combine
+
+    # 1. Overall utilization check
+    if memory < 30 and compute < 30 and occupancy < 30:
         feedback += (
-            "Bottleneck: LATENCY-BOUND (both memory and compute underutilized).\n"
+            "Bottleneck: LATENCY-BOUND (all three metrics very low).\n"
             "The kernel is not doing enough work per launch.\n"
             "Techniques: process multiple elements per thread (loop over elements), "
             "use float4/int4 vectorized loads/stores (128-bit transactions), "
             "fuse multiple operations into a single kernel."
         )
-    elif memory > compute * 1.5:
-        # Memory-bound
-        feedback += "Bottleneck: MEMORY-BOUND.\n"
-        if memory >= 80:
+        if occupancy < 40:
             feedback += (
-                "Memory throughput is near peak — this kernel is already well-optimized "
-                "for a memory-bound workload. Further speedup requires reducing the number "
-                "of memory passes (fuse multiple operations into one kernel to avoid writing "
-                "and re-reading intermediate results) or reducing total bytes moved "
-                "(e.g., in-place operations, skip unnecessary copies)."
+                f"\n\nLow occupancy ({occupancy:.0f}%): too few active warps. "
+                "Reduce registers per thread, reduce shared memory per block, "
+                "or use smaller block sizes (128 instead of 256)."
+            )
+        return feedback
+
+    # 2. Identify the primary bottleneck
+    if memory > compute * 1.5:
+        bottleneck = "MEMORY"
+    elif compute > memory * 1.5:
+        bottleneck = "COMPUTE"
+    else:
+        bottleneck = "BALANCED"
+
+    # 3. Build advice considering all three metrics together
+    if bottleneck == "MEMORY":
+        feedback += "Bottleneck: MEMORY-BOUND.\n"
+        if memory >= 80 and occupancy >= 60:
+            # Near peak on both memory and occupancy — genuinely well-optimized
+            feedback += (
+                "Memory throughput is near peak with good occupancy — this kernel is "
+                "already well-optimized for a memory-bound workload. Further speedup "
+                "requires reducing memory passes (fuse multiple operations into one kernel) "
+                "or reducing total bytes moved (in-place ops, skip unnecessary copies)."
+            )
+        elif memory >= 80 and occupancy < 60:
+            # High memory but low occupancy — could still improve
+            feedback += (
+                f"Memory throughput is high but occupancy is low ({occupancy:.0f}%). "
+                "More active warps could hide memory latency better.\n"
+                "Techniques: reduce registers per thread, reduce shared memory per block, "
+                "use smaller block sizes to fit more blocks per SM, "
+                "process more elements per thread with a strided loop."
             )
         elif memory < 50:
             feedback += (
@@ -241,10 +268,24 @@ def _generate_feedback(metrics: Dict[str, float]) -> str:
                 "fuse sequential operations to avoid intermediate global memory writes, "
                 "process multiple elements per thread to overlap compute and memory."
             )
-    elif compute > memory * 1.5:
-        # Compute-bound
+
+    elif bottleneck == "COMPUTE":
         feedback += "Bottleneck: COMPUTE-BOUND.\n"
-        if compute < 50:
+        if compute >= 80 and occupancy >= 60:
+            feedback += (
+                "Compute throughput is near peak with good occupancy — well-optimized. "
+                "Further speedup requires reducing arithmetic (precompute constants, "
+                "use fast intrinsics like __fmaf_rn, __expf, __rsqrtf), "
+                "or algorithmic changes to reduce total FLOPs."
+            )
+        elif compute >= 80 and occupancy < 60:
+            feedback += (
+                f"Compute throughput is high but occupancy is low ({occupancy:.0f}%). "
+                "More warps could improve instruction-level parallelism.\n"
+                "Techniques: reduce registers per thread, use smaller block sizes, "
+                "simplify per-thread logic to reduce register pressure."
+            )
+        elif compute < 50:
             feedback += (
                 "Compute units are underutilized.\n"
                 "Techniques: increase parallelism (more threads/blocks), "
@@ -255,22 +296,28 @@ def _generate_feedback(metrics: Dict[str, float]) -> str:
         else:
             feedback += (
                 "Compute is the primary limiter.\n"
-                "Techniques: reduce arithmetic intensity (precompute constants, "
-                "use fast intrinsics like __fmaf_rn, __expf, __rsqrtf), "
-                "trade precision where acceptable (float vs double), "
+                "Techniques: use fast intrinsics (__fmaf_rn, __expf, __rsqrtf), "
+                "precompute constants outside the inner loop, "
                 "use warp shuffle (__shfl_down_sync) instead of shared memory for reductions."
             )
-    else:
-        # Balanced
-        feedback += (
-            "Bottleneck: BALANCED (compute and memory roughly equal).\n"
-            "Techniques: overlap compute and memory with software pipelining, "
-            "use shared memory to stage data and reduce global accesses, "
-            "increase elements per thread to improve instruction-level parallelism."
-        )
 
-    # Occupancy advice
-    if occupancy < 40:
+    else:  # BALANCED
+        feedback += "Bottleneck: BALANCED (compute and memory roughly equal).\n"
+        if memory >= 70 and compute >= 70:
+            feedback += (
+                "Both compute and memory are well-utilized. "
+                "Further speedup requires algorithmic changes: reduce total work or "
+                "fuse operations to eliminate intermediate memory traffic."
+            )
+        else:
+            feedback += (
+                "Techniques: overlap compute and memory with software pipelining, "
+                "use shared memory to stage data and reduce global accesses, "
+                "increase elements per thread to improve instruction-level parallelism."
+            )
+
+    # 4. Occupancy advice (always relevant when low, regardless of bottleneck)
+    if occupancy < 40 and not (memory < 30 and compute < 30):
         feedback += (
             f"\n\nLow occupancy ({occupancy:.0f}%): too few active warps. "
             "Reduce registers per thread (fewer local variables, simpler logic), "
