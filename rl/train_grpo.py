@@ -301,10 +301,12 @@ def launch_sglang_server(model_path: str, adapter_path: str, port: int, tp: int,
         "--enable-lora",
         "--lora-paths", f"{_LORA_NAME}={adapter_path}",
         "--max-loras-per-batch", "1",
-        "--mem-fraction-static", "0.45",
+        "--mem-fraction-static", "0.60",  # 0.45→0.60: doubles KV cache 16GB→30GB, fixes turn 3+ eviction
         "--context-length", "16384",
         "--log-level", "error",
-        "--max-running-requests", "32",  # allow all G*phases requests to run concurrently
+        "--max-running-requests", "16",   # G=8 × 2 phases = 16 max concurrent requests
+        "--schedule-policy", "lpm",       # longest-prefix-match: maximises KV reuse across turns
+        "--enable-mixed-chunk",           # mix prefill+decode in same batch, reduces stalls
     ]
 
     import glob as _glob
