@@ -255,6 +255,7 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
     - When correctness breaks after a previous correct turn: references the high water
       mark (best speedup and which turn) so the model knows what it had.
     - On final turn: optionally includes profiler hardware metrics.
+    - When ALL trajectories failed: includes group error summary so model avoids dead ends.
     """
     stuck = (
         prev_eval is not None
@@ -272,11 +273,16 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
                 f" at {best_speedup:.2f}x speedup over PyTorch."
             )
 
+    # Group error summary: when ALL trajectories failed, show what others tried
+    group_summary = ""
+    if eval_res is not None and eval_res.get("_group_error_summary"):
+        group_summary = f"\n\n{eval_res['_group_error_summary']}"
+
     if eval_res is None:
         return (
             stuck_prefix +
             "Your previous answer failed to be parsed due to not adhering to the desired formatting."
-            + hwm_suffix + "\n\n"
+            + hwm_suffix + group_summary + "\n\n"
             "Try a completely different approach and generate new, complete code."
         )
     if not eval_res.get("compiles", False):
@@ -284,7 +290,7 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
         return (
             stuck_prefix +
             f"Your previous answer failed to compile. Here is the error message:\n{err}"
-            + hwm_suffix + "\n\n"
+            + hwm_suffix + group_summary + "\n\n"
             "Fix the compilation error and generate new, complete code."
         )
     if not eval_res.get("correct", False):
@@ -292,7 +298,7 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
         return (
             stuck_prefix +
             f"Your previous answer was incorrect. Here is the error message:\n{err}"
-            + hwm_suffix + "\n\n"
+            + hwm_suffix + group_summary + "\n\n"
             "Fix the correctness issue and generate new, complete code."
         )
     # Correct kernel — include timing milestones and optional profiler data
@@ -946,7 +952,39 @@ def _run_group_episodes(
                       f"({ws_best_speedup:.2f}x) — {n_failed} failed trajectories will receive it next turn")
         # ── END warm start ────────────────────────────────────────────────────
 
-        # Store for next-turn context building
+        # ── Group error summary: when 0/8 correct, summarize what others tried ──
+        # This helps trajectories avoid repeating the same dead-end approaches
+        group_error_summary: str | None = None
+        if n_correct == 0 and turn_idx < T - 1:
+            # Collect unique error classes across all trajectories
+            error_types: dict[str, int] = {}
+            for er in eval_results:
+                if er is None:
+                    error_types["parse failure (no code extracted)"] = error_types.get("parse failure (no code extracted)", 0) + 1
+                elif not er.get("compiles", False):
+                    # Extract the key part of the compile error
+                    raw = er.get("compiler_error", "unknown compile error")
+                    # Truncate to first line for grouping
+                    first_line = raw.strip().split('\n')[-1][:120]
+                    error_types[first_line] = error_types.get(first_line, 0) + 1
+                elif not er.get("correct", False):
+                    error_types["wrong output"] = error_types.get("wrong output", 0) + 1
+            if error_types:
+                summary_lines = [f"  {count}x: {err}" for err, count in sorted(error_types.items(), key=lambda x: -x[1])]
+                group_error_summary = (
+                    f"All {G} trajectories failed this turn. Error summary:\n"
+                    + "\n".join(summary_lines[:5])  # top 5 error types
+                )
+                print(f"  [GROUP ERRORS] {group_error_summary}")
+        # ── END group error summary ───────────────────────────────────────────
+
+        # Store for next-turn context building (include group error summary in evals)
+        if group_error_summary:
+            for i in range(G):
+                if eval_results[i] is None:
+                    eval_results[i] = {"_group_error_summary": group_error_summary}
+                else:
+                    eval_results[i]["_group_error_summary"] = group_error_summary
         for i in range(G):
             traj_responses[i].append(completions[i])
             traj_evals[i].append(eval_results[i])
