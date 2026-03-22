@@ -825,12 +825,10 @@ def _run_group_episodes(
 
         # ── DEBUG: reward breakdown this turn ───────────────────────────────
         turn_rewards = [group_rewards[i][turn_idx] for i in range(G)]
-        reward_counts = {-1: 0, 1: 0, 2: 0, 3: 0}
-        for r_val in turn_rewards:
-            bucket = int(round(r_val))
-            reward_counts[bucket] = reward_counts.get(bucket, 0) + 1
-        print(f"  [DEBUG] Turn {turn_idx+1} rewards: {reward_counts} "
-              f"| min={min(turn_rewards):.0f} max={max(turn_rewards):.0f} "
+        n_correct = sum(1 for r in turn_rewards if r > 0)
+        n_wrong = sum(1 for r in turn_rewards if r <= 0)
+        print(f"  [DEBUG] Turn {turn_idx+1} rewards: correct={n_correct} wrong={n_wrong} "
+              f"| values=[{', '.join(f'{r:.2f}' for r in turn_rewards)}] "
               f"std={torch.tensor(turn_rewards).std().item():.3f}")
         # ── END DEBUG ────────────────────────────────────────────────────────
 
