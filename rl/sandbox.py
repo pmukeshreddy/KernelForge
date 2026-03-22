@@ -410,6 +410,23 @@ if R["correct"] and torch.cuda.is_available():
                 times.append(s.elapsed_time(e))
             times.sort()
             R[key] = times[len(times)//2]
+
+        # torch.compile baseline timing
+        try:
+            compiled_model = torch.compile(ref_model)
+            for _ in range({n_warmup} + 1):  # extra warmup for compile
+                with torch.no_grad(): compiled_model(*inputs)
+            torch.cuda.synchronize()
+            times = []
+            for _ in range({n_timed}):
+                s.record()
+                with torch.no_grad(): compiled_model(*inputs)
+                e.record(); torch.cuda.synchronize()
+                times.append(s.elapsed_time(e))
+            times.sort()
+            R["compile_runtime_ms"] = times[len(times)//2]
+        except Exception:
+            pass  # torch.compile may fail on some models, that's okay
     except Exception as ex:
         R["compiler_error"] = f"Timing: {{ex}}"
 

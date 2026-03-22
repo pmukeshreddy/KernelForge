@@ -119,24 +119,10 @@ class GRPOConfig:
     wandb_project: str = "kernelforge-rl"
     wandb_run_name: str = "grpo-qwen-14b"
 
-    # Reward shaping (graduated — creates gradient signal at every failure stage)
+    # Discrete milestone rewards (CUDA Agent style)
+    # -1 = wrong, 1 = correct, 2 = beats eager PyTorch, 3 = beats torch.compile
+    reward_wrong: float = -1.0          # any wrong output (compile fail, shape mismatch, wrong values)
     reward_no_code: float = -1.0        # no ```python block found at all
-    reward_compile_fail: float = -0.5   # code found but fails to compile or wrap
-    reward_shape_mismatch: float = -0.25 # compiles but output shape is wrong
-    reward_mostly_wrong: float = -0.1   # >90% of values wrong (fundamental algo error)
-    reward_partially_wrong: float = -0.05 # 30-90% of values wrong (indexing bug)
-    reward_nearly_correct: float = 0.05  # <30% of values wrong (boundary/edge case)
-    reward_wrong_output: float = -0.1   # fallback when wrong_frac unavailable
-    reward_correct_base: float = 0.3    # base bonus for any correct kernel (Kevin's approach)
-
-    # Regression penalty (SCoRe): if turn T was correct and turn T+1 breaks it,
-    # subtract this from the turn T+1 reward so the model has a specific gradient
-    # signal for "don't regress from a working state" (not just "be correct").
-    reward_regression_penalty: float = -0.3
-
-    # Length penalty — scaled to be minor relative to reward signal
-    # At 3000 tokens: -0.0001 * 3000 = -0.3 (won't swamp the correctness signal)
-    length_penalty_coef: float = 0.0001
 
     # Entropy bonus — prevents entropy collapse (critical for coding tasks)
     # A small positive coefficient adds H(π) to the objective, keeping exploration alive.
@@ -308,13 +294,20 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
             + hwm_suffix + "\n\n"
             "Restart your reasoning process and generate new, complete code."
         )
-    # Correct kernel — include speedup and optional profiler data
+    # Correct kernel — include timing milestones and optional profiler data
     rt = eval_res.get("runtime_ms")
     bt = eval_res.get("baseline_runtime_ms")
-    speedup_str = f" at {bt/rt:.2f}x speedup over PyTorch" if (rt and bt) else ""
+    ct = eval_res.get("compile_runtime_ms")
+    timing_lines = []
+    if rt and bt:
+        timing_lines.append(f"Your kernel: {rt:.3f}ms")
+        timing_lines.append(f"PyTorch eager: {bt:.3f}ms ({bt/rt:.2f}x)")
+    if ct:
+        timing_lines.append(f"torch.compile: {ct:.3f}ms" + (f" ({ct/rt:.2f}x)" if rt else ""))
+    timing_str = "\n".join(timing_lines)
     profiler_str = f"\n\n{profiler_feedback}" if profiler_feedback else ""
     return (
-        f"Your previous answer was correct{speedup_str}.{profiler_str}\n\n"
+        f"Your previous answer was correct.\n{timing_str}{profiler_str}\n\n"
         "Restart your reasoning process and generate new, complete code."
     )
 
@@ -784,27 +777,14 @@ def _run_group_episodes(
 
         # Compute per-turn rewards
         for i, (eval_res, gen_text) in enumerate(zip(eval_results, completions)):
-            gen_len = len(group_turns[i][turn_idx][1])
-            length_penalty = -config.length_penalty_coef * gen_len
-
             if candidates[i] is None:
-                overlong_penalty = -0.5 if gen_len >= int(config.max_new_tokens * 0.95) else 0.0
-                r = config.reward_no_code + length_penalty + overlong_penalty
+                r = config.reward_no_code
             elif eval_res is None or not eval_res.get("compiles", False):
-                r = config.reward_compile_fail + length_penalty
+                r = config.reward_wrong
             elif not eval_res["correct"]:
-                wrong_frac = eval_res.get("wrong_frac")
-                shape_ok = eval_res.get("shape_ok")
-                if shape_ok is False:
-                    r = config.reward_shape_mismatch + length_penalty
-                elif wrong_frac is not None and wrong_frac < 0.30:
-                    r = config.reward_nearly_correct + length_penalty
-                elif wrong_frac is not None and wrong_frac < 0.90:
-                    r = config.reward_partially_wrong + length_penalty
-                else:
-                    r = config.reward_mostly_wrong + length_penalty
+                r = config.reward_wrong
             else:
-                r = config.reward_correct_base + calculate_reward(eval_res) + length_penalty
+                r = calculate_reward(eval_res)  # returns 1, 2, or 3
                 # Update high water mark for this trajectory
                 rt = eval_res.get("runtime_ms")
                 bt = eval_res.get("baseline_runtime_ms")
@@ -816,34 +796,18 @@ def _run_group_episodes(
                 if i < 3:
                     rt_str = f"{eval_res['runtime_ms']:.3f}ms" if eval_res.get('runtime_ms') is not None else "no timing"
                     sp_str = f" ({bt/rt:.2f}x)" if (rt and bt) else ""
-                    print(f"    ✅ Turn {turn_idx+1} Traj {i}: {rt_str}{sp_str} reward={r:.3f}")
+                    print(f"    ✅ Turn {turn_idx+1} Traj {i}: {rt_str}{sp_str} reward={r:.0f}")
 
             group_rewards[i].append(r)
 
         # ── DEBUG: reward breakdown this turn ───────────────────────────────
         turn_rewards = [group_rewards[i][turn_idx] for i in range(G)]
-        reward_categories = {"no_code": 0, "compile_fail": 0, "shape_mismatch": 0,
-                             "mostly_wrong": 0, "partially_wrong": 0, "nearly_correct": 0, "correct": 0}
-        for i in range(G):
-            if candidates[i] is None:
-                reward_categories["no_code"] += 1
-            elif eval_results[i] is None or not eval_results[i].get("compiles", False):
-                reward_categories["compile_fail"] += 1
-            elif not eval_results[i].get("correct", False):
-                wf = eval_results[i].get("wrong_frac")
-                so = eval_results[i].get("shape_ok")
-                if so is False:
-                    reward_categories["shape_mismatch"] += 1
-                elif wf is not None and wf < 0.30:
-                    reward_categories["nearly_correct"] += 1
-                elif wf is not None and wf < 0.90:
-                    reward_categories["partially_wrong"] += 1
-                else:
-                    reward_categories["mostly_wrong"] += 1
-            else:
-                reward_categories["correct"] += 1
-        print(f"  [DEBUG] Turn {turn_idx+1} rewards: {reward_categories} "
-              f"| min={min(turn_rewards):.2f} max={max(turn_rewards):.2f} "
+        reward_counts = {-1: 0, 1: 0, 2: 0, 3: 0}
+        for r_val in turn_rewards:
+            bucket = int(round(r_val))
+            reward_counts[bucket] = reward_counts.get(bucket, 0) + 1
+        print(f"  [DEBUG] Turn {turn_idx+1} rewards: {reward_counts} "
+              f"| min={min(turn_rewards):.0f} max={max(turn_rewards):.0f} "
               f"std={torch.tensor(turn_rewards).std().item():.3f}")
         # ── END DEBUG ────────────────────────────────────────────────────────
 
@@ -932,15 +896,16 @@ def _compute_grpo_loss_and_backward(
     config: GRPOConfig,
 ) -> float:
     """
-    GRPO loss with Kevin's multi-turn discounted advantages.
+    GRPO loss with TRLOO (Dr. Kernel) leave-one-out advantages.
     Calls backward() one sequence at a time to avoid OOM from holding
     G×T=32 computation graphs simultaneously.
 
     1. Discounted return:   R_i_t = Σ_{k=t}^{T-1} γ^{k-t} * r_i_k
-    2. Per-turn group norm: A_i_t = (R_i_t - mean_t) / (std_t + ε)
-    3. Token-level DAPO Clip-Higher
-    4. Dr. GRPO per-sequence mean
-    5. Entropy bonus
+    2. TRLOO baseline:      b_i_t = mean_{j≠i}(R_j_t)  (unbiased leave-one-out)
+    3. Advantage:            A_i_t = (R_i_t - b_i_t) / (std_{j≠i} + ε)
+    4. Token-level DAPO Clip-Higher
+    5. Dr. GRPO per-sequence mean
+    6. Entropy bonus
 
     Returns scalar loss value for logging (gradients already applied).
     """
@@ -954,15 +919,24 @@ def _compute_grpo_loss_and_backward(
         for k in range(t, T):
             disc_returns[:, t] += (config.gamma ** (k - t)) * rewards_t[:, k]
 
-    # Per-turn group normalization → advantages [G, T]
-    mean_t = disc_returns.mean(dim=0, keepdim=True)
-    std_t  = disc_returns.std(dim=0,  keepdim=True) + 1e-8
-    advantages = (disc_returns - mean_t) / std_t
+    # TRLOO (Dr. Kernel): leave-one-out baseline per trajectory per turn
+    # For trajectory i, baseline = mean of all OTHER trajectories' returns at turn t
+    # This is unbiased unlike group-mean which includes the trajectory itself
+    advantages = torch.zeros(G, T, dtype=torch.float32)
+    for t in range(T):
+        group_sum = disc_returns[:, t].sum()
+        group_sq_sum = (disc_returns[:, t] ** 2).sum()
+        for i in range(G):
+            loo_mean = (group_sum - disc_returns[i, t]) / max(G - 1, 1)
+            loo_var = (group_sq_sum - disc_returns[i, t] ** 2) / max(G - 1, 1) - loo_mean ** 2
+            loo_std = loo_var.clamp(min=0).sqrt() + 1e-8
+            advantages[i, t] = (disc_returns[i, t] - loo_mean) / loo_std
 
     # ── DEBUG: discounted returns and advantages ─────────────────────────────
     print(f"  [DEBUG] disc_returns per turn (mean): {disc_returns.mean(dim=0).tolist()}")
     print(f"  [DEBUG] disc_returns std per turn:    {disc_returns.std(dim=0).tolist()}")
     print(f"  [DEBUG] advantages range: min={advantages.min().item():.3f} max={advantages.max().item():.3f}")
+    print(f"  [DEBUG] TRLOO baseline (leave-one-out)")
     # ── END DEBUG ────────────────────────────────────────────────────────────
 
     # Count valid sequences upfront for loss normalization
