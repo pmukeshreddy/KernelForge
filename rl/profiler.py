@@ -193,7 +193,7 @@ def _parse_ncu_csv(csv_text: str) -> Dict[str, float]:
 
 
 def _generate_feedback(metrics: Dict[str, float]) -> str:
-    """Raw hardware metrics — no prescriptive advice. Model uses <think> to reason."""
+    """Bottleneck-aware profiler feedback with actionable optimization techniques."""
     compute = metrics.get("compute", 0.0)
     memory = metrics.get("memory", 0.0)
     occupancy = metrics.get("occupancy", 0.0)
@@ -201,7 +201,73 @@ def _generate_feedback(metrics: Dict[str, float]) -> str:
     feedback = f"--- Hardware Profiler ---\n"
     feedback += f"Memory Throughput:  {memory:>5.1f}% of peak\n"
     feedback += f"Compute Throughput: {compute:>5.1f}% of peak\n"
-    feedback += f"Warp Occupancy:     {occupancy:>5.1f}% of theoretical peak"
+    feedback += f"Warp Occupancy:     {occupancy:>5.1f}% of theoretical peak\n"
+
+    # Diagnose bottleneck and suggest techniques based on actual metrics
+    feedback += f"\n--- Bottleneck Analysis ---\n"
+
+    if memory < 30 and compute < 30:
+        # Both low → kernel is latency-bound (not doing enough work)
+        feedback += (
+            "Bottleneck: LATENCY-BOUND (both memory and compute underutilized).\n"
+            "The kernel is not doing enough work per launch.\n"
+            "Techniques: process multiple elements per thread (loop over elements), "
+            "use float4/int4 vectorized loads/stores (128-bit transactions), "
+            "fuse multiple operations into a single kernel."
+        )
+    elif memory > compute * 1.5:
+        # Memory-bound
+        feedback += "Bottleneck: MEMORY-BOUND.\n"
+        if memory < 50:
+            feedback += (
+                "Memory bandwidth is underutilized.\n"
+                "Techniques: use float4 vectorized loads/stores (reinterpret_cast<float4*>), "
+                "ensure coalesced access patterns (consecutive threads access consecutive addresses), "
+                "process multiple elements per thread to hide memory latency."
+            )
+        else:
+            feedback += (
+                "Memory bandwidth is the primary limiter.\n"
+                "Techniques: reduce global memory traffic with shared memory tiling, "
+                "use __ldg() for read-only data (L2 cache hint), "
+                "fuse sequential operations to avoid intermediate global memory writes, "
+                "consider algorithmic changes that reduce memory passes."
+            )
+    elif compute > memory * 1.5:
+        # Compute-bound
+        feedback += "Bottleneck: COMPUTE-BOUND.\n"
+        if compute < 50:
+            feedback += (
+                "Compute units are underutilized.\n"
+                "Techniques: increase parallelism (more threads/blocks), "
+                "use warp-level primitives (__shfl_down_sync for reductions), "
+                "unroll inner loops (#pragma unroll), "
+                "reduce branch divergence within warps."
+            )
+        else:
+            feedback += (
+                "Compute is the primary limiter.\n"
+                "Techniques: reduce arithmetic intensity (precompute constants, "
+                "use fast intrinsics like __fmaf_rn, __expf, __rsqrtf), "
+                "trade precision where acceptable (float vs double), "
+                "use warp shuffle (__shfl_down_sync) instead of shared memory for reductions."
+            )
+    else:
+        # Balanced
+        feedback += (
+            "Bottleneck: BALANCED (compute and memory roughly equal).\n"
+            "Techniques: overlap compute and memory with software pipelining, "
+            "use shared memory to stage data and reduce global accesses, "
+            "increase elements per thread to improve instruction-level parallelism."
+        )
+
+    # Occupancy advice
+    if occupancy < 40:
+        feedback += (
+            f"\n\nLow occupancy ({occupancy:.0f}%): too few active warps. "
+            "Reduce registers per thread (fewer local variables, simpler logic), "
+            "reduce shared memory per block, or use smaller block sizes (128 instead of 256)."
+        )
 
     return feedback
 
