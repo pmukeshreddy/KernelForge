@@ -33,14 +33,13 @@ Output EXACTLY ONE ```python code block containing a complete model_new.py file 
 - Use `fmaxf`/`fminf` in device code, NOT `std::max`/`std::min`.
 - Max 1024 threads per block.
 - Declare `__shared__` arrays INSIDE the kernel body.
-- Do NOT use `--use_fast_math` in `extra_cuda_cflags`.
-- Store ALL custom weight tensors as `nn.Parameter` (or `nn.ParameterList`), NOT plain Python lists. Plain lists stay on CPU — passing `.data_ptr<float>()` of a CPU tensor to a CUDA kernel produces garbage values (outputs millions times too large). It reduces the precision of `expf`, `tanhf`, etc. below the correctness tolerance (atol=1e-3), causing kernels with correct algorithms to fail the correctness check.
+- Do NOT use `--use_fast_math` in `extra_cuda_cflags`. It reduces the precision of `expf`, `tanhf`, etc. below the correctness tolerance (atol=1e-3).
+- Store ALL custom weight tensors as `nn.Parameter` (or `nn.ParameterList`), NOT plain Python lists. Plain lists stay on CPU — passing `.data_ptr<float>()` of a CPU tensor to a CUDA kernel produces garbage values.
 
 # Iteration Strategy (when refining a previous attempt)
-1. DIAGNOSE FIRST: Read the error message carefully. State in a comment what line/formula is wrong and why, before writing any new code.
-2. NEVER RISK CORRECTNESS FOR SPEED: A correct-but-slow kernel always scores higher than a fast-but-wrong one (wrong = zero reward). If your previous kernel was correct, only optimize if you are certain the change cannot break correctness.
-3. VERIFY INDEX FORMULAS: For any thread-index expression, manually trace: what output element does thread (blockIdx.x, blockIdx.y, threadIdx.x, threadIdx.y) write? Does every element get written exactly once with no gaps or overlaps?
-4. CORRECTNESS BEFORE SPEED: A kernel that produces wrong outputs scores zero regardless of speed. Only optimize after correctness is confirmed.
+1. DIAGNOSE FIRST: Read the error message carefully. State what is wrong and why before writing new code.
+2. NEVER RISK CORRECTNESS FOR SPEED: A correct-but-slow kernel scores higher than a fast-but-wrong one (wrong = zero reward).
+3. VERIFY INDEX FORMULAS: For any thread-index expression, manually trace what element each thread writes. Every output element must be written exactly once.
 <|im_end|>
 """
 
