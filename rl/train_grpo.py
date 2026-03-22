@@ -227,26 +227,96 @@ def _strip_thinking(text: str) -> str:
     return cleaned.strip()
 
 
-def _build_turn_feedback(eval_res: dict | None) -> str:
+def _classify_error(eval_res: dict | None) -> str:
+    """Classify an eval result into a coarse error bucket for stuck-detection."""
+    if eval_res is None:
+        return "no_code"
+    if not eval_res.get("compiles", False):
+        return "compile"
+    if not eval_res.get("correct", False):
+        if eval_res.get("shape_ok") is False:
+            return "shape"
+        wf = eval_res.get("wrong_frac") or 1.0
+        me = eval_res.get("max_abs_error") or 0.0
+        if wf > 0.3 and me > 5.0:
+            return "algorithm"
+        if abs(eval_res.get("systematic_bias") or 0.0) > 0.1:
+            return "systematic"
+        return "boundary"
+    return "correct"
+
+
+def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None) -> str:
     """
-    Kevin-style minimal feedback: just the result + error message.
-    No prescriptive instructions — let the model reason autonomously.
+    Diagnostic feedback: execution result + pattern-based diagnosis.
+
+    - Execution feedback (compiler errors, wrong values) is the primary signal (RLEF/MURPHY).
+    - Diagnostic hints classify the error type from statistics, not op-specific rules (MLMT-RL).
+    - When the same error class repeats, prepends a "try again" signal (UFO, arXiv:2507.14295).
     """
+    stuck = (
+        prev_eval is not None
+        and _classify_error(eval_res) == _classify_error(prev_eval)
+        and _classify_error(eval_res) != "correct"
+    )
+    stuck_prefix = "Your previous attempt made the same type of error. Try a different approach.\n\n" if stuck else ""
+
     if eval_res is None:
         return (
+            stuck_prefix +
             "Your previous answer failed to be parsed due to not adhering to the desired formatting.\n\n"
             "Restart your reasoning process and generate new, complete code."
         )
     if not eval_res.get("compiles", False):
         err = (eval_res.get("compiler_error") or "Unknown compile error")
         return (
+            stuck_prefix +
             f"Your previous answer failed to compile. Here is the error message:\n{err}\n\n"
             "Restart your reasoning process and generate new, complete code."
         )
     if not eval_res.get("correct", False):
-        err = (eval_res.get("compiler_error") or "Outputs do not match reference")
+        err  = (eval_res.get("compiler_error") or "Outputs do not match reference")
+        hint = ""
+
+        if eval_res.get("shape_ok") is False:
+            hint = (
+                "\nDiagnosis: output shape is wrong — your size formula does not match "
+                "the reference. Recheck how you compute H_out / W_out in both the CUDA "
+                "allocation and Python forward(), and make sure they agree."
+            )
+        else:
+            wrong_frac = eval_res.get("wrong_frac")
+            max_err    = eval_res.get("max_abs_error")
+            bias       = eval_res.get("systematic_bias")
+
+            if wrong_frac is not None and max_err is not None:
+                if wrong_frac > 0.3 and max_err > 5.0:
+                    hint = (
+                        f"\nDiagnosis: {wrong_frac*100:.0f}% of outputs wrong with large "
+                        f"max error ({max_err:.1f}). This pattern means the core algorithm "
+                        "is wrong, not just an indexing bug — the kernel is computing a "
+                        "fundamentally different operation than the reference. Reconsider "
+                        "the gather/scatter direction and the input↔output index mapping."
+                    )
+                elif bias is not None and abs(bias) > 0.1 and wrong_frac < 0.3:
+                    hint = (
+                        f"\nDiagnosis: systematic bias of {bias:+.4f} with only "
+                        f"{wrong_frac*100:.1f}% wrong elements. The algorithm is mostly "
+                        "correct but outputs are consistently offset — check your "
+                        "normalization, scale factor, or accumulation (e.g. off-by-one "
+                        "in reduction count)."
+                    )
+                elif wrong_frac < 0.1:
+                    hint = (
+                        f"\nDiagnosis: only {wrong_frac*100:.1f}% wrong — the algorithm "
+                        "is nearly correct. Likely a boundary/edge-case error: check "
+                        "padding handling, out-of-bounds guards, or fence-post conditions "
+                        "at tensor edges."
+                    )
+
         return (
-            f"Your previous answer was incorrect. Here is the error message:\n{err}\n\n"
+            stuck_prefix +
+            f"Your previous answer was incorrect. Here is the error message:\n{err}{hint}\n\n"
             "Restart your reasoning process and generate new, complete code."
         )
     rt = eval_res.get("runtime_ms")
@@ -588,7 +658,8 @@ def _run_group_episodes(
                     print(f"  [DEBUG] Turn {t+1}→{turn_idx+1} traj=0: "
                           f"reflection={'YES' if has_ref else 'NO'}, stripped_len={len(stripped)} chars")
                 msgs.append({"role": "assistant", "content": stripped})
-                feedback = _build_turn_feedback(traj_evals[i][t])
+                prev_eval = traj_evals[i][t - 1] if t > 0 else None
+                feedback = _build_turn_feedback(traj_evals[i][t], prev_eval=prev_eval)
                 if i == 0:
                     print(f"  [DEBUG] Feedback traj=0 turn {t+1}→{turn_idx+1}:\n{feedback}")
                 elif (traj_evals[i][t] is not None
@@ -724,7 +795,8 @@ def _run_group_episodes(
             else:
                 r = config.reward_correct_base + calculate_reward(eval_res) + length_penalty
                 if i < 3:
-                    print(f"    ✅ Turn {turn_idx+1} Traj {i}: {eval_res['runtime_ms']:.3f}ms reward={r:.3f}")
+                    rt_str = f"{eval_res['runtime_ms']:.3f}ms" if eval_res.get('runtime_ms') is not None else "no timing"
+                    print(f"    ✅ Turn {turn_idx+1} Traj {i}: {rt_str} reward={r:.3f}")
 
             group_rewards[i].append(r)
 

@@ -182,7 +182,8 @@ def save(r):
 
 R = {{"compiles": False, "compiler_error": None, "correct": False,
      "outputs_match": [], "runtime_ms": None, "baseline_runtime_ms": None,
-     "wrong_frac": None, "shape_ok": None}}
+     "wrong_frac": None, "shape_ok": None,
+     "max_abs_error": None, "systematic_bias": None}}
 
 import torch
 
@@ -310,6 +311,8 @@ try:
                 mean_err = diff.mean().item()
                 wrong_frac = (diff > 1e-3).float().mean().item()
                 R["wrong_frac"] = wrong_frac
+                R["max_abs_error"] = max_err
+                R["systematic_bias"] = bias
                 max_pos = diff.argmax().item()
                 # Convert flat index to multi-dim for readability
                 shape = rf.shape
