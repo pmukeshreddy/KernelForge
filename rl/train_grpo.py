@@ -800,13 +800,16 @@ def _run_group_episodes(
                 print(f"  [CODE DUMP turn={turn_idx} traj={wrong_traj}]:\n{candidates[wrong_traj]}")
 
         # Compute per-turn rewards
+        # Penalty scale: easier problems penalized more, harder problems forgiven more
+        # Level 1: 1.0x penalty, Level 2: 0.75x, Level 3: 0.5x
+        penalty_scale = {1: 1.0, 2: 0.75, 3: 0.5}.get(difficulty, 1.0)
         for i, (eval_res, gen_text) in enumerate(zip(eval_results, completions)):
             if candidates[i] is None:
-                r = config.reward_no_code
+                r = config.reward_no_code * penalty_scale
             elif eval_res is None or not eval_res.get("compiles", False):
-                r = config.reward_compile_fail
+                r = config.reward_compile_fail * penalty_scale
             elif not eval_res["correct"]:
-                r = config.reward_wrong_output
+                r = config.reward_wrong_output * penalty_scale
             else:
                 r = calculate_reward(eval_res) * diff_scale  # scale by difficulty
                 # Update high water mark for this trajectory
