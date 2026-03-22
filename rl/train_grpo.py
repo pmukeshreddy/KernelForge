@@ -621,7 +621,12 @@ def _run_group_episodes(
     T = config.num_turns
 
     sys_content = get_system_prompt().strip()
-    user_msg = f"{FORMAT_EXAMPLE}Reference Program:\n```python\n{prompt_text}\n```"
+    user_msg = (
+        "Write the complete model_new.py for the following operation.\n\n"
+        "Output EXACTLY ONE ```python code block containing the complete model_new.py "
+        "with load_inline and a ModelNew(nn.Module) class.\n\n"
+        f"Reference Program:\n```python\n{prompt_text}\n```"
+    )
     base_messages = [
         {"role": "system", "content": sys_content},
         {"role": "user", "content": user_msg},
@@ -976,8 +981,12 @@ def _run_evaluation(model, tokenizer, config: GRPOConfig, val_prompts: list[str]
 
     with torch.no_grad():
         for prompt_text in val_prompts:
-            # Build prompt matching SFT training format via apply_chat_template
-            user_msg = f"{FORMAT_EXAMPLE}Reference Program:\n```python\n{prompt_text}\n```"
+            user_msg = (
+                "Write the complete model_new.py for the following operation.\n\n"
+                "Output EXACTLY ONE ```python code block containing the complete model_new.py "
+                "with load_inline and a ModelNew(nn.Module) class.\n\n"
+                f"Reference Program:\n```python\n{prompt_text}\n```"
+            )
             sys_content = get_system_prompt().strip()
             messages = [
                 {"role": "system", "content": sys_content},
