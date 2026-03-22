@@ -239,17 +239,12 @@ def _build_turn_feedback(eval_res: dict | None) -> str:
         )
     if not eval_res.get("compiles", False):
         err = (eval_res.get("compiler_error") or "Unknown compile error")
-        # Translate useless CUDA DSA message to what it actually means
-        if "TORCH_USE_CUDA_DSA" in err or ("device-side assert" in err.lower() and "Compile with" in err):
-            err = "Device-side assertion triggered: kernel accessed memory out of bounds at runtime. Check all array index calculations and bounds conditions."
         return (
             f"Your previous answer failed to compile. Here is the error message:\n{err}\n\n"
             "Restart your reasoning process and generate new, complete code."
         )
     if not eval_res.get("correct", False):
         err = (eval_res.get("compiler_error") or "Outputs do not match reference")
-        if "TORCH_USE_CUDA_DSA" in err or ("device-side assert" in err.lower() and "Compile with" in err):
-            err = "Device-side assertion triggered: kernel accessed memory out of bounds at runtime. Check all array index calculations and bounds conditions."
         return (
             f"Your previous answer was incorrect. Here is the error message:\n{err}\n\n"
             "Restart your reasoning process and generate new, complete code."
