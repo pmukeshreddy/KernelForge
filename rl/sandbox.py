@@ -248,9 +248,9 @@ try:
                 if wrong_frac > 0.9:
                     pattern = "FUNDAMENTAL ALGORITHMIC ERROR (>90% outputs wrong): your core formula is incorrect — do NOT make incremental tweaks, rewrite the kernel from scratch"
                 elif wrong_frac > 0.3:
-                    pattern = f"{{wrong_frac*100:.0f}}% of elements wrong (likely indexing error or off-by-one in loop bounds)"
+                    pattern = f"{{wrong_frac*100:.0f}}% of elements wrong"
                 else:
-                    pattern = f"{{wrong_frac*100:.1f}}% of elements wrong (likely boundary/edge case or incorrect stride)"
+                    pattern = f"{{wrong_frac*100:.1f}}% of elements wrong"
                 bias_note = f"systematic bias={{bias:+.4f}} (output is consistently {{'too high' if bias > 0 else 'too low'}})" if abs(bias) > 0.1 else "no systematic bias"
                 wrong_flat = (diff.flatten() > 1e-3).nonzero(as_tuple=False).flatten()
                 n_show = min(4, len(wrong_flat))

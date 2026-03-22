@@ -27,6 +27,7 @@ Output EXACTLY ONE ```python code block containing a complete model_new.py file 
 - Use `fmaxf`/`fminf` in device code, NOT `std::max`/`std::min`.
 - Max 1024 threads per block.
 - Declare `__shared__` arrays INSIDE the kernel body.
+- Do NOT use `--use_fast_math` in `extra_cuda_cflags`. It reduces the precision of `expf`, `tanhf`, etc. below the correctness tolerance (atol=1e-3), causing kernels with correct algorithms to fail the correctness check.
 
 # Iteration Strategy (when refining a previous attempt)
 1. DIAGNOSE FIRST: Read the error message carefully. State in a comment what line/formula is wrong and why, before writing any new code.
