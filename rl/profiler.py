@@ -48,7 +48,16 @@ def profile_kernel(kernel_code: str, reference_code: str, timeout: int = 120) ->
         os.makedirs(cache_dir, exist_ok=True)
         env["TORCH_EXTENSIONS_DIR"] = cache_dir
         if "TORCH_CUDA_ARCH_LIST" not in env:
-            env["TORCH_CUDA_ARCH_LIST"] = "9.0"
+            # Auto-detect GPU arch (e.g. 8.9 for RTX PRO 6000, 9.0 for H100)
+            try:
+                import torch as _torch
+                if _torch.cuda.is_available():
+                    major, minor = _torch.cuda.get_device_capability(0)
+                    env["TORCH_CUDA_ARCH_LIST"] = f"{major}.{minor}"
+                else:
+                    env["TORCH_CUDA_ARCH_LIST"] = "8.9"
+            except Exception:
+                env["TORCH_CUDA_ARCH_LIST"] = "8.9"
 
         # Explicitly profile the custom kernel, not PyTorch overhead
         metrics = [

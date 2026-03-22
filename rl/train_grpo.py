@@ -756,6 +756,22 @@ def _run_group_episodes(
         n_correct  = sum(1 for r in eval_results if r is not None and r.get("correct",  False))
         print(f"done ({time.time()-t_eval:.1f}s) | compiled={n_compiled}/{n_valid} correct={n_correct}/{G}")
 
+        # OOM detection: if ALL evals on turn 1 fail (often means ref model itself OOMs),
+        # skip this prompt entirely — no useful learning signal.
+        if turn_idx == 0 and n_compiled == 0:
+            oom_count = sum(
+                1 for r in eval_results
+                if r is not None and "OutOfMemory" in (r.get("compiler_error") or "")
+            )
+            if oom_count > 0:
+                print(f"  [SKIP] {oom_count}/{G} trajectories OOM on turn 1 — prompt too heavy, skipping.")
+                for i in range(G):
+                    group_rewards[i].extend([config.reward_compile_fail] * T)
+                    for _ in range(T):
+                        dummy_ids = torch.zeros(1, dtype=torch.long)
+                        group_turns[i].append((dummy_ids, dummy_ids))
+                return group_turns, group_rewards
+
         # Compile errors (all turns)
         for i, res in enumerate(eval_results):
             if res and not res.get("compiles", False) and res.get("compiler_error"):
