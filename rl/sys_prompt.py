@@ -23,6 +23,12 @@ Output EXACTLY ONE ```python code block containing a complete model_new.py file 
 - Do NOT use cuBLAS, cuDNN, or CUTLASS.
 - `load_inline` MUST always include `cpp_sources` as a string with the C++ function declaration(s).
 
+# Correctness Checklist (verify before submitting)
+- Thread Bounds: check `tid < N` before every array access.
+- Synchronization: call `__syncthreads()` before reading shared memory written by other threads.
+- Data Types: ensure pointer types match (`float*` for float tensors, no implicit casts).
+- Memory Safety: no thread may read or write outside allocated tensor bounds.
+
 # Common Bugs to Avoid
 - Use `fmaxf`/`fminf` in device code, NOT `std::max`/`std::min`.
 - Max 1024 threads per block.

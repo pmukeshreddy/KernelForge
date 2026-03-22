@@ -229,98 +229,37 @@ def _strip_thinking(text: str) -> str:
 
 def _build_turn_feedback(eval_res: dict | None) -> str:
     """
-    Build the user feedback message for the next turn (Kevin's format):
-    - Full error message (not truncated mid-sentence)
-    - Specific, actionable ask, scaled to how close the kernel is
+    Kevin-style minimal feedback: just the result + error message.
+    No prescriptive instructions — let the model reason autonomously.
     """
     if eval_res is None:
         return (
-            "Your previous response could not be evaluated. "
-            "Please write a complete, valid CUDA kernel using load_inline()."
+            "Your previous answer failed to be parsed due to not adhering to the desired formatting.\n\n"
+            "Restart your reasoning process and generate new, complete code."
         )
     if not eval_res.get("compiles", False):
         err = (eval_res.get("compiler_error") or "Unknown compile error")
-        import re as _re
-        name_match = _re.search(r"name '(\w+)' is not defined", err)
-        if name_match:
-            var = name_match.group(1)
-            hint = (
-                f"This is a Python scoping error: '{var}' is not available at module level. "
-                f"load_inline() is called when the module is imported, before any __init__ runs, "
-                f"so constructor parameters like '{var}' do not exist yet. "
-                f"Fix: move load_inline() inside __init__ where '{var}' is accessible, "
-                f"OR remove '{var}' from the cuda_source string and pass it as a kernel argument at runtime."
-            )
-        else:
-            hint = "Fix the compile error above."
-        return (
-            f"Your previous kernel failed to compile:\n{err}\n\n"
-            f"{hint} End your response with:\n"
-            "Reflection: <2-3 sentences: (1) what caused the error, (2) what you changed to fix it, (3) your parallelization strategy>"
-        )
-    if not eval_res.get("correct", False):
-        err = (eval_res.get("compiler_error") or "Outputs do not match reference")
-        wrong_frac = eval_res.get("wrong_frac")
-        shape_ok = eval_res.get("shape_ok")
-
         # Translate useless CUDA DSA message to what it actually means
         if "TORCH_USE_CUDA_DSA" in err or ("device-side assert" in err.lower() and "Compile with" in err):
             err = "Device-side assertion triggered: kernel accessed memory out of bounds at runtime. Check all array index calculations and bounds conditions."
-
-        # Shape wrong — the algorithm may be fine, only dimensions need fixing
-        if shape_ok is False:
-            return (
-                f"Your previous kernel compiled but produced incorrect outputs:\n{err}\n\n"
-                "Fix the correctness issue. End your response with:\n"
-                "Reflection: <2-3 sentences: (1) what was wrong in your previous kernel, (2) what you changed to fix it, (3) your parallelization strategy>"
-            )
-
-        # Nearly correct (<30% wrong) — small fix, don't rewrite
-        if wrong_frac is not None and wrong_frac < 0.30:
-            return (
-                f"Your previous kernel compiled but produced incorrect outputs:\n{err}\n\n"
-                "Fix the correctness issue. End your response with:\n"
-                "Reflection: <2-3 sentences: (1) what was wrong in your previous kernel, (2) what you changed to fix it, (3) your parallelization strategy>"
-            )
-
-        # Partially wrong (30-90%) — indexing bug
-        if wrong_frac is not None and wrong_frac < 0.90:
-            return (
-                f"Your previous kernel compiled but produced incorrect outputs:\n{err}\n\n"
-                "Fix the correctness issue. End your response with:\n"
-                "Reflection: <2-3 sentences: (1) what was wrong in your previous kernel, (2) what you changed to fix it, (3) your parallelization strategy>"
-            )
-
-        # Mostly wrong (>90%) — fundamental error, rewrite
-        if "FUNDAMENTAL ALGORITHMIC ERROR" in err:
-            return (
-                f"Your previous kernel compiled but produced incorrect outputs:\n{err}\n\n"
-                "Rewrite the kernel completely from scratch — do not modify the existing code. "
-                "Study the reference implementation carefully before writing. End your response with:\n"
-                "Reflection: <2-3 sentences: (1) what was fundamentally wrong, (2) what algorithm you are using in the rewrite, (3) your parallelization strategy>"
-            )
         return (
-            f"Your previous kernel compiled but produced incorrect outputs:\n{err}\n\n"
-            "Fix the correctness issue. End your response with:\n"
-            "Reflection: <2-3 sentences: (1) what was wrong in your previous kernel, (2) what you changed to fix it, (3) your parallelization strategy>"
+            f"Your previous answer failed to compile. Here is the error message:\n{err}\n\n"
+            "Restart your reasoning process and generate new, complete code."
         )
-
+    if not eval_res.get("correct", False):
+        err = (eval_res.get("compiler_error") or "Outputs do not match reference")
+        if "TORCH_USE_CUDA_DSA" in err or ("device-side assert" in err.lower() and "Compile with" in err):
+            err = "Device-side assertion triggered: kernel accessed memory out of bounds at runtime. Check all array index calculations and bounds conditions."
+        return (
+            f"Your previous answer was incorrect. Here is the error message:\n{err}\n\n"
+            "Restart your reasoning process and generate new, complete code."
+        )
     rt = eval_res.get("runtime_ms")
     bt = eval_res.get("baseline_runtime_ms")
-    if rt and bt:
-        speedup = bt / rt
-        return (
-            f"Your previous kernel was correct at {speedup:.2f}x speedup over PyTorch. "
-            "Try to optimize it further — shared memory, vectorized loads, better parallelism, tuned block size. "
-            "IMPORTANT: preserve correctness. Only submit if your optimized version still produces correct outputs. "
-            "End your response with:\n"
-            "Reflection: <2-3 sentences: (1) what you changed vs your previous kernel, (2) why you expected it to be faster, (3) what you would try next>"
-        )
+    speedup_str = f" at {bt/rt:.2f}x speedup over PyTorch" if (rt and bt) else ""
     return (
-        "Your previous kernel was correct. Try to optimize it for GPU performance. "
-        "IMPORTANT: preserve correctness. "
-        "End your response with:\n"
-        "Reflection: <2-3 sentences: (1) what you changed vs your previous kernel, (2) why you expected it to be faster, (3) what you would try next>"
+        f"Your previous answer was correct{speedup_str}.\n\n"
+        "Restart your reasoning process and generate new, complete code."
     )
 
 
