@@ -66,8 +66,18 @@ def profile_kernel(kernel_code: str, reference_code: str, timeout: int = 120) ->
             "sm__warps_active.avg.pct_of_peak_sustained_active"
         ]
         
+        # Find ncu: prefer /usr/local/cuda/bin/ncu over system ncu
+        ncu_bin = shutil.which("ncu")
+        for candidate in ["/usr/local/cuda/bin/ncu", "/usr/local/cuda-12/bin/ncu"]:
+            if os.path.isfile(candidate):
+                ncu_bin = candidate
+                break
+        if ncu_bin is None:
+            ncu_bin = "ncu"
+
+        # ncu needs sudo for GPU performance counters
         ncu_cmd = [
-            "ncu",
+            "sudo", ncu_bin,
             "--target-processes", "all",
             "--metrics", ",".join(metrics),
             "--csv",
