@@ -304,7 +304,6 @@ def launch_sglang_server(model_path: str, adapter_path: str, port: int, tp: int,
         "--mem-fraction-static", "0.45",
         "--context-length", "16384",
         "--log-level", "error",
-        "--enable-prefix-caching",       # cache shared prefix KV across all G trajectories
         "--max-running-requests", "32",  # allow all G*phases requests to run concurrently
     ]
 
