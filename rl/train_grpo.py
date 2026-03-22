@@ -94,8 +94,9 @@ class GRPOConfig:
 
     # Multi-turn (Kevin's recipe): T refinement turns per trajectory
     # γ=0.4 discounts later turns so getting it right on turn 1 is worth more.
+    # Kevin's ablation explicitly found 0.4 > 0.8 for CUDA kernel RL.
     num_turns: int = 4
-    gamma: float = 0.7
+    gamma: float = 0.4
 
     # Generation
     max_new_tokens: int = 6000        # total budget (thinking + code)
@@ -127,6 +128,11 @@ class GRPOConfig:
     reward_nearly_correct: float = 0.05  # <30% of values wrong (boundary/edge case)
     reward_wrong_output: float = -0.1   # fallback when wrong_frac unavailable
     reward_correct_base: float = 0.3    # base bonus for any correct kernel (Kevin's approach)
+
+    # Regression penalty (SCoRe): if turn T was correct and turn T+1 breaks it,
+    # subtract this from the turn T+1 reward so the model has a specific gradient
+    # signal for "don't regress from a working state" (not just "be correct").
+    reward_regression_penalty: float = -0.3
 
     # Length penalty — scaled to be minor relative to reward signal
     # At 3000 tokens: -0.0001 * 3000 = -0.3 (won't swamp the correctness signal)
@@ -639,13 +645,13 @@ def _run_group_episodes(
     for turn_idx in range(T):
         turn_label = f"Turn {turn_idx+1}/{T}"
 
-        # Build context texts: base prompt + most recent turn's [code + feedback].
-        # Showing only the last turn (not all) keeps context O(1) regardless of T.
+        # Build context texts: base prompt + all prior turns [code + feedback].
+        # Kevin, Dr. Kernel, and MURPHY all keep full history — the model needs to
+        # see all prior attempts to identify which approach was best and avoid repeating mistakes.
         context_texts = []
         for i in range(G):
             msgs = list(base_messages)
-            if turn_idx > 0:
-                t = turn_idx - 1
+            for t in range(turn_idx):
                 stripped = _strip_thinking(traj_responses[i][t])
                 if i == 0:
                     has_ref = "Reflection:" in stripped
@@ -753,6 +759,11 @@ def _run_group_episodes(
                     r = config.reward_partially_wrong + length_penalty
                 else:
                     r = config.reward_mostly_wrong + length_penalty
+                # Regression penalty (SCoRe): if previous turn was correct and this one isn't,
+                # add an extra penalty so the model learns specifically not to break working code.
+                if turn_idx > 0 and traj_evals[i][turn_idx - 1] is not None:
+                    if traj_evals[i][turn_idx - 1].get("correct", False):
+                        r += config.reward_regression_penalty
             else:
                 r = config.reward_correct_base + calculate_reward(eval_res) + length_penalty
                 if i < 3:
