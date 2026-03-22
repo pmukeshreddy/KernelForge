@@ -427,7 +427,7 @@ with open(_cu_path, "w") as _f:
 ext = load(
     name="{mod_name}",
     sources=[_cu_path],
-    extra_cuda_cflags=["-O3", "--use_fast_math"],
+    extra_cuda_cflags=["-O3"],
     verbose=False,
 )
 '''
@@ -634,7 +634,7 @@ class KernelForgeAgent:
                 print(f"--- FAILED GENERATED CODE ---\n{candidate_code}\n-----------------------------")
                 
                 # Feed error back to LLM (show the C++ error, not Python wrapper errors)
-                feedback = f"Your CUDA C++ code failed during compilation or evaluation.\n\nError Log:\n```\n{error_msg}\n```\n\nAnalyze the root cause carefully. If this is a CUDA runtime error (illegal memory access), check your shared memory sizing, indexing bounds, and output write offsets. Remember: use float* and data_ptr<float>() for float32 tensors. Fix the bug and output the corrected C++ code."
+                feedback = f"Your previous answer was incorrect. Here is the error message:\n{error_msg}\n\nRestart your reasoning process and generate new, complete code."
                 messages.append({"role": "user", "content": feedback})
                 continue
 
@@ -656,7 +656,7 @@ class KernelForgeAgent:
             # 6. Iteration Feedback
             if step < max_steps:
                 print("🔄 Sending profiler feedback back to LLM for next iteration...")
-                feedback = f"Success! Your kernel ran in {runtime_ms:.3f} ms, achieving a {reward:.2f}x speedup over the baseline.\n\nHere is the hardware profiling report:\n{profiler_feedback}\n\nCan you optimize the kernel further to resolve the bottleneck? Output the improved ```python model_new.py."
+                feedback = f"Your previous answer was correct at {reward:.2f}x speedup over PyTorch.\n\nHere is the hardware profiling report:\n{profiler_feedback}\n\nRestart your reasoning process and generate new, complete code."
                 messages.append({"role": "user", "content": feedback})
 
         print(f"\n🏁 Optimization Completed. Best Reward: {best_reward:.2f}x")

@@ -1,53 +1,51 @@
 """
-reward.py - SP2 Reward Function for RL
+reward.py - Speedup reward component for correct kernels.
 
-Maps the execution sandbox evaluation metrics to a scalar RL reward.
-Focuses strictly on correctness (binary 0/1 gate) and speedup (multiplier).
+NOTE: This function is called ONLY for kernels that are already correct.
+It returns the speedup-based reward component added on top of reward_correct_base.
+
+Full graduated reward logic (compile fail, shape mismatch, wrong outputs, regression
+penalty, etc.) lives in train_grpo.py:_run_group_episodes() and is used during
+RL training. This function is the speedup component only, used by:
+  - train_grpo.py: `reward_correct_base + calculate_reward(eval_res)`
+  - agent.py: standalone inference reward display
 """
 
 import math
 
+
 def calculate_reward(sandbox_result: dict, max_reward: float = 3.0) -> float:
     """
-    Calculate RL reward from sandbox evaluation result.
-    
+    Speedup reward for a correct kernel. Returns 0.0 if not correct or no timing data.
+
+    Scaling:
+      speedup <= 2x  → reward = speedup          (linear)
+      speedup >  2x  → reward = 2 + log2(s/2)    (log-scaled to avoid gradient spikes)
+      capped at max_reward=3.0
+
     Args:
-        sandbox_result: Dictionary from sandbox.evaluate() containing
-                        compiles, correct, runtime_ms, baseline_runtime_ms
-        max_reward: Cap the maximum reward to prevent gradient explosions
-                   from tiny measurement anomalies
-                   
+        sandbox_result: dict from sandbox.evaluate()
+        max_reward: cap to prevent gradient explosions from micro-benchmark noise
+
     Returns:
-        float: The continuous scalar reward for PPO
+        float speedup reward (0.0 if kernel is wrong or timing unavailable)
     """
-    # 1. Gate: Must compile
     if not sandbox_result.get("compiles", False):
         return 0.0
-        
-    # 2. Gate: Must produce correct outputs
     if not sandbox_result.get("correct", False):
         return 0.0
-        
+
     baseline_ms = sandbox_result.get("baseline_runtime_ms")
     kernel_ms = sandbox_result.get("runtime_ms")
-    
-    # 3. Validation: Must have valid timing data
-    if baseline_ms is None or kernel_ms is None:
+
+    if baseline_ms is None or kernel_ms is None or kernel_ms <= 0:
         return 0.0
-        
-    if kernel_ms <= 0:  # Prevent division by zero or negative anomaly
-        return 0.0
-        
-    # 4. Calculation: Speedup = baseline / kernel
+
     speedup = baseline_ms / kernel_ms
-    
-    # Smooth out extreme advantages with log-scale for high speedups to stabilize GRPO
+
     if speedup > 2.0:
         reward = 2.0 + math.log2(speedup / 2.0)
     else:
         reward = speedup
-        
-    # Cap reward to prevent wild spikes from micro-benchmarks
-    reward = min(reward, max_reward)
-    
-    return float(reward)
+
+    return float(min(reward, max_reward))

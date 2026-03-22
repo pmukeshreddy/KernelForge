@@ -189,7 +189,7 @@ ext = load_inline(
     cpp_sources="torch::Tensor add_cuda(torch::Tensor a, torch::Tensor b);",
     cuda_sources=cuda_source,
     functions=["add_cuda"],
-    extra_cuda_cflags=["-O3", "--use_fast_math"],
+    extra_cuda_cflags=["-O3"],
 )
 
 class ModelNew(nn.Module):
@@ -545,7 +545,7 @@ def _run_group_episodes(
     G = config.group_size
     T = config.num_turns
 
-    sys_content = get_system_prompt().replace("<|im_start|>system\n", "").replace("<|im_end|>\n", "").strip()
+    sys_content = get_system_prompt().strip()
     user_msg = f"{FORMAT_EXAMPLE}Reference Program:\n```python\n{prompt_text}\n```"
     base_messages = [
         {"role": "system", "content": sys_content},
@@ -801,8 +801,10 @@ def _get_token_log_probs(
     resp_logits = outputs.logits[0, Q - 1 : Q + R - 1, :]  # [R, V]
     log_probs = F.log_softmax(resp_logits, dim=-1)           # [R, V]
     token_log_probs = log_probs[range(R), r_ids]              # [R]
+    # Real per-token entropy H = -sum_v p(v) log p(v), mean over response tokens
+    entropy = -(log_probs.exp() * log_probs).sum(-1).mean()  # scalar
 
-    return token_log_probs
+    return token_log_probs, entropy
 
 
 def _compute_grpo_loss_and_backward(
@@ -864,7 +866,7 @@ def _compute_grpo_loss_and_backward(
 
             A_i_t = advantages[i, turn_idx].item()
 
-            new_lp = _get_token_log_probs(model, ctx, resp)
+            new_lp, entropy = _get_token_log_probs(model, ctx, resp)
             old_lp = old_log_probs[i][turn_idx].to(new_lp.device)
 
             ratio   = torch.exp(new_lp - old_lp.detach())
@@ -874,7 +876,8 @@ def _compute_grpo_loss_and_backward(
             loss_term = seq_loss.mean()
 
             if config.entropy_coef > 0:
-                loss_term = loss_term - config.entropy_coef * (-new_lp.mean())
+                # Real H(π) = -Σ_v p(v) log p(v), computed in _get_token_log_probs
+                loss_term = loss_term - config.entropy_coef * entropy
 
             # Divide by n_seqs so the sum of all backward() calls = proper mean loss.
             # Call backward immediately — frees this sequence's computation graph,
@@ -898,7 +901,7 @@ def _run_evaluation(model, tokenizer, config: GRPOConfig, val_prompts: list[str]
         for prompt_text in val_prompts:
             # Build prompt matching SFT training format via apply_chat_template
             user_msg = f"{FORMAT_EXAMPLE}Reference Program:\n```python\n{prompt_text}\n```"
-            sys_content = get_system_prompt().replace("<|im_start|>system\n", "").replace("<|im_end|>\n", "").strip()
+            sys_content = get_system_prompt().strip()
             messages = [
                 {"role": "system", "content": sys_content},
                 {"role": "user", "content": user_msg},
@@ -1238,7 +1241,7 @@ def train(config: GRPOConfig = None):
                             turn_lps.append(torch.zeros(0))
                         else:
                             with torch.no_grad():
-                                lp = _get_token_log_probs(model, ctx, resp)
+                                lp, _ = _get_token_log_probs(model, ctx, resp)
                             turn_lps.append(lp.detach().cpu())
                     group_old.append(turn_lps)
                 all_old_lps.append(group_old)
