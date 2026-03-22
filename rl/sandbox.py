@@ -245,7 +245,17 @@ try:
                 got_val = nf.flatten()[max_pos].item()
                 bias = (nf - rf).mean().item()
                 # Diagnose error pattern to give actionable feedback
-                if wrong_frac > 0.9:
+                exp_scale = rf.abs().mean().item()
+                if max_err > 1e5 and (exp_scale < 10.0 or max_err > exp_scale * 1e4):
+                    pattern = (
+                        f"MEMORY CORRUPTION (max_err={{max_err:.2g}} but expected values ~{{exp_scale:.3g}}): "
+                        "outputs are many orders of magnitude larger than expected. "
+                        "This is NOT a numerical algorithm error — the kernel is reading from wrong-device "
+                        "or uninitialized memory. Most likely cause: custom weight tensors stored in a plain "
+                        "Python list (self.weights=[...]) instead of nn.Parameter/nn.ParameterList, "
+                        "so they stay on CPU and their data_ptr() is invalid on the GPU."
+                    )
+                elif wrong_frac > 0.9:
                     pattern = "FUNDAMENTAL ALGORITHMIC ERROR (>90% outputs wrong): your core formula is incorrect — do NOT make incremental tweaks, rewrite the kernel from scratch"
                 elif wrong_frac > 0.3:
                     pattern = f"{{wrong_frac*100:.0f}}% of elements wrong"

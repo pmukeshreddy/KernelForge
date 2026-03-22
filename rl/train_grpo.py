@@ -263,19 +263,6 @@ def _build_turn_feedback(eval_res: dict | None) -> str:
         wrong_frac = eval_res.get("wrong_frac")
         shape_ok = eval_res.get("shape_ok")
 
-        import re as _re
-        if "TORCH_USE_CUDA_DSA" in err or "device-side assert" in err.lower():
-            err = (
-                "CUDA out-of-bounds memory access: a thread read/wrote past array bounds. "
-                "Common causes: (1) threadIdx.y used as batch index but blockDim.y > batch_size — "
-                "threads with threadIdx.y >= batch_size go out of bounds; "
-                "(2) shared memory loaded by only threadIdx.x threads but indexed up to in_features; "
-                "(3) output index calculation does not match tensor layout [batch, out_features]. "
-                "Fix: ensure every thread index stays within the tensor dimensions it accesses. "
-                "If you changed from a flat 1D kernel to a 2D block layout, verify blockDim.x/y "
-                "and your index formula match the new launch configuration."
-            )
-
         # Shape wrong — the algorithm may be fine, only dimensions need fixing
         if shape_ok is False:
             return (
