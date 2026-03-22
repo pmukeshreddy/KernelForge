@@ -28,9 +28,7 @@ Output EXACTLY ONE ```python code block containing a complete model_new.py file 
 - Max 1024 threads per block.
 - Declare `__shared__` arrays INSIDE the kernel body.
 - Do NOT use `--use_fast_math` in `extra_cuda_cflags`.
-- Store ALL custom weight tensors as `nn.Parameter` (or `nn.ParameterList`), NOT plain Python lists. Plain lists stay on CPU — passing `.data_ptr<float>()` of a CPU tensor to a CUDA kernel produces garbage values (outputs millions times too large).
-- When using a 3D grid `dim3 grid(x, y, z)`, the mapping `blockIdx.x/y/z → dimension` must be consistent between the launch call and the kernel body. Swapping e.g. batch and n-tile dimensions silently produces wrong results.
-- When loading shared memory tiles, ensure ALL elements are loaded. If `blockDim.x < BLOCK_K`, each thread must load multiple elements (loop or stride). A load guarded by `tx < BLOCK_K` where `tx` only reaches `blockDim.x-1 < BLOCK_K` silently leaves part of the tile uninitialized. It reduces the precision of `expf`, `tanhf`, etc. below the correctness tolerance (atol=1e-3), causing kernels with correct algorithms to fail the correctness check.
+- Store ALL custom weight tensors as `nn.Parameter` (or `nn.ParameterList`), NOT plain Python lists. Plain lists stay on CPU — passing `.data_ptr<float>()` of a CPU tensor to a CUDA kernel produces garbage values (outputs millions times too large). It reduces the precision of `expf`, `tanhf`, etc. below the correctness tolerance (atol=1e-3), causing kernels with correct algorithms to fail the correctness check.
 
 # Iteration Strategy (when refining a previous attempt)
 1. DIAGNOSE FIRST: Read the error message carefully. State in a comment what line/formula is wrong and why, before writing any new code.
