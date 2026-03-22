@@ -92,12 +92,12 @@ def evaluate(kernel_code: str, reference_code: str, timeout: int = 300,
         "baseline_runtime_ms": None,
     }
 
-    # -O1 for correctness-only turns: ~40% faster compile, correctness unaffected.
-    # -O3 only when we need timing (final turn).
+    # All turns get timing now, but non-final turns use -O1 + fewer trials for speed.
+    # Final turns use -O3 + full trials for accurate benchmarking.
     if not timed:
         kernel_code = kernel_code.replace('"-O3"', '"-O1"')
-        n_warmup = 0
-        n_timed  = 0
+        n_warmup = 1
+        n_timed  = 2
 
     tmpdir = tempfile.mkdtemp(prefix="kf_sandbox_")
     result_path = os.path.join(tmpdir, "result.json")

@@ -173,41 +173,16 @@ def _parse_ncu_csv(csv_text: str) -> Dict[str, float]:
 
 
 def _generate_feedback(metrics: Dict[str, float]) -> str:
-    """Turn raw metrics into an actionable RL prompt."""
+    """Raw hardware metrics — no prescriptive advice. Model uses <think> to reason."""
     compute = metrics.get("compute", 0.0)
     memory = metrics.get("memory", 0.0)
     occupancy = metrics.get("occupancy", 0.0)
-    
-    # Determine bottleneck
-    if occupancy < 40.0:
-        bottleneck = "Warning: Occupancy is very low (LATENCY-BOUND). The SMs are largely idle."
-        advice = "The kernel is stalled or not mapping enough parallel work. Increase block size, reduce registers/thread, or reduce shared memory usage to map more Warps per SM."
-    elif memory > compute * 2.0 or memory > 70.0:
-        bottleneck = "MEMORY-BOUND"
-        advice = "Try coalesced global memory accesses, vectorization (float4), or utilizing shared memory caching to reduce global memory traffic."
-    elif compute > memory * 2.0 or compute > 70.0:
-        bottleneck = "COMPUTE-BOUND"
-        advice = "Reduce divergent branches, unroll inner loops, or use intrinsic math functions (e.g., __fdividef) to speed up math operations."
-    elif compute > 40.0 and memory > 40.0:
-        bottleneck = "BALANCED (PIPELINE-BOUND)"
-        advice = "Both memory and compute are moderately utilized. Focus on instruction-level parallelism (ILP) and hiding latency through higher occupancy."
-    else:
-        bottleneck = "LATENCY-BOUND (SYNCHRONIZATION/MEMORY LATENCY)"
-        advice = "Neither memory bandwidth nor compute units are saturated. You are likely stalled on excessive __syncthreads(), bad memory access patterns causing cache misses, or loop dependencies."
 
-    # Format actionable feedback
-    feedback = f"--- Profiler Analysis ---\n"
-    feedback += f"Bottleneck: {bottleneck}\n\n"
-    feedback += f"Hardware Utilization:\n"
-    feedback += f"- Memory Throughput:  {memory:>5.1f}% of peak\n"
-    feedback += f"- Compute Throughput: {compute:>5.1f}% of peak\n"
-    feedback += f"- Warp Occupancy:     {occupancy:>5.1f}% of theoretical peak\n\n"
-    
-    if occupancy < 30.0:
-        feedback += "Warning: Occupancy is very low. Reduce shared memory usage per block or register count per thread to allow more warps to schedule concurrently.\n"
-        
-    feedback += f"Recommendation: {advice}"
-    
+    feedback = f"--- Hardware Profiler ---\n"
+    feedback += f"Memory Throughput:  {memory:>5.1f}% of peak\n"
+    feedback += f"Compute Throughput: {compute:>5.1f}% of peak\n"
+    feedback += f"Warp Occupancy:     {occupancy:>5.1f}% of theoretical peak"
+
     return feedback
 
 
