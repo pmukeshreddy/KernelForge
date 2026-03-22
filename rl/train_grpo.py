@@ -817,10 +817,9 @@ def _run_group_episodes(
                     if traj_best_speedup[i] is None or sp > traj_best_speedup[i]:
                         traj_best_speedup[i] = sp
                         traj_best_turn[i] = turn_idx + 1
-                if i < 3:
-                    rt_str = f"{eval_res['runtime_ms']:.3f}ms" if eval_res.get('runtime_ms') is not None else "no timing"
-                    sp_str = f" ({bt/rt:.2f}x)" if (rt and bt) else ""
-                    print(f"    ✅ Turn {turn_idx+1} Traj {i}: {rt_str}{sp_str} reward={r:.0f}")
+                rt_str = f"{eval_res['runtime_ms']:.3f}ms" if eval_res.get('runtime_ms') is not None else "no timing"
+                sp_str = f" ({bt/rt:.2f}x)" if (rt and bt) else ""
+                print(f"    ✅ Turn {turn_idx+1} Traj {i}: {rt_str}{sp_str} reward={r:.2f}")
 
             group_rewards[i].append(r)
 
