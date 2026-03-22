@@ -263,6 +263,10 @@ def _build_turn_feedback(eval_res: dict | None) -> str:
         wrong_frac = eval_res.get("wrong_frac")
         shape_ok = eval_res.get("shape_ok")
 
+        # Translate useless CUDA DSA message to what it actually means
+        if "TORCH_USE_CUDA_DSA" in err or ("device-side assert" in err.lower() and "Compile with" in err):
+            err = "Device-side assertion triggered: kernel accessed memory out of bounds at runtime. Check all array index calculations and bounds conditions."
+
         # Shape wrong — the algorithm may be fine, only dimensions need fixing
         if shape_ok is False:
             return (

@@ -277,6 +277,12 @@ try:
                     _g = nf.flatten()[_fidx].item()
                     sample_lines.append(f"  pos={{_c}} expected={{_e:.5f}} got={{_g:.5f}} err={{abs(_e-_g):.5f}}")
                 samples_str = (" | First " + str(n_show) + " wrong elements:\\n" + "\\n".join(sample_lines)) if sample_lines else ""
+                # Detect unwritten-output pattern: got≈0 while expected≠0
+                got_vals = nf.flatten()[wrong_flat[:min(20, len(wrong_flat))]].abs()
+                exp_vals = rf.flatten()[wrong_flat[:min(20, len(wrong_flat))]].abs()
+                zero_got_frac = (got_vals < 1e-6).float().mean().item()
+                if zero_got_frac > 0.7 and exp_vals.mean().item() > 0.01:
+                    samples_str += " | NOTE: most wrong outputs are 0.0 — these positions were likely never written by any thread (launch too few threads, or thread index formula skips them)"
                 correctness_detail = (
                     f"Output tensor {{t_idx}}: {{pattern}}. "
                     f"max_abs_error={{max_err:.5f}}, mean_abs_error={{mean_err:.5f}}, {{bias_note}}. "
