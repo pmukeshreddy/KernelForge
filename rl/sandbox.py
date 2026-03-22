@@ -7,6 +7,7 @@ and timing results.
 """
 import os
 import sys
+import stat
 import random
 import subprocess
 import tempfile
@@ -15,8 +16,55 @@ import json
 from antihack import check_security
 
 
+def _ensure_ccache_nvcc(env: dict) -> None:
+    """
+    Route nvcc through ccache for persistent CUDA compilation caching.
+    Same kernel compiled twice (e.g. traj=0 submitting identical code across turns)
+    returns from cache in milliseconds instead of 5-7s.
+
+    Creates a wrapper script ~/.cache/kf_nvcc_wrapper/nvcc → ccache <real_nvcc>
+    once; reuses it on every subsequent call. CUDA_HOME is cleared so PyTorch
+    finds nvcc via PATH (our wrapper) instead of the direct CUDA_HOME/bin/nvcc path.
+    CPATH already contains CUDA headers (set earlier in evaluate()), so removing
+    CUDA_HOME does not break header resolution.
+    """
+    if not shutil.which("ccache"):
+        return
+
+    # Find real nvcc path before we touch env
+    cuda_home = env.get("CUDA_HOME") or env.get("CUDA_PATH")
+    if cuda_home:
+        real_nvcc = os.path.join(cuda_home, "bin", "nvcc")
+    else:
+        real_nvcc = shutil.which("nvcc") or ""
+    if not real_nvcc or not os.path.isfile(real_nvcc):
+        return
+
+    wrapper_dir  = os.path.expanduser("~/.cache/kf_nvcc_wrapper")
+    wrapper_nvcc = os.path.join(wrapper_dir, "nvcc")
+    ccache_dir   = os.path.expanduser("~/.cache/kf_nvcc_ccache")
+
+    if not os.path.isfile(wrapper_nvcc):
+        os.makedirs(wrapper_dir, exist_ok=True)
+        os.makedirs(ccache_dir,  exist_ok=True)
+        with open(wrapper_nvcc, "w") as f:
+            f.write(f"#!/bin/sh\nexec ccache {real_nvcc} \"$@\"\n")
+        os.chmod(wrapper_nvcc,
+                 stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP |
+                 stat.S_IROTH | stat.S_IXOTH)
+        print(f"[ccache] nvcc wrapper → {wrapper_nvcc}  cache → {ccache_dir}")
+
+    env["CCACHE_DIR"]      = ccache_dir
+    env["CCACHE_SLOPPINESS"] = "time_macros"   # avoids false misses on __DATE__/__TIME__
+    env["PATH"]            = wrapper_dir + ":" + env.get("PATH", os.environ.get("PATH", ""))
+    # Remove CUDA_HOME/CUDA_PATH so PyTorch resolves nvcc via PATH (finds our wrapper)
+    env.pop("CUDA_HOME", None)
+    env.pop("CUDA_PATH", None)
+
+
 def evaluate(kernel_code: str, reference_code: str, timeout: int = 300,
-             n_correctness: int = 10, n_warmup: int = 3, n_timed: int = 10) -> dict:
+             n_correctness: int = 10, n_warmup: int = 3, n_timed: int = 10,
+             timed: bool = True) -> dict:
     """
     Evaluate a generated CUDA kernel against a reference PyTorch model.
 
@@ -44,6 +92,13 @@ def evaluate(kernel_code: str, reference_code: str, timeout: int = 300,
         "baseline_runtime_ms": None,
     }
 
+    # -O1 for correctness-only turns: ~40% faster compile, correctness unaffected.
+    # -O3 only when we need timing (final turn).
+    if not timed:
+        kernel_code = kernel_code.replace('"-O3"', '"-O1"')
+        n_warmup = 0
+        n_timed  = 0
+
     tmpdir = tempfile.mkdtemp(prefix="kf_sandbox_")
     result_path = os.path.join(tmpdir, "result.json")
 
@@ -62,7 +117,7 @@ def evaluate(kernel_code: str, reference_code: str, timeout: int = 300,
         # Run in subprocess
         env = os.environ.copy()
         env["PYTHONPATH"] = tmpdir
-        
+
         # Each sandbox gets its own cache subdir to avoid parallel-eval race conditions
         # where two processes compile different kernels with the same name= simultaneously.
         cache_dir = os.path.join(tmpdir, ".kf_cache")
@@ -72,6 +127,8 @@ def evaluate(kernel_code: str, reference_code: str, timeout: int = 300,
             import torch
             major, minor = torch.cuda.get_device_capability()
             env["TORCH_CUDA_ARCH_LIST"] = f"{major}.{minor}"
+
+        _ensure_ccache_nvcc(env)  # route nvcc through ccache for persistent compile cache
 
         proc = subprocess.run(
             [sys.executable, eval_path],

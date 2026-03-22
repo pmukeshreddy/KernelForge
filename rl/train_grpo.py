@@ -48,9 +48,9 @@ from sys_prompt import get_system_prompt
 
 
 def _worker_run_eval(args):
-    cand, prompt_text = args
+    cand, prompt_text, timed = args
     if cand is None: return None
-    return evaluate(cand, prompt_text)
+    return evaluate(cand, prompt_text, timed=timed)
 
 
 def _extract_python_block(text: str) -> str:
@@ -663,11 +663,12 @@ def _run_group_episodes(
 
         n_valid = sum(1 for c in candidates if c is not None)
         t_eval = time.time()
+        is_final_turn = (turn_idx == T - 1)
         print(f"  [{turn_label}] Evaluating {n_valid}/{G} valid kernels...", end=" ", flush=True)
         with ProcessPoolExecutor(max_workers=min(G, 16), mp_context=_MP_SPAWN_CTX) as pool:
             eval_results = list(pool.map(
                 _worker_run_eval,
-                [(c, prompt_text) for c in candidates],
+                [(c, prompt_text, is_final_turn) for c in candidates],
             ))
         n_compiled = sum(1 for r in eval_results if r is not None and r.get("compiles", False))
         n_correct  = sum(1 for r in eval_results if r is not None and r.get("correct",  False))
@@ -935,7 +936,8 @@ def _run_evaluation(model, tokenizer, config: GRPOConfig, val_prompts: list[str]
     total_speedup = 0.0
 
     with ProcessPoolExecutor(max_workers=min(16, len(val_prompts)), mp_context=_MP_SPAWN_CTX) as pool:
-        eval_results = list(pool.map(_worker_run_eval, candidates_to_eval))
+        eval_results = list(pool.map(_worker_run_eval,
+                                     [(c, p, True) for c, p in candidates_to_eval]))
         
     for res in eval_results:
         if res is not None:
