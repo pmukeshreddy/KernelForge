@@ -630,6 +630,12 @@ def _run_group_episodes(
     traj_best_speedup: list[float | None] = [None] * G  # best speedup achieved so far
     traj_best_turn:    list[int | None]   = [None] * G  # which turn achieved it
 
+    # Warm start: best correct kernel across ALL trajectories per turn
+    # Failed trajectories in turn 2+ get this kernel injected so they focus on optimization
+    group_best_code: list[str | None] = [None] * T   # best code per turn
+    group_best_eval: list[dict | None] = [None] * T   # eval result for best code per turn
+    group_best_completion: list[str | None] = [None] * T  # raw completion for best code
+
     # ── DEBUG: what operation is this prompt? ───────────────────────────────
     # Extract first torch call from prompt to label the operation
     op_match = re.search(r'torch\.\w+|nn\.\w+', prompt_text)
@@ -647,51 +653,114 @@ def _run_group_episodes(
         context_texts = []
         for i in range(G):
             msgs = list(base_messages)
-            for t in range(turn_idx):
-                # Only keep full code for the most recent prior turn;
-                # older turns get code truncated to save context tokens.
-                is_old_turn = (t < turn_idx - 1)
-                stripped = _strip_thinking(traj_responses[i][t], truncate_code=is_old_turn)
-                if i == 0:
-                    has_ref = "Reflection:" in stripped
-                    print(f"  [DEBUG] Turn {t+1}→{turn_idx+1} traj=0: "
-                          f"reflection={'YES' if has_ref else 'NO'}, stripped_len={len(stripped)} chars"
-                          f"{' (truncated)' if is_old_turn else ''}")
+
+            # ── Warm start check: did this trajectory fail on the last turn
+            # while a better kernel exists from another trajectory? ──────────
+            use_warm_start = False
+            if turn_idx > 0:
+                last_t = turn_idx - 1
+                my_eval = traj_evals[i][last_t]
+                my_failed = (my_eval is None or not my_eval.get("correct", False))
+                if my_failed and group_best_code[last_t] is not None:
+                    use_warm_start = True
+
+            if use_warm_start:
+                # Instead of this trajectory's own failed history, inject the
+                # group's best correct kernel and ask to optimize it.
+                # We only include the latest best turn (not full multi-turn history)
+                # to keep context short and focused on optimization.
+                best_t = last_t  # the turn that produced the best kernel
+                best_completion = group_best_completion[best_t]
+                best_eval = group_best_eval[best_t]
+
+                stripped = _strip_thinking(best_completion, truncate_code=False)
                 msgs.append({"role": "assistant", "content": stripped})
-                prev_eval = traj_evals[i][t - 1] if t > 0 else None
-                # Compute high water mark up to turn t for feedback context
-                hwm_speedup, hwm_turn = None, None
-                for pt in range(t):
-                    pe = traj_evals[i][pt]
-                    if pe and pe.get("correct") and pe.get("baseline_runtime_ms") and pe.get("runtime_ms"):
-                        sp = pe["baseline_runtime_ms"] / pe["runtime_ms"]
-                        if hwm_speedup is None or sp > hwm_speedup:
-                            hwm_speedup, hwm_turn = sp, pt + 1
-                feedback = _build_turn_feedback(
-                    traj_evals[i][t], prev_eval=prev_eval,
-                    best_speedup=hwm_speedup, best_turn=hwm_turn,
-                    profiler_feedback=traj_evals[i][t].get("profiler_feedback") if traj_evals[i][t] else None,
+
+                # Build optimization-focused feedback using the best kernel's eval
+                rt = best_eval.get("runtime_ms") if best_eval else None
+                bt = best_eval.get("baseline_runtime_ms") if best_eval else None
+                ct = best_eval.get("compile_runtime_ms") if best_eval else None
+                timing_lines = []
+                if rt and bt:
+                    timing_lines.append(f"Your kernel: {rt:.3f}ms")
+                    timing_lines.append(f"PyTorch eager: {bt:.3f}ms ({bt/rt:.2f}x)")
+                if ct:
+                    timing_lines.append(f"torch.compile: {ct:.3f}ms" + (f" ({ct/rt:.2f}x)" if rt else ""))
+                timing_str = "\n".join(timing_lines)
+                # Include profiler data if available from the best kernel
+                prof_fb = best_eval.get("profiler_feedback") if best_eval else None
+                profiler_str = f"\n\n{prof_fb}" if prof_fb else ""
+                feedback = (
+                    f"Your previous answer was correct.\n{timing_str}{profiler_str}\n\n"
+                    "Keep your working approach and optimize it for speed. Generate the complete improved code."
                 )
+
                 if i == 0:
-                    print(f"  [DEBUG] Feedback traj=0 turn {t+1}→{turn_idx+1}:\n{feedback}")
-                elif (traj_evals[i][t] is not None
-                      and not traj_evals[i][t].get("correct", False)
-                      and t == turn_idx - 1):
-                    # Print feedback for first wrong traj so we see what error msg it received
-                    is_first_wrong = not any(
-                        traj_evals[j][t] is not None
-                        and not traj_evals[j][t].get("correct", False)
-                        and t == turn_idx - 1
-                        for j in range(1, i)
-                    )
-                    if is_first_wrong:
-                        print(f"  [DEBUG] Feedback traj={i} turn {t+1}→{turn_idx+1}:\n{feedback}")
+                    print(f"  [DEBUG] WARM START traj=0 turn {turn_idx+1}: "
+                          f"injected best kernel from turn {best_t+1}")
+                    print(f"  [DEBUG] Feedback traj=0 turn {best_t+1}→{turn_idx+1}:\n{feedback}")
                 msgs.append({"role": "user", "content": feedback})
+            else:
+                # Normal path: build context from this trajectory's own history
+                for t in range(turn_idx):
+                    # Only keep full code for the most recent prior turn;
+                    # older turns get code truncated to save context tokens.
+                    is_old_turn = (t < turn_idx - 1)
+                    stripped = _strip_thinking(traj_responses[i][t], truncate_code=is_old_turn)
+                    if i == 0:
+                        has_ref = "Reflection:" in stripped
+                        print(f"  [DEBUG] Turn {t+1}→{turn_idx+1} traj=0: "
+                              f"reflection={'YES' if has_ref else 'NO'}, stripped_len={len(stripped)} chars"
+                              f"{' (truncated)' if is_old_turn else ''}")
+                    msgs.append({"role": "assistant", "content": stripped})
+                    prev_eval = traj_evals[i][t - 1] if t > 0 else None
+                    # Compute high water mark up to turn t for feedback context
+                    hwm_speedup, hwm_turn = None, None
+                    for pt in range(t):
+                        pe = traj_evals[i][pt]
+                        if pe and pe.get("correct") and pe.get("baseline_runtime_ms") and pe.get("runtime_ms"):
+                            sp = pe["baseline_runtime_ms"] / pe["runtime_ms"]
+                            if hwm_speedup is None or sp > hwm_speedup:
+                                hwm_speedup, hwm_turn = sp, pt + 1
+                    feedback = _build_turn_feedback(
+                        traj_evals[i][t], prev_eval=prev_eval,
+                        best_speedup=hwm_speedup, best_turn=hwm_turn,
+                        profiler_feedback=traj_evals[i][t].get("profiler_feedback") if traj_evals[i][t] else None,
+                    )
+                    if i == 0:
+                        print(f"  [DEBUG] Feedback traj=0 turn {t+1}→{turn_idx+1}:\n{feedback}")
+                    elif (traj_evals[i][t] is not None
+                          and not traj_evals[i][t].get("correct", False)
+                          and t == turn_idx - 1):
+                        # Print feedback for first wrong traj so we see what error msg it received
+                        is_first_wrong = not any(
+                            traj_evals[j][t] is not None
+                            and not traj_evals[j][t].get("correct", False)
+                            and t == turn_idx - 1
+                            for j in range(1, i)
+                        )
+                        if is_first_wrong:
+                            print(f"  [DEBUG] Feedback traj={i} turn {t+1}→{turn_idx+1}:\n{feedback}")
+                    msgs.append({"role": "user", "content": feedback})
+
             ctx_str = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
             if i == 0:
                 ctx_tokens = len(tokenizer(ctx_str).input_ids)
-                print(f"  [DEBUG] Context traj=0 turn {turn_idx+1}: {ctx_tokens} tokens")
+                print(f"  [DEBUG] Context traj=0 turn {turn_idx+1}: {ctx_tokens} tokens"
+                      f"{' (warm start)' if use_warm_start else ''}")
             context_texts.append(ctx_str)
+
+        # Warm start summary for this turn
+        if turn_idx > 0:
+            n_warm = sum(
+                1 for i in range(G)
+                if (traj_evals[i][turn_idx-1] is None
+                    or not traj_evals[i][turn_idx-1].get("correct", False))
+                and group_best_code[turn_idx-1] is not None
+            )
+            if n_warm > 0:
+                print(f"  [WARM START] Turn {turn_idx+1}: {n_warm}/{G} trajectories warm-started "
+                      f"with best kernel from turn {turn_idx}")
 
         # Generate G completions for this turn
         if not config.mock_mode:
@@ -853,6 +922,26 @@ def _run_group_episodes(
                     print(f"  [PROFILER traj={profiled_idx}] ({time.time()-t_prof:.1f}s):\n{prof_fb}")
                 except Exception as e:
                     print(f"  [PROFILER] Failed: {e}")
+
+        # ── Warm start: find best correct kernel across all trajectories ────
+        best_idx, best_sp = None, 0.0
+        for i in range(G):
+            er = eval_results[i]
+            if er and er.get("correct", False) and candidates[i]:
+                rt = er.get("runtime_ms")
+                bt = er.get("baseline_runtime_ms")
+                sp = bt / rt if rt and bt and rt > 0 else 0.0
+                if sp > best_sp:
+                    best_sp = sp
+                    best_idx = i
+        if best_idx is not None:
+            group_best_code[turn_idx] = candidates[best_idx]
+            group_best_eval[turn_idx] = eval_results[best_idx]
+            group_best_completion[turn_idx] = completions[best_idx]
+            n_failed = sum(1 for er in eval_results if er is None or not er.get("correct", False))
+            print(f"  [WARM START] Turn {turn_idx+1}: best kernel from traj {best_idx} "
+                  f"({best_sp:.2f}x) — {n_failed} failed trajectories will receive it next turn")
+        # ── END warm start ────────────────────────────────────────────────────
 
         # Store for next-turn context building
         for i in range(G):
