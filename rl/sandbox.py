@@ -277,7 +277,7 @@ try:
                         "so they stay on CPU and their data_ptr() is invalid on the GPU."
                     )
                 elif wrong_frac > 0.9:
-                    pattern = "FUNDAMENTAL ALGORITHMIC ERROR (>90% outputs wrong): your core formula is incorrect — do NOT make incremental tweaks, rewrite the kernel from scratch"
+                    pattern = f"{{wrong_frac*100:.0f}}% of elements wrong"
                 elif wrong_frac > 0.3:
                     pattern = f"{{wrong_frac*100:.0f}}% of elements wrong"
                 else:
