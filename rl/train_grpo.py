@@ -659,13 +659,15 @@ def _run_group_episodes(
             msgs = list(base_messages)
 
             # ── Warm start check: did this trajectory fail on the last turn
-            # while a better kernel exists from ANY prior turn? ─────────────
+            # while a GOOD kernel exists from ANY prior turn? ───────────────
+            # Only warm start if the best kernel is at least 0.5x eager speed.
+            # Warm starting from a terrible kernel (0.01x) is counterproductive.
             use_warm_start = False
             if turn_idx > 0:
                 last_t = turn_idx - 1
                 my_eval = traj_evals[i][last_t]
                 my_failed = (my_eval is None or not my_eval.get("correct", False))
-                if my_failed and ws_best_code is not None:
+                if my_failed and ws_best_code is not None and ws_best_speedup >= 0.5:
                     use_warm_start = True
 
             if use_warm_start:
