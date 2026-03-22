@@ -252,10 +252,25 @@ try:
                 else:
                     pattern = f"{{wrong_frac*100:.1f}}% of elements wrong (likely boundary/edge case or incorrect stride)"
                 bias_note = f"systematic bias={{bias:+.4f}} (output is consistently {{'too high' if bias > 0 else 'too low'}})" if abs(bias) > 0.1 else "no systematic bias"
+                wrong_flat = (diff.flatten() > 1e-3).nonzero(as_tuple=False).flatten()
+                n_show = min(4, len(wrong_flat))
+                sample_lines = []
+                for _wi in range(n_show):
+                    _fidx = wrong_flat[_wi].item()
+                    _c = []
+                    _f = _fidx
+                    for _ds in reversed(shape):
+                        _c.append(_f % _ds)
+                        _f //= _ds
+                    _c = list(reversed(_c))
+                    _e = rf.flatten()[_fidx].item()
+                    _g = nf.flatten()[_fidx].item()
+                    sample_lines.append(f"  pos={{_c}} expected={{_e:.5f}} got={{_g:.5f}} err={{abs(_e-_g):.5f}}")
+                samples_str = (" | First " + str(n_show) + " wrong elements:\\n" + "\\n".join(sample_lines)) if sample_lines else ""
                 correctness_detail = (
                     f"Output tensor {{t_idx}}: {{pattern}}. "
                     f"max_abs_error={{max_err:.5f}}, mean_abs_error={{mean_err:.5f}}, {{bias_note}}. "
-                    f"Worst at position {{coords}}: expected={{exp_val:.5f}}, got={{got_val:.5f}}. shape={{list(shape)}}"
+                    f"Worst at position {{coords}}: expected={{exp_val:.5f}}, got={{got_val:.5f}}. shape={{list(shape)}}{{samples_str}}"
                 )
                 break
         matches.append(trial_ok)
