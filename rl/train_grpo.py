@@ -591,6 +591,7 @@ def _run_group_episodes(
     model,
     tokenizer,
     config: GRPOConfig,
+    difficulty: int = 1,
 ) -> tuple[list[list[TurnData]], list[list[float]]]:
     """
     Generate G trajectories × T turns (Kevin's multi-turn recipe).
@@ -598,10 +599,16 @@ def _run_group_episodes(
     Each turn: generate → evaluate → build feedback → build next-turn context.
     Thinking is stripped from inter-turn context so the model only sees its code + feedback.
 
+    Args:
+        difficulty: 1/2/3 from level_id. Scales positive rewards so harder
+                    problems are worth more (1.0x / 1.25x / 1.5x).
+
     Returns:
       group_turns:   list[G] of list[T] of (ctx_ids, resp_ids)
       group_rewards: list[G] of list[T] of scalar rewards
     """
+    # Difficulty multiplier: harder problems are worth more
+    diff_scale = {1: 1.0, 2: 1.25, 3: 1.5}.get(difficulty, 1.0)
     G = config.group_size
     T = config.num_turns
 
@@ -801,7 +808,7 @@ def _run_group_episodes(
             elif not eval_res["correct"]:
                 r = config.reward_wrong_output
             else:
-                r = calculate_reward(eval_res)  # returns 1, 2, or 3
+                r = calculate_reward(eval_res) * diff_scale  # scale by difficulty
                 # Update high water mark for this trajectory
                 rt = eval_res.get("runtime_ms")
                 bt = eval_res.get("baseline_runtime_ms")
@@ -996,7 +1003,7 @@ def _compute_grpo_loss_and_backward(
     return total_loss / n_seqs
 
 
-def _run_evaluation(model, tokenizer, config: GRPOConfig, val_prompts: list[str]) -> dict:
+def _run_evaluation(model, tokenizer, config: GRPOConfig, val_prompts: list[tuple]) -> dict:
     """Run an evaluation pass on the validation set."""
     print(f"\n--- Running Evaluation ({len(val_prompts)} prompts) ---")
     if config.mock_mode:
@@ -1006,7 +1013,7 @@ def _run_evaluation(model, tokenizer, config: GRPOConfig, val_prompts: list[str]
     candidates_to_eval = []
 
     with torch.no_grad():
-        for prompt_text in val_prompts:
+        for prompt_text, _level in val_prompts:
             user_msg = FORMAT_EXAMPLE + f"Reference Program:\n```python\n{prompt_text}\n```"
             sys_content = get_system_prompt().strip()
             messages = [
@@ -1164,7 +1171,9 @@ def train(config: GRPOConfig = None):
         rows = rows[:config.max_prompts]
         print(f"[Dataset] Capped to {config.max_prompts} prompts (time-boxed run).")
 
-    prompts = [row["pytorch_code"] for row in rows]
+    # Carry (prompt_text, level_id) so reward can scale by difficulty
+    LEVEL_TO_INT = {"level_1": 1, "level_2": 2, "level_3": 3}
+    prompts = [(row["pytorch_code"], LEVEL_TO_INT.get(row.get("level_id", ""), 1)) for row in rows]
     # Split to train/val (10% val, max 20)
     val_size = min(int(len(prompts) * 0.1), 20)
     if val_size == 0 and len(prompts) > 1:
@@ -1172,7 +1181,7 @@ def train(config: GRPOConfig = None):
 
     val_prompts = prompts[:val_size]
     train_prompts = prompts[val_size:]
-    
+
     if len(train_prompts) == 0:
         # Fallback for dummy datasets
         train_prompts = prompts
@@ -1297,9 +1306,9 @@ def train(config: GRPOConfig = None):
 
             n_degenerate = 0
             t0 = time.time()
-            for p_idx, prompt_text in enumerate(batch):
-                print(f"\n[Prompt {p_idx+1}/{len(batch)}] Generating {config.group_size} trajectories (batched/parallel)...")
-                group_turns, group_rewards = _run_group_episodes(prompt_text, model, tokenizer, config)
+            for p_idx, (prompt_text, level) in enumerate(batch):
+                print(f"\n[Prompt {p_idx+1}/{len(batch)} level={level}] Generating {config.group_size} trajectories (batched/parallel)...")
+                group_turns, group_rewards = _run_group_episodes(prompt_text, model, tokenizer, config, difficulty=level)
 
                 # Dynamic Sampling: skip degenerate groups (DAPO).
                 # Use mean-reward-per-trajectory as the degeneracy signal.
