@@ -40,7 +40,7 @@ try:
 except ImportError:
     SGLANG_AVAILABLE = False
 
-from agent import _extract_cuda_code
+from agent import _extract_cuda_code, _fix_cuda_api
 from profiler import profile_kernel
 from reward import calculate_reward
 from sandbox import evaluate
@@ -729,17 +729,22 @@ def _run_group_episodes(
         candidates = []
         for i, gen_text in enumerate(completions):
             model_new_py = _extract_python_block(gen_text)
+            if model_new_py:
+                # Fix common CUDA API mismatches before evaluation
+                model_new_py = _fix_cuda_api(model_new_py)
             if i == 0:  # always print traj=0 every turn so we can trace the full repair loop
                 print(f"  [CODE DUMP turn={turn_idx} traj=0]:\n{(model_new_py or gen_text)}")
             candidates.append(model_new_py if model_new_py else None)
 
+        # Only time the final turn (-O3 + benchmarks); earlier turns use -O1 for faster compilation
+        is_final_turn = (turn_idx == T - 1)
         n_valid = sum(1 for c in candidates if c is not None)
         t_eval = time.time()
         print(f"  [{turn_label}] Evaluating {n_valid}/{G} valid kernels...", end=" ", flush=True)
         with ProcessPoolExecutor(max_workers=min(G, 16), mp_context=_MP_SPAWN_CTX) as pool:
             eval_results = list(pool.map(
                 _worker_run_eval,
-                [(c, prompt_text, True) for c in candidates],
+                [(c, prompt_text, is_final_turn) for c in candidates],
             ))
         n_compiled = sum(1 for r in eval_results if r is not None and r.get("compiles", False))
         n_correct  = sum(1 for r in eval_results if r is not None and r.get("correct",  False))
