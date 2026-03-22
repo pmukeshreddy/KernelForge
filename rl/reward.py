@@ -1,26 +1,27 @@
 """
-reward.py - Milestone reward with linear ramp for correct kernels.
+reward.py - Milestone reward with continuous scaling above each tier.
 
-Discrete milestones at key thresholds + linear interpolation between them
-so the model always has gradient signal to optimize speed.
+Milestones at key thresholds + continuous scaling within each tier
+so the model ALWAYS has gradient signal to push faster.
 
-  -1.0  = wrong (compile fail, wrong output)
-   0.0  = correct but very slow (>= 10x slower than eager)
-   1.0  = correct and matches eager speed
-   2.0  = beats eager PyTorch
-   3.0  = beats torch.compile
+  -1.0       = wrong (compile fail, wrong output)
+   0.1→1.0   = correct but slower than eager (linear ramp by speedup)
+   2.0→2.99  = beats eager, continuous scaling toward torch.compile speed
+   3.0→4.0   = beats torch.compile, continuous scaling by how much faster
 """
+
+import math
 
 
 def calculate_reward(sandbox_result: dict) -> float:
     """
-    Reward for a correct kernel with linear ramp between milestones.
+    Reward for a correct kernel with continuous scaling within milestones.
 
     Returns:
-        0.0 to 1.0  — correct, linearly scaled by how close to eager speed
-        2.0         — faster than eager PyTorch
-        3.0         — faster than torch.compile
-        0.0         — not correct or no timing data
+        0.1 to 1.0  — correct but slower than eager (linear by speedup)
+        2.0 to 2.99 — beats eager, scales toward torch.compile threshold
+        3.0 to 4.0  — beats torch.compile, scales by additional speedup
+        0.5         — correct but no timing data
     """
     if not sandbox_result.get("compiles", False):
         return 0.0
@@ -34,17 +35,25 @@ def calculate_reward(sandbox_result: dict) -> float:
     if baseline_ms is None or kernel_ms is None or kernel_ms <= 0:
         return 0.5  # correct but no timing
 
-    speedup = baseline_ms / kernel_ms  # >1 means faster than eager
+    speedup_vs_eager = baseline_ms / kernel_ms
 
-    # Beats torch.compile?
+    # Tier 3: Beats torch.compile → 3.0 + log bonus (capped at 4.0)
     if compile_ms is not None and compile_ms > 0 and kernel_ms < compile_ms:
-        return 3.0
+        speedup_vs_compile = compile_ms / kernel_ms
+        # log2 scaling: 1x over compile = 3.0, 2x over compile = 3.5, 4x = 4.0
+        bonus = min(1.0, 0.5 * math.log2(max(1.0, speedup_vs_compile)))
+        return 3.0 + bonus
 
-    # Beats eager PyTorch?
-    if speedup >= 1.0:
-        return 2.0
+    # Tier 2: Beats eager → 2.0 + linear scaling toward compile threshold
+    if speedup_vs_eager >= 1.0:
+        if compile_ms is not None and compile_ms > 0:
+            # How close to beating compile? Scale 2.0→2.99
+            compile_speedup = baseline_ms / compile_ms  # how fast compile is vs eager
+            if compile_speedup > 1.0 and speedup_vs_eager < compile_speedup:
+                progress = (speedup_vs_eager - 1.0) / (compile_speedup - 1.0)
+                return 2.0 + 0.99 * min(1.0, progress)
+        # No compile timing or compile is slower than eager
+        return 2.0 + min(0.99, 0.5 * math.log2(max(1.0, speedup_vs_eager)))
 
-    # Correct but slower — linear ramp from 0.0 (10x slower) to 1.0 (matches eager)
-    # This gives gradient signal to improve speed even below 1.0x
-    # clamp so even very slow correct kernels get a small positive reward
-    return max(0.1, min(1.0, speedup))
+    # Tier 1: Correct but slower — linear ramp 0.1 to 1.0
+    return max(0.1, min(1.0, speedup_vs_eager))

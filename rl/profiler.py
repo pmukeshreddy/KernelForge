@@ -108,10 +108,11 @@ def profile_kernel(kernel_code: str, reference_code: str, timeout: int = 120) ->
             return "Profiler Error: Timed out during execution."
         
         if proc.returncode != 0:
-            if "not found" in stderr.lower() or "no such file or directory" in stderr.lower():
+            combined = (stderr.strip() + "\n" + stdout.strip()).strip()
+            if "not found" in combined.lower() or "no such file or directory" in combined.lower():
                 return "Profiler Error: 'ncu' command not found. Ensure Nsight Compute is installed."
-            # Exclude massive compilation noise, grab just the end error
-            clean_err = stderr.strip()[-500:] 
+            # Grab the end of combined output for debugging
+            clean_err = combined[-500:] if combined else f"exit code {proc.returncode}"
             return f"Profiler Execution Failed:\n{clean_err}"
 
         # Parse CSV output for the target kernel
