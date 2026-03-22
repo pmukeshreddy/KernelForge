@@ -304,6 +304,8 @@ def launch_sglang_server(model_path: str, adapter_path: str, port: int, tp: int,
         "--mem-fraction-static", "0.45",
         "--context-length", "16384",
         "--log-level", "error",
+        "--enable-prefix-caching",       # cache shared prefix KV across all G trajectories
+        "--max-running-requests", "32",  # allow all G*phases requests to run concurrently
     ]
 
     import glob as _glob
@@ -458,9 +460,11 @@ def _sglang_post(port: int, contexts: list[str], max_new_tokens: int,
             return [r["text"] for r in result]
         return [result["text"]]
     except Exception:
-        # Batch failed — fall back to per-request so one bad context doesn't kill all 8
-        print("  [SGLang] Batch request failed, falling back to per-request mode...")
-        return [_single(ctx) for ctx in contexts]
+        # Batch failed — fall back to per-request concurrently so one bad context doesn't kill all 8
+        print("  [SGLang] Batch request failed, falling back to concurrent per-request mode...")
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=len(contexts)) as ex:
+            return list(ex.map(_single, contexts))
 
 
 def _generate_with_sglang(context_texts: list[str], config: "GRPOConfig") -> list[str]:
