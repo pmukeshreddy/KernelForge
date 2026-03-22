@@ -310,6 +310,7 @@ try:
                 max_err = diff.max().item()
                 mean_err = diff.mean().item()
                 wrong_frac = (diff > 1e-3).float().mean().item()
+                bias = (nf - rf).mean().item()
                 R["wrong_frac"] = wrong_frac
                 R["max_abs_error"] = max_err
                 R["systematic_bias"] = bias
@@ -324,7 +325,6 @@ try:
                 coords = list(reversed(coords))
                 exp_val = rf.flatten()[max_pos].item()
                 got_val = nf.flatten()[max_pos].item()
-                bias = (nf - rf).mean().item()
                 # Diagnose error pattern to give actionable feedback
                 exp_scale = rf.abs().mean().item()
                 if max_err > 1e5 and (exp_scale < 10.0 or max_err > exp_scale * 1e4):
