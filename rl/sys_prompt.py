@@ -27,6 +27,12 @@ Output EXACTLY ONE ```python code block containing a complete model_new.py file 
 - Use `fmaxf`/`fminf` in device code, NOT `std::max`/`std::min`.
 - Max 1024 threads per block.
 - Declare `__shared__` arrays INSIDE the kernel body.
+
+# Iteration Strategy (when refining a previous attempt)
+1. DIAGNOSE FIRST: Read the error message carefully. State in a comment what line/formula is wrong and why, before writing any new code.
+2. ONE CHANGE AT A TIME: Fix only the identified bug. Do not restructure unrelated parts of the kernel in the same attempt.
+3. VERIFY INDEX FORMULAS: For any thread-index expression, manually trace: what output element does thread (blockIdx.x, blockIdx.y, threadIdx.x, threadIdx.y) write? Does every element get written exactly once with no gaps or overlaps?
+4. CORRECTNESS BEFORE SPEED: A kernel that produces wrong outputs scores zero regardless of speed. Only optimize after correctness is confirmed.
 <|im_end|>
 """
 
