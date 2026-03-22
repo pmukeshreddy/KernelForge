@@ -26,6 +26,10 @@ python train_grpo.py \
   --output_dir ./checkpoints/grpo_v1 \
   --group_size 8 \
   --batch_size 2 \
+  --num_turns 3 \
+  --think_budget 2000 \
+  --max_prompts 100 \
+  --grpo_epochs 1 \
   --wandb_project kernelforge-rl \
   --use_sglang \
   --sglang_python ~/sglang_env/bin/python \

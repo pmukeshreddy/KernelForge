@@ -151,6 +151,9 @@ class GRPOConfig:
     dynamic_sampling: bool = True
     max_resample_attempts: int = 3
 
+    # Dataset cap: limit to N prompts (0 = use all). Useful for time-boxed runs.
+    max_prompts: int = 0
+
 
 # ---------------------------------------------------------------------------
 # Format helpers (must match agent.py)
@@ -210,21 +213,27 @@ Reflection: <2-3 sentences covering: (1) your parallelization strategy and block
 # Multi-turn helpers (Kevin's recipe)
 # ---------------------------------------------------------------------------
 
-def _strip_thinking(text: str) -> str:
+def _strip_thinking(text: str, truncate_code: bool = False) -> str:
     """
     Strip internal <think> blocks from a prior-turn response, keeping all
     code and the Reflection line intact.
 
-    This is the correct ReAct approach: the model's "action" (the kernel it
-    wrote) must remain visible in context so subsequent turns can make targeted
-    fixes rather than hallucinating a new kernel from scratch.
-
-    Context length is handled downstream by _get_token_log_probs which
-    truncates sequences exceeding MAX_SEQ_LEN (DAPO overlong handling).
+    If truncate_code=True, also replace the full code block with a short
+    placeholder to save context tokens for older turns (only the most recent
+    turn keeps full code visible).
     """
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     cleaned = re.sub(r"<think>.*", "", cleaned, flags=re.DOTALL)
-    return cleaned.strip()
+    cleaned = cleaned.strip()
+    if truncate_code:
+        # Replace ```python ... ``` blocks with a short placeholder
+        cleaned = re.sub(
+            r'```python\s*.*?```',
+            '```python\n# [Previous code omitted — see feedback below for what to fix]\n```',
+            cleaned,
+            flags=re.DOTALL,
+        )
+    return cleaned
 
 
 def _classify_error(eval_res: dict | None) -> str:
@@ -280,9 +289,10 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None) -
 
         if eval_res.get("shape_ok") is False:
             hint = (
-                "\nDiagnosis: output shape is wrong — your size formula does not match "
-                "the reference. Recheck how you compute H_out / W_out in both the CUDA "
-                "allocation and Python forward(), and make sure they agree."
+                "\nDiagnosis: output shape is wrong. PyTorch Conv/Pool output size "
+                "formula is: out = floor((input + 2*padding - kernel) / stride + 1). "
+                "The +1 is critical — check BOTH the CUDA output allocation AND the "
+                "Python forward() stride/padding values match the reference op."
             )
         else:
             wrong_frac = eval_res.get("wrong_frac")
@@ -383,7 +393,7 @@ def launch_sglang_server(model_path: str, adapter_path: str, port: int, tp: int,
         "--lora-paths", f"{_LORA_NAME}={adapter_path}",
         "--max-loras-per-batch", "1",
         "--mem-fraction-static", "0.60",  # 0.45→0.60: doubles KV cache 16GB→30GB, fixes turn 3+ eviction
-        "--context-length", "16384",
+        "--context-length", "32768",
         "--log-level", "error",
         "--max-running-requests", "16",   # G=8 × 2 phases = 16 max concurrent requests
         "--schedule-policy", "lpm",       # longest-prefix-match: maximises KV reuse across turns
@@ -663,11 +673,15 @@ def _run_group_episodes(
         for i in range(G):
             msgs = list(base_messages)
             for t in range(turn_idx):
-                stripped = _strip_thinking(traj_responses[i][t])
+                # Only keep full code for the most recent prior turn;
+                # older turns get code truncated to save context tokens.
+                is_old_turn = (t < turn_idx - 1)
+                stripped = _strip_thinking(traj_responses[i][t], truncate_code=is_old_turn)
                 if i == 0:
                     has_ref = "Reflection:" in stripped
                     print(f"  [DEBUG] Turn {t+1}→{turn_idx+1} traj=0: "
-                          f"reflection={'YES' if has_ref else 'NO'}, stripped_len={len(stripped)} chars")
+                          f"reflection={'YES' if has_ref else 'NO'}, stripped_len={len(stripped)} chars"
+                          f"{' (truncated)' if is_old_turn else ''}")
                 msgs.append({"role": "assistant", "content": stripped})
                 prev_eval = traj_evals[i][t - 1] if t > 0 else None
                 feedback = _build_turn_feedback(traj_evals[i][t], prev_eval=prev_eval)
@@ -1144,6 +1158,11 @@ def train(config: GRPOConfig = None):
         pass
     rows = valid_rows
 
+    # Cap dataset size for time-boxed runs
+    if config.max_prompts > 0 and len(rows) > config.max_prompts:
+        rows = rows[:config.max_prompts]
+        print(f"[Dataset] Capped to {config.max_prompts} prompts (time-boxed run).")
+
     prompts = [row["pytorch_code"] for row in rows]
     # Split to train/val (10% val, max 20)
     val_size = min(int(len(prompts) * 0.1), 20)
@@ -1446,6 +1465,7 @@ if __name__ == "__main__":
     parser.add_argument("--sglang_python", type=str, default="", help="Path to SGLang venv python (e.g. /root/sglang_env/bin/python). Can also set SGLANG_PYTHON env var.")
     parser.add_argument("--sglang_port", type=int, default=30000)
     parser.add_argument("--sglang_tp", type=int, default=1, help="SGLang tensor parallel degree")
+    parser.add_argument("--max_prompts", type=int, default=0, help="Cap dataset to N prompts (0=all). Use ~100 for a 2-3h run.")
     args = parser.parse_args()
 
     cfg = GRPOConfig(
@@ -1468,6 +1488,7 @@ if __name__ == "__main__":
         sglang_python=args.sglang_python,
         sglang_port=args.sglang_port,
         sglang_tp=args.sglang_tp,
+        max_prompts=args.max_prompts,
     )
     
     # Simple resume logic: swap base model for output_dir if resuming
