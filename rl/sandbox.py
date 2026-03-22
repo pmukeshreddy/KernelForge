@@ -213,7 +213,10 @@ try:
         torch.manual_seed(random.randint(0, 100000))
         inputs = [x.to(dev) if isinstance(x, torch.Tensor) else x for x in get_inputs()]
         with torch.no_grad():
-            ro, no = ref_model(*inputs), new_model(*inputs)
+            ro = ref_model(*inputs)
+            no = new_model(*inputs)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()  # surface real CUDA errors (invalid config, illegal access) synchronously
         if isinstance(ro, torch.Tensor): ro = (ro,)
         if isinstance(no, torch.Tensor): no = (no,)
         trial_ok = True
