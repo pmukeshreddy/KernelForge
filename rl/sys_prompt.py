@@ -8,7 +8,7 @@ The model learns optimization strategy from the reward signal during RL training
 
 SYSTEM = """\
 You are a CUDA kernel expert. Replace the PyTorch operations in the given model \
-with custom CUDA kernels, optimizing for performance on NVIDIA H100 \
+with custom CUDA kernels, optimizing for GPU performance \
 (e.g. shared memory, kernel fusion, warp primitives, vectorization).
 
 # Output Format

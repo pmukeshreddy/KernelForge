@@ -86,11 +86,11 @@ class GRPOConfig:
     # GRPO + DAPO hyperparameters
     grpo_epochs: int = 2              # gradient updates per batch
     batch_size: int = 4               # prompts per batch
-    learning_rate: float = 2e-6
+    learning_rate: float = 5e-6       # higher LR for LoRA (fewer trainable params)
     warmup_steps: int = 10            # cosine schedule warmup (noisy advantages early in training)
     cliprange_low: float = 0.2        # standard lower clip
     cliprange_high: float = 0.28      # DAPO Clip-Higher (asymmetric)
-    max_grad_norm: float = 0.05
+    max_grad_norm: float = 0.5        # standard GRPO clip (0.05 was too aggressive)
 
     # Multi-turn (Kevin's recipe): T refinement turns per trajectory
     # γ=0.4 discounts later turns so getting it right on turn 1 is worth more.
@@ -101,7 +101,7 @@ class GRPOConfig:
     # Generation
     max_new_tokens: int = 6000        # total budget (thinking + code)
     think_budget: int = 2000          # phase-1 thinking cap; code gets the rest
-    temperature: float = 0.7
+    temperature: float = 0.9          # higher temp for diverse exploration (DAPO uses 1.0)
     mock_mode: bool = False
 
     # SGLang server-mode generation (faster than model.generate())
