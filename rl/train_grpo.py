@@ -735,10 +735,6 @@ def _run_group_episodes(
 
         n_valid = sum(1 for c in candidates if c is not None)
         t_eval = time.time()
-        is_final_turn = (turn_idx == T - 1)
-        # Always time correct kernels so calculate_reward has speedup data on every turn.
-        # Without this, correct kernels on turns 1-3 get runtime_ms=None → calculate_reward=0.0
-        # → the model has no incentive to write fast kernels, only correct ones.
         print(f"  [{turn_label}] Evaluating {n_valid}/{G} valid kernels...", end=" ", flush=True)
         with ProcessPoolExecutor(max_workers=min(G, 16), mp_context=_MP_SPAWN_CTX) as pool:
             eval_results = list(pool.map(
