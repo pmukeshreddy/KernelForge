@@ -216,7 +216,25 @@ try:
             ro = ref_model(*inputs)
             no = new_model(*inputs)
         if torch.cuda.is_available():
-            torch.cuda.synchronize()  # surface real CUDA errors (invalid config, illegal access) synchronously
+            # Use cudart directly to get the real CUDA error string.
+            # torch.cuda.synchronize() wraps all device errors as "Compile with TORCH_USE_CUDA_DSA"
+            # which is useless. Calling cudaDeviceSynchronize() via ctypes gives the actual
+            # error: "invalid configuration argument", "an illegal memory access was encountered", etc.
+            import ctypes as _ct
+            _lib = None
+            for _n in ["libcudart.so", "libcudart.so.12", "libcudart.so.11.0"]:
+                try: _lib = _ct.CDLL(_n); break
+                except: pass
+            if _lib is not None:
+                _lib.cudaGetErrorString.restype = _ct.c_char_p
+                _err = _lib.cudaGetLastError()   # catch synchronous launch errors (invalid config)
+                if _err == 0:
+                    _err = _lib.cudaDeviceSynchronize()  # catch async errors (illegal access)
+                if _err != 0:
+                    _msg = _lib.cudaGetErrorString(_err).decode()
+                    raise RuntimeError(f"CUDA error: {{_msg}}")
+            else:
+                torch.cuda.synchronize()
         if isinstance(ro, torch.Tensor): ro = (ro,)
         if isinstance(no, torch.Tensor): no = (no,)
         trial_ok = True
