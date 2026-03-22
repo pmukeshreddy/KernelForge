@@ -1,13 +1,14 @@
 """
-reward.py - Milestone reward with continuous scaling above each tier.
+reward.py - Continuous reward signal across all outcome tiers.
 
-Milestones at key thresholds + continuous scaling within each tier
-so the model ALWAYS has gradient signal to push faster.
+Full reward spectrum so the model ALWAYS has gradient signal:
 
-  -1.0       = wrong (compile fail, wrong output)
-   0.1→1.0   = correct but slower than eager (linear ramp by speedup)
-   2.0→2.99  = beats eager, continuous scaling toward torch.compile speed
-   3.0→4.0   = beats torch.compile, continuous scaling by how much faster
+  -1.0              = no code extracted (format failure)
+  -0.7              = compile failure (at least attempted code)
+  -0.50 → -0.05    = wrong output, continuous by how wrong (shape, wrong_frac, bias)
+   0.1  →  1.0     = correct but slower than eager (linear ramp by speedup)
+   2.0  →  2.99    = beats eager, continuous scaling toward torch.compile speed
+   3.0  →  4.0     = beats torch.compile, continuous scaling by how much faster
 """
 
 import math
@@ -57,3 +58,44 @@ def calculate_reward(sandbox_result: dict) -> float:
 
     # Tier 1: Correct but slower — linear ramp 0.1 to 1.0
     return max(0.1, min(1.0, speedup_vs_eager))
+
+
+def calculate_wrong_reward(sandbox_result: dict) -> float:
+    """
+    Continuous reward for kernels that compile but produce wrong output.
+
+    Uses sandbox signals (wrong_frac, shape_ok, max_abs_error, systematic_bias)
+    to create gradient from "total garbage" to "almost correct."
+
+    Range: -0.50 (total garbage) → -0.05 (borderline correct)
+    """
+    # Shape completely wrong — worst wrong-output tier
+    if sandbox_result.get("shape_ok") is False:
+        return -0.50
+
+    wrong_frac = sandbox_result.get("wrong_frac")
+    if wrong_frac is None:
+        wrong_frac = 1.0
+    bias = abs(sandbox_result.get("systematic_bias") or 0.0)
+
+    # Nearly all elements wrong — close to compile-fail quality
+    if wrong_frac > 0.9:
+        return -0.45
+
+    # Most elements wrong but shape is right — linear interpolation
+    if wrong_frac > 0.3:
+        # 0.9 → -0.40, 0.3 → -0.20
+        t = (wrong_frac - 0.3) / 0.6
+        return -0.20 - 0.20 * t
+
+    # Few elements wrong — likely boundary or precision issue
+    if wrong_frac > 0.0:
+        # 0.3 → -0.20, ~0 → -0.05
+        t = wrong_frac / 0.3
+        return -0.05 - 0.15 * t
+
+    # wrong_frac ≈ 0 but failed correctness check — systematic bias
+    if bias > 0.0:
+        return max(-0.15, -0.05 - 0.1 * min(1.0, bias))
+
+    return -0.05  # passed element check but failed some other assert

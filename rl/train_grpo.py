@@ -42,7 +42,7 @@ except ImportError:
 
 from agent import _extract_cuda_code, _fix_cuda_api
 from profiler import profile_kernel
-from reward import calculate_reward
+from reward import calculate_reward, calculate_wrong_reward
 from sandbox import evaluate
 from sys_prompt import get_system_prompt
 
@@ -122,7 +122,7 @@ class GRPOConfig:
     # Discrete milestone rewards (CUDA Agent style + graduated negatives)
     # -1 = no code/compile fail, -0.5 = wrong output, 1 = correct, 2 = beats eager, 3 = beats torch.compile
     reward_no_code: float = -1.0        # no ```python block found at all
-    reward_compile_fail: float = -1.0   # code found but fails to compile
+    reward_compile_fail: float = -0.7   # code found but fails to compile
     reward_wrong_output: float = -0.5   # compiles but wrong output (stepping stone)
 
     # Entropy bonus — prevents entropy collapse (critical for coding tasks)
@@ -878,7 +878,7 @@ def _run_group_episodes(
             elif eval_res is None or not eval_res.get("compiles", False):
                 r = config.reward_compile_fail * penalty_scale
             elif not eval_res["correct"]:
-                r = config.reward_wrong_output * penalty_scale
+                r = calculate_wrong_reward(eval_res) * penalty_scale
             else:
                 r = calculate_reward(eval_res) * diff_scale  # scale by difficulty
                 # Update high water mark for this trajectory
@@ -1048,7 +1048,9 @@ def _compute_grpo_loss_and_backward(
         for i in range(G):
             loo_mean = (group_sum - disc_returns[i, t]) / max(G - 1, 1)
             loo_var = (group_sq_sum - disc_returns[i, t] ** 2) / max(G - 1, 1) - loo_mean ** 2
-            loo_std = loo_var.clamp(min=0).sqrt() + 1e-8
+            # Floor at 0.1 to prevent exploding advantages when all trajectories
+            # have near-identical rewards (e.g., 7x -0.5 + 1x -1.0 → std≈0 → adv=±5M)
+            loo_std = max(loo_var.clamp(min=0).sqrt().item(), 0.1)
             advantages[i, t] = (disc_returns[i, t] - loo_mean) / loo_std
 
     # ── DEBUG: discounted returns and advantages ─────────────────────────────
