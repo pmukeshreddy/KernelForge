@@ -622,9 +622,7 @@ def _run_group_episodes(
 
     sys_content = get_system_prompt().strip()
     user_msg = (
-        "Write the complete model_new.py for the following operation.\n\n"
-        "Output EXACTLY ONE ```python code block containing the complete model_new.py "
-        "with load_inline and a ModelNew(nn.Module) class.\n\n"
+        FORMAT_EXAMPLE
         f"Reference Program:\n```python\n{prompt_text}\n```"
     )
     base_messages = [
@@ -982,9 +980,7 @@ def _run_evaluation(model, tokenizer, config: GRPOConfig, val_prompts: list[str]
     with torch.no_grad():
         for prompt_text in val_prompts:
             user_msg = (
-                "Write the complete model_new.py for the following operation.\n\n"
-                "Output EXACTLY ONE ```python code block containing the complete model_new.py "
-                "with load_inline and a ModelNew(nn.Module) class.\n\n"
+                FORMAT_EXAMPLE
                 f"Reference Program:\n```python\n{prompt_text}\n```"
             )
             sys_content = get_system_prompt().strip()
