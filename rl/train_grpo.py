@@ -119,10 +119,11 @@ class GRPOConfig:
     wandb_project: str = "kernelforge-rl"
     wandb_run_name: str = "grpo-qwen-14b"
 
-    # Discrete milestone rewards (CUDA Agent style)
-    # -1 = wrong, 1 = correct, 2 = beats eager PyTorch, 3 = beats torch.compile
-    reward_wrong: float = -1.0          # any wrong output (compile fail, shape mismatch, wrong values)
+    # Discrete milestone rewards (CUDA Agent style + graduated negatives)
+    # -1 = no code/compile fail, -0.5 = wrong output, 1 = correct, 2 = beats eager, 3 = beats torch.compile
     reward_no_code: float = -1.0        # no ```python block found at all
+    reward_compile_fail: float = -1.0   # code found but fails to compile
+    reward_wrong_output: float = -0.5   # compiles but wrong output (stepping stone)
 
     # Entropy bonus — prevents entropy collapse (critical for coding tasks)
     # A small positive coefficient adds H(π) to the objective, keeping exploration alive.
@@ -780,9 +781,9 @@ def _run_group_episodes(
             if candidates[i] is None:
                 r = config.reward_no_code
             elif eval_res is None or not eval_res.get("compiles", False):
-                r = config.reward_wrong
+                r = config.reward_compile_fail
             elif not eval_res["correct"]:
-                r = config.reward_wrong
+                r = config.reward_wrong_output
             else:
                 r = calculate_reward(eval_res)  # returns 1, 2, or 3
                 # Update high water mark for this trajectory
