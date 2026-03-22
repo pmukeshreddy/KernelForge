@@ -661,6 +661,18 @@ def _run_group_episodes(
                 feedback = _build_turn_feedback(traj_evals[i][t])
                 if i == 0:
                     print(f"  [DEBUG] Feedback traj=0 turn {t+1}→{turn_idx+1}:\n{feedback}")
+                elif (traj_evals[i][t] is not None
+                      and not traj_evals[i][t].get("correct", False)
+                      and t == turn_idx - 1):
+                    # Print feedback for first wrong traj so we see what error msg it received
+                    is_first_wrong = not any(
+                        traj_evals[j][t] is not None
+                        and not traj_evals[j][t].get("correct", False)
+                        and t == turn_idx - 1
+                        for j in range(1, i)
+                    )
+                    if is_first_wrong:
+                        print(f"  [DEBUG] Feedback traj={i} turn {t+1}→{turn_idx+1}:\n{feedback}")
                 msgs.append({"role": "user", "content": feedback})
             ctx_str = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
             if i == 0:
@@ -732,11 +744,25 @@ def _run_group_episodes(
         n_correct  = sum(1 for r in eval_results if r is not None and r.get("correct",  False))
         print(f"done ({time.time()-t_eval:.1f}s) | compiled={n_compiled}/{n_valid} correct={n_correct}/{G}")
 
-        # Only print compile errors on turn 1 to avoid log spam
-        if turn_idx == 0:
-            for i, res in enumerate(eval_results):
-                if res and not res.get("compiles", False) and res.get("compiler_error"):
-                    print(f"  [COMPILE ERROR traj={i}]: {res['compiler_error']}")
+        # Compile errors (all turns)
+        for i, res in enumerate(eval_results):
+            if res and not res.get("compiles", False) and res.get("compiler_error"):
+                print(f"  [COMPILE ERROR traj={i}]: {res['compiler_error']}")
+
+        # First wrong (compiled-but-incorrect) trajectory: print error + code so we can see
+        # exactly what the kernel computed and what the sandbox told it.
+        wrong_traj = next(
+            (i for i in range(G)
+             if eval_results[i] is not None
+             and eval_results[i].get("compiles", False)
+             and not eval_results[i].get("correct", False)),
+            None,
+        )
+        if wrong_traj is not None:
+            err = eval_results[wrong_traj].get("compiler_error") or "no error detail"
+            print(f"  [WRONG traj={wrong_traj} turn={turn_idx+1}] {err}")
+            if candidates[wrong_traj]:
+                print(f"  [CODE DUMP turn={turn_idx} traj={wrong_traj}]:\n{candidates[wrong_traj]}")
 
         # Compute per-turn rewards
         for i, (eval_res, gen_text) in enumerate(zip(eval_results, completions)):
