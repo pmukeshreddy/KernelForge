@@ -218,7 +218,15 @@ def _generate_feedback(metrics: Dict[str, float]) -> str:
     elif memory > compute * 1.5:
         # Memory-bound
         feedback += "Bottleneck: MEMORY-BOUND.\n"
-        if memory < 50:
+        if memory >= 80:
+            feedback += (
+                "Memory throughput is near peak — this kernel is already well-optimized "
+                "for a memory-bound workload. Further speedup requires reducing the number "
+                "of memory passes (fuse multiple operations into one kernel to avoid writing "
+                "and re-reading intermediate results) or reducing total bytes moved "
+                "(e.g., in-place operations, skip unnecessary copies)."
+            )
+        elif memory < 50:
             feedback += (
                 "Memory bandwidth is underutilized.\n"
                 "Techniques: use float4 vectorized loads/stores (reinterpret_cast<float4*>), "
@@ -228,10 +236,10 @@ def _generate_feedback(metrics: Dict[str, float]) -> str:
         else:
             feedback += (
                 "Memory bandwidth is the primary limiter.\n"
-                "Techniques: reduce global memory traffic with shared memory tiling, "
+                "Techniques: use float4 vectorized loads/stores for 128-bit transactions, "
                 "use __ldg() for read-only data (L2 cache hint), "
                 "fuse sequential operations to avoid intermediate global memory writes, "
-                "consider algorithmic changes that reduce memory passes."
+                "process multiple elements per thread to overlap compute and memory."
             )
     elif compute > memory * 1.5:
         # Compute-bound
