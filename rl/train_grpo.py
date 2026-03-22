@@ -277,7 +277,7 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
             stuck_prefix +
             "Your previous answer failed to be parsed due to not adhering to the desired formatting."
             + hwm_suffix + "\n\n"
-            "Restart your reasoning process and generate new, complete code."
+            "Try a completely different approach and generate new, complete code."
         )
     if not eval_res.get("compiles", False):
         err = (eval_res.get("compiler_error") or "Unknown compile error")
@@ -285,7 +285,7 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
             stuck_prefix +
             f"Your previous answer failed to compile. Here is the error message:\n{err}"
             + hwm_suffix + "\n\n"
-            "Restart your reasoning process and generate new, complete code."
+            "Fix the compilation error and generate new, complete code."
         )
     if not eval_res.get("correct", False):
         err = (eval_res.get("compiler_error") or "Outputs do not match reference")
@@ -293,7 +293,7 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
             stuck_prefix +
             f"Your previous answer was incorrect. Here is the error message:\n{err}"
             + hwm_suffix + "\n\n"
-            "Restart your reasoning process and generate new, complete code."
+            "Fix the correctness issue and generate new, complete code."
         )
     # Correct kernel — include timing milestones and optional profiler data
     rt = eval_res.get("runtime_ms")
@@ -309,7 +309,7 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
     profiler_str = f"\n\n{profiler_feedback}" if profiler_feedback else ""
     return (
         f"Your previous answer was correct.\n{timing_str}{profiler_str}\n\n"
-        "Restart your reasoning process and generate new, complete code."
+        "Keep your working approach and optimize it for speed. Generate the complete improved code."
     )
 
 
