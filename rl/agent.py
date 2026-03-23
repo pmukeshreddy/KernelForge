@@ -150,6 +150,48 @@ def _fix_cuda_api(cuda_code: str) -> str:
         cuda_code,
     )
 
+    # Bug 5 — Output tensors allocated on CPU instead of CUDA.
+    # Model writes: torch::empty({...}, torch::kInt32)  → creates on CPU!
+    # Fix: torch::empty({...}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA))
+    # Process line-by-line so we only touch lines with torch::empty/zeros/ones/full.
+    _DTYPES = (
+        'kFloat', 'kFloat32', 'kFloat64', 'kDouble', 'kHalf', 'kBFloat16',
+        'kInt', 'kInt32', 'kInt64', 'kLong', 'kByte', 'kBool', 'kShort',
+    )
+    _dtype_pat = '|'.join(_DTYPES)
+    _alloc_line_pat = re.compile(r'torch::(?:empty|zeros|ones|full)\s*\(')
+    _bare_dtype_pat = re.compile(
+        rf',\s*(torch::(?:{_dtype_pat}))\s*\)'
+    )
+    def _fix_cpu_line(line: str) -> str:
+        if not _alloc_line_pat.search(line):
+            return line
+        # Don't touch lines that already have device() or TensorOptions
+        if 'device(' in line or 'TensorOptions' in line or '.options()' in line:
+            return line
+        return _bare_dtype_pat.sub(
+            r', torch::TensorOptions().dtype(\1).device(torch::kCUDA))',
+            line,
+        )
+    cuda_code = '\n'.join(_fix_cpu_line(l) for l in cuda_code.splitlines())
+
+    # Bug 6 — torch::empty/zeros/ones with NO options at all → CPU float32.
+    # Detect: torch::empty({...}) where ) immediately closes the call after }.
+    # Fix: append .to(input.device()) — but we don't know input name, so
+    # instead use device(torch::kCUDA) since this is always a CUDA extension.
+    def _fix_no_options_alloc(line: str) -> str:
+        if not _alloc_line_pat.search(line):
+            return line
+        if 'device(' in line or 'TensorOptions' in line or '.options()' in line:
+            return line
+        # Match torch::empty({...}) — closing } immediately followed by )
+        return re.sub(
+            r'(torch::(?:empty|zeros|ones)\s*\(\s*\{[^}]*\})\s*\)',
+            r'\1, torch::TensorOptions().device(torch::kCUDA))',
+            line,
+        )
+    cuda_code = '\n'.join(_fix_no_options_alloc(l) for l in cuda_code.splitlines())
+
     return cuda_code
 
 
