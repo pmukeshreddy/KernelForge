@@ -201,6 +201,18 @@ def _fix_cuda_api(cuda_code: str) -> str:
         cuda_code,
     )
 
+    # Bug 8 — register_buffer/register_parameter fails when attribute already exists.
+    # Model writes self.bias = bias (bool), then register_buffer("bias", ...) → KeyError.
+    # Fix: insert delattr guard before the register call.
+    _reg_pat = re.compile(r'^(\s*)self\.register_(buffer|parameter)\(\s*["\'](\w+)["\']')
+    def _fix_register_conflict(line: str) -> str:
+        m = _reg_pat.match(line)
+        if m:
+            indent, name = m.group(1), m.group(3)
+            return f'{indent}if hasattr(self, "{name}"): delattr(self, "{name}")\n{line}'
+        return line
+    cuda_code = '\n'.join(_fix_register_conflict(l) for l in cuda_code.splitlines())
+
     return cuda_code
 
 
