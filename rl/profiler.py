@@ -14,7 +14,8 @@ import csv
 from typing import Dict, Any
 
 
-def profile_kernel(kernel_code: str, reference_code: str, timeout: int = 120) -> str:
+def profile_kernel(kernel_code: str, reference_code: str, timeout: int = 120,
+                   speedup: float | None = None) -> str:
     """
     Profile a generated CUDA kernel using ncu and generate actionable feedback.
     
@@ -22,6 +23,9 @@ def profile_kernel(kernel_code: str, reference_code: str, timeout: int = 120) ->
         kernel_code: Code containing ModelNew and load_inline
         reference_code: Code containing Model and get_inputs
         timeout: Max seconds to run the profiler
+        speedup: Optional speedup ratio (baseline_ms / kernel_ms). Used to detect
+                 "efficient but slow" patterns where utilization is high but the
+                 kernel is slower than PyTorch.
         
     Returns:
         Readable string with bottleneck analysis and recommendations.
@@ -132,7 +136,7 @@ def profile_kernel(kernel_code: str, reference_code: str, timeout: int = 120) ->
         if not extracted_metrics:
             return "Profiler Error: Could not extract metric data from 'ncu' output."
             
-        return _generate_feedback(extracted_metrics)
+        return _generate_feedback(extracted_metrics, speedup=speedup)
 
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -192,7 +196,7 @@ def _parse_ncu_csv(csv_text: str) -> Dict[str, float]:
     return metrics
 
 
-def _generate_feedback(metrics: Dict[str, float]) -> str:
+def _generate_feedback(metrics: Dict[str, float], speedup: float | None = None) -> str:
     """Bottleneck-aware profiler feedback with actionable optimization techniques."""
     compute = metrics.get("compute", 0.0)
     memory = metrics.get("memory", 0.0)
@@ -202,6 +206,23 @@ def _generate_feedback(metrics: Dict[str, float]) -> str:
     feedback += f"Memory Throughput:  {memory:>5.1f}% of peak\n"
     feedback += f"Compute Throughput: {compute:>5.1f}% of peak\n"
     feedback += f"Warp Occupancy:     {occupancy:>5.1f}% of theoretical peak\n"
+
+    # Detect "efficient but slow" pattern: high utilization but slower than PyTorch.
+    # This means the kernel is efficiently doing TOO MUCH WORK — the problem is
+    # algorithmic (too many memory passes, too many FLOPs), not micro-optimization.
+    if speedup is not None and speedup < 1.0 and memory > 70 and compute > 50:
+        feedback += (
+            f"\n--- WARNING: Efficient But Slow ({speedup:.2f}x) ---\n"
+            f"Your kernel has high hardware utilization but is SLOWER than PyTorch. "
+            f"This means the GPU is efficiently executing TOO MUCH WORK.\n"
+            f"The problem is NOT micro-optimization — it is algorithmic:\n"
+            f"- Are you reading/writing the full tensor multiple times? Fuse into one pass.\n"
+            f"- Are you computing the same values redundantly? Precompute and reuse.\n"
+            f"- Is your loop order causing redundant memory traffic? Reorder for locality.\n"
+            f"- Can you reduce total FLOPs with a mathematical simplification?\n"
+            f"Focus on reducing TOTAL WORK, not improving utilization.\n"
+        )
+        return feedback
 
     # Diagnose bottleneck and suggest techniques based on ALL three metrics
     feedback += f"\n--- Bottleneck Analysis ---\n"

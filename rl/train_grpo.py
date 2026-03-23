@@ -212,7 +212,8 @@ OPTIMIZATION_RULES = [
             "  float4 out4;\n"
             "  out4.x = f(in4.x); out4.y = f(in4.y); out4.z = f(in4.z); out4.w = f(in4.w);\n"
             "  reinterpret_cast<float4*>(output)[idx] = out4;\n"
-            "Adjust grid size: blocks = (n/4 + threads - 1) / threads. Handle remainder elements separately if n % 4 != 0."
+            "Adjust grid size: blocks = (n/4 + threads - 1) / threads. Handle remainder elements separately if n % 4 != 0.\n"
+            "IMPORTANT: data pointer must be 16-byte aligned (torch tensors are by default). n should be divisible by 4."
         ),
     },
     {
@@ -301,6 +302,22 @@ OPTIMIZATION_RULES = [
             "- Use __launch_bounds__(maxThreads, minBlocks) to guide the compiler:\n"
             "  __global__ void __launch_bounds__(128, 8) my_kernel(...) { ... }\n"
             "Check: blocks_per_SM = shared_mem_per_SM / shared_mem_per_block. Aim for >= 4."
+        ),
+    },
+    {
+        "name": "Coalesced Memory Access (Loop Reordering)",
+        "rule": (
+            "Ensure consecutive threads access consecutive memory addresses (coalesced access).\n"
+            "Bad (strided access — threads jump across memory):\n"
+            "  for (int c = 0; c < C; c++)\n"
+            "    for (int h = 0; h < H; h++)\n"
+            "      output[c * H + h] = ...;  // threads access c*H apart\n"
+            "Good (consecutive access — threads access neighbors):\n"
+            "  for (int h = 0; h < H; h++)\n"
+            "    for (int c = 0; c < C; c++)\n"
+            "      output[c * H + h] = ...;  // threads access 1 apart\n"
+            "Rule: the innermost loop index should match the fastest-varying memory dimension. "
+            "For row-major tensors, the last dimension is fastest."
         ),
     },
 ]
@@ -1044,7 +1061,7 @@ def _run_group_episodes(
             if profiled_idx is not None:
                 try:
                     t_prof = time.time()
-                    prof_fb = profile_kernel(candidates[profiled_idx], prompt_text)
+                    prof_fb = profile_kernel(candidates[profiled_idx], prompt_text, speedup=profiled_sp)
                     # Store profiler feedback in eval result so warm start and _build_turn_feedback can use it
                     eval_results[profiled_idx]["profiler_feedback"] = prof_fb
                     print(f"  [PROFILER traj={profiled_idx} ({profiled_sp:.2f}x)] ({time.time()-t_prof:.1f}s):\n{prof_fb}")
