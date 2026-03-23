@@ -213,6 +213,38 @@ def _fix_cuda_api(cuda_code: str) -> str:
         return line
     cuda_code = '\n'.join(_fix_register_conflict(l) for l in cuda_code.splitlines())
 
+    # Bug 9 — .stride() (no-arg overload) doesn't exist on at::Tensor.
+    # The model writes input.stride() but the correct no-arg accessor is .strides().
+    # Only fix the no-arg call; .stride(dim) with an argument is valid.
+    cuda_code = re.sub(r'\.stride\(\)', '.strides()', cuda_code)
+
+    # Bug 10 — IntArrayRef (from .sizes()/.strides()) passed where const int64_t* expected.
+    # Kernel launches and raw pointer assignments need .data() to get the underlying pointer.
+    # Only apply when followed by , ; or ) (argument/assignment context), NOT when subscripted [].
+    # Guard against double-application: skip if already followed by .data().
+    cuda_code = re.sub(
+        r'(\w+\.(?:sizes|strides)\(\))(?!\.data\(\))(?=\s*[,;)])',
+        r'\1.data()',
+        cuda_code,
+    )
+
+    # Bug 11 — VLA int64_t arr[ndim] → std::vector<int64_t> arr(ndim).
+    # C-style VLAs don't implicitly convert to c10::ArrayRef<int64_t> (needed by
+    # .reshape(), .view(), etc.). std::vector does via implicit conversion.
+    cuda_code = re.sub(
+        r'int64_t\s+(\w+)\[(\w+)\]\s*;',
+        r'std::vector<int64_t> \1(\2);',
+        cuda_code,
+    )
+
+    # Bug 12 — non-const pointer assigned from .sizes()/.strides().data().
+    # These return const int64_t*, not int64_t*. Add const qualifier.
+    cuda_code = re.sub(
+        r'int64_t\s*\*\s*(\w+)\s*=\s*(\w+\.(?:sizes|strides)\(\))',
+        r'const int64_t* \1 = \2',
+        cuda_code,
+    )
+
     return cuda_code
 
 
