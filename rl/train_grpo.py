@@ -443,15 +443,31 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
         timing_lines.append(f"torch.compile: {ct:.3f}ms" + (f" ({ct/rt:.2f}x)" if rt else ""))
     timing_str = "\n".join(timing_lines)
     profiler_str = f"\n\n{profiler_feedback}" if profiler_feedback else ""
-    return (
-        f"Your previous answer was correct.\n{timing_str}{profiler_str}\n\n"
-        "IMPORTANT: Your kernel is correct. Do NOT rewrite it from scratch.\n"
-        "Make small, incremental changes to improve speed while keeping the SAME kernel structure.\n"
-        "Examples of safe optimizations: adjust block/grid sizes, add #pragma unroll, "
-        "use float4 loads, reduce redundant computation.\n"
-        "Do NOT attempt shared memory tiling or major algorithmic rewrites — "
-        "those often break correctness. Generate the complete improved code."
-    )
+
+    speedup_val = (bt / rt) if (rt and bt and rt > 0) else 0.0
+
+    if speedup_val >= 1.0:
+        # OPT TURN: already faster than PyTorch — safe micro-optimizations only
+        return (
+            f"Your previous answer was correct.\n{timing_str}{profiler_str}\n\n"
+            "IMPORTANT: Your kernel is correct AND already faster than PyTorch.\n"
+            "Do NOT rewrite it from scratch. Make small, incremental changes only.\n"
+            "Safe optimizations: adjust block/grid sizes, add #pragma unroll, "
+            "use float4/int4 vectorized loads, reduce redundant computation.\n"
+            "Do NOT attempt shared memory tiling or major algorithmic rewrites — "
+            "those often break correctness. Generate the complete improved code."
+        )
+    else:
+        # REWRITE TURN: slower than PyTorch — allow algorithmic restructuring
+        return (
+            f"Your previous answer was correct.\n{timing_str}{profiler_str}\n\n"
+            "Your kernel is correct but SLOWER than PyTorch. "
+            "You may restructure the algorithm to improve performance.\n"
+            "Focus on: reducing total work, improving memory access patterns, "
+            "increasing parallelism, and ensuring coalesced memory access.\n"
+            "Keep the same function signature and output shape. "
+            "Generate the complete improved code."
+        )
 
 
 # ---------------------------------------------------------------------------
