@@ -818,8 +818,48 @@ def _run_group_episodes(
                 prof_fb = ws_best_eval.get("profiler_feedback") if ws_best_eval else None
                 profiler_str = f"\n\n{prof_fb}" if prof_fb else ""
 
-                # Assign a different optimization rule to each trajectory
-                rule = OPTIMIZATION_RULES[i % len(OPTIMIZATION_RULES)]
+                # ── Delta feedback from previous optimization attempt ─────
+                # Tell the model if its last rule application helped or hurt.
+                delta_str = ""
+                prev_opt_eval = traj_evals[i][turn_idx - 1] if turn_idx > 1 and len(traj_evals[i]) >= turn_idx else None
+                if prev_opt_eval is not None:
+                    prev_rule = OPTIMIZATION_RULES[(i + turn_idx - 2) % len(OPTIMIZATION_RULES)]
+                    if not prev_opt_eval.get("compiles", False):
+                        delta_str = (
+                            f"\n\n⚠ Last turn you tried '{prev_rule['name']}' — "
+                            f"it BROKE COMPILATION. Avoid that approach."
+                        )
+                    elif not prev_opt_eval.get("correct", False):
+                        delta_str = (
+                            f"\n\n⚠ Last turn you tried '{prev_rule['name']}' — "
+                            f"it BROKE CORRECTNESS. The optimization introduced bugs."
+                        )
+                    else:
+                        prev_rt = prev_opt_eval.get("runtime_ms")
+                        if prev_rt and bt:
+                            prev_sp = bt / prev_rt
+                            if prev_sp > ws_best_speedup * 1.05:
+                                delta_str = (
+                                    f"\n\n✓ Last turn you tried '{prev_rule['name']}' — "
+                                    f"it IMPROVED speed to {prev_sp:.2f}x (was {ws_best_speedup:.2f}x). Good technique."
+                                )
+                            elif prev_sp < ws_best_speedup * 0.95:
+                                delta_str = (
+                                    f"\n\n✗ Last turn you tried '{prev_rule['name']}' — "
+                                    f"it made the kernel SLOWER at {prev_sp:.2f}x (was {ws_best_speedup:.2f}x). "
+                                    f"Avoid that approach."
+                                )
+                            else:
+                                delta_str = (
+                                    f"\n\n→ Last turn you tried '{prev_rule['name']}' — "
+                                    f"no significant speed change ({prev_sp:.2f}x vs {ws_best_speedup:.2f}x). "
+                                    f"Try a different technique."
+                                )
+
+                # Assign a different optimization rule — rotate by BOTH
+                # trajectory index AND turn so each traj tries a different
+                # technique each turn instead of the same one every time.
+                rule = OPTIMIZATION_RULES[(i + turn_idx - 1) % len(OPTIMIZATION_RULES)]
                 rule_str = (
                     f"\n\n--- Optimization Technique to Apply ---\n"
                     f"**{rule['name']}**\n{rule['rule']}\n"
@@ -830,6 +870,7 @@ def _run_group_episodes(
 
                 feedback = (
                     f"Your previous answer was correct.\n{timing_str}{profiler_str}"
+                    f"{delta_str}"
                     f"{rule_str}\n\n"
                     "Apply the optimization technique above to improve speed. "
                     "Generate the complete improved code."
@@ -838,8 +879,9 @@ def _run_group_episodes(
                 if i == 0:
                     print(f"  [OPT TURN] traj=0 turn {turn_idx+1}: "
                           f"best kernel from {ws_best_source} ({ws_best_speedup:.2f}x), "
-                          f"rule='{rule['name']}'")
-                    print(f"  [DEBUG] Feedback traj=0 →{turn_idx+1}:\n{feedback[:500]}...")
+                          f"rule='{rule['name']}'"
+                          f"{', delta: ' + delta_str.strip() if delta_str else ''}")
+                    print(f"  [DEBUG] Feedback traj=0 →{turn_idx+1}:\n{feedback[:600]}...")
                 msgs.append({"role": "user", "content": feedback})
             else:
                 # Normal path (turn 1, or turn 2+ with no correct kernel yet):
@@ -896,7 +938,7 @@ def _run_group_episodes(
         if turn_idx > 0 and ws_best_code is not None:
             print(f"  [OPT TURN] Turn {turn_idx+1}: ALL {G} trajectories optimizing "
                   f"best kernel from {ws_best_source} ({ws_best_speedup:.2f}x)")
-            rules_used = [OPTIMIZATION_RULES[i % len(OPTIMIZATION_RULES)]["name"] for i in range(G)]
+            rules_used = [OPTIMIZATION_RULES[(i + turn_idx - 1) % len(OPTIMIZATION_RULES)]["name"] for i in range(G)]
             print(f"  [OPT TURN] Rules assigned: {rules_used}")
         elif turn_idx > 0:
             print(f"  [TURN {turn_idx+1}] No correct kernel yet — normal error-feedback path")
