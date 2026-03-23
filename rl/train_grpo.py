@@ -193,6 +193,118 @@ Now write the complete model_new.py for the following operation. End your respon
 Reflection: <2-3 sentences covering: (1) your parallelization strategy and block/grid dimensions, (2) memory optimizations used (shared memory, vectorized loads, etc.), (3) what you would try next to improve performance>
 """
 
+# ---------------------------------------------------------------------------
+# Optimization Rules Catalog — universal CUDA techniques for turn 2+
+# Each rule is a concrete before/after code pattern the model can apply.
+# Different trajectories get assigned different rules for GRPO diversity.
+# ---------------------------------------------------------------------------
+
+OPTIMIZATION_RULES = [
+    {
+        "name": "Vectorized Memory Access (float4)",
+        "rule": (
+            "Load/store 4 floats at once using float4 for 128-bit memory transactions (4x fewer transactions).\n"
+            "Replace:\n"
+            "  float val = input[idx];\n"
+            "  output[idx] = f(val);\n"
+            "With:\n"
+            "  float4 in4 = reinterpret_cast<const float4*>(input)[idx];\n"
+            "  float4 out4;\n"
+            "  out4.x = f(in4.x); out4.y = f(in4.y); out4.z = f(in4.z); out4.w = f(in4.w);\n"
+            "  reinterpret_cast<float4*>(output)[idx] = out4;\n"
+            "Adjust grid size: blocks = (n/4 + threads - 1) / threads. Handle remainder elements separately if n % 4 != 0."
+        ),
+    },
+    {
+        "name": "Grid-Stride Loop",
+        "rule": (
+            "Process multiple elements per thread with a grid-stride loop. Handles any size, improves occupancy.\n"
+            "Replace:\n"
+            "  int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+            "  if (idx < n) output[idx] = f(input[idx]);\n"
+            "With:\n"
+            "  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {\n"
+            "      output[i] = f(input[i]);\n"
+            "  }\n"
+            "Launch fewer blocks (e.g. 128 blocks × 256 threads) and let each thread loop over its stride."
+        ),
+    },
+    {
+        "name": "Warp-Level Reduction",
+        "rule": (
+            "For reductions (sum, max, min), use warp shuffle instead of shared memory — no sync needed.\n"
+            "  float val = thread_value;\n"
+            "  for (int offset = 16; offset > 0; offset >>= 1)\n"
+            "      val += __shfl_down_sync(0xffffffff, val, offset);\n"
+            "  // Now thread 0 of each warp has the warp's sum.\n"
+            "For block-wide reduction: each warp reduces to lane 0, then lane 0s reduce via shared memory (only 32 elements)."
+        ),
+    },
+    {
+        "name": "Shared Memory Tiling",
+        "rule": (
+            "For operations that reuse data (matmul, conv, stencil), tile data into shared memory.\n"
+            "  __shared__ float tile[TILE_SIZE][TILE_SIZE];\n"
+            "  // Step 1: Load tile from global memory (coalesced access)\n"
+            "  tile[ty][tx] = input[row * N + col];\n"
+            "  __syncthreads();\n"
+            "  // Step 2: Compute from shared memory (fast, no global memory latency)\n"
+            "  for (int k = 0; k < TILE_SIZE; k++) sum += tile[ty][k] * ...;\n"
+            "  __syncthreads();\n"
+            "Typical tile sizes: 16x16 or 32x32. Shared memory is ~100x faster than global."
+        ),
+    },
+    {
+        "name": "Loop Unrolling",
+        "rule": (
+            "Unroll inner loops so the compiler can pipeline instructions and use registers efficiently.\n"
+            "  #pragma unroll\n"
+            "  for (int k = 0; k < TILE_K; k++) {\n"
+            "      sum += a[k] * b[k];\n"
+            "  }\n"
+            "Or manually unroll by 4:\n"
+            "  sum += a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3];\n"
+            "Best for small, fixed-size inner loops. Combine with vectorized loads for maximum throughput."
+        ),
+    },
+    {
+        "name": "Kernel Fusion",
+        "rule": (
+            "Combine multiple element-wise operations into a single kernel to eliminate intermediate memory traffic.\n"
+            "Instead of separate kernels:\n"
+            "  kernel1: temp[i] = relu(x[i])\n"
+            "  kernel2: out[i] = temp[i] + bias[i]\n"
+            "Fuse into one kernel:\n"
+            "  out[i] = fmaxf(0.0f, x[i]) + bias[i];\n"
+            "This halves memory traffic (no temp array) and eliminates kernel launch overhead."
+        ),
+    },
+    {
+        "name": "Read-Only Cache (__ldg)",
+        "rule": (
+            "For read-only input data, use __ldg() to use the texture/L2 cache path.\n"
+            "Replace:\n"
+            "  float val = input[idx];\n"
+            "With:\n"
+            "  float val = __ldg(&input[idx]);\n"
+            "This hints the hardware to cache the read in L2 without polluting L1. "
+            "Especially useful for scattered or read-many access patterns."
+        ),
+    },
+    {
+        "name": "Occupancy Tuning",
+        "rule": (
+            "Increase occupancy (active warps per SM) to better hide memory latency.\n"
+            "- Try 128 threads/block instead of 256 — more blocks fit per SM.\n"
+            "- Reduce local variables to lower register pressure.\n"
+            "- Reduce shared memory usage so more blocks can coexist.\n"
+            "- Use __launch_bounds__(maxThreads, minBlocks) to guide the compiler:\n"
+            "  __global__ void __launch_bounds__(128, 8) my_kernel(...) { ... }\n"
+            "Check: blocks_per_SM = shared_mem_per_SM / shared_mem_per_block. Aim for >= 4."
+        ),
+    },
+]
+
 
 
 
@@ -658,25 +770,22 @@ def _run_group_episodes(
         for i in range(G):
             msgs = list(base_messages)
 
-            # ── Warm start check: did this trajectory fail on the last turn
-            # while a GOOD kernel exists from ANY prior turn? ───────────────
-            # Only warm start if the best kernel is at least 0.5x eager speed.
-            # Warm starting from a terrible kernel (0.01x) is counterproductive.
-            use_warm_start = False
-            if turn_idx > 0:
-                last_t = turn_idx - 1
-                my_eval = traj_evals[i][last_t]
-                my_failed = (my_eval is None or not my_eval.get("correct", False))
-                if my_failed and ws_best_code is not None and ws_best_speedup >= 0.5:
-                    use_warm_start = True
+            # ── Optimization-first turn strategy ─────────────────────────────
+            # Turn 2+: if ANY correct kernel exists, ALL trajectories get it
+            # and are asked to optimize using a specific technique (different
+            # per trajectory for GRPO diversity). This replaces the old
+            # "warm start only for failed trajectories" approach.
+            use_optimization_turn = (
+                turn_idx > 0
+                and ws_best_code is not None
+            )
 
-            if use_warm_start:
-                # Instead of this trajectory's own failed history, inject the
-                # overall best correct kernel and ask to optimize it.
+            if use_optimization_turn:
+                # ALL trajectories get the best correct kernel
                 stripped = _strip_thinking(ws_best_completion, truncate_code=False)
                 msgs.append({"role": "assistant", "content": stripped})
 
-                # Build optimization-focused feedback using the best kernel's eval
+                # Build timing string from the best kernel's eval
                 rt = ws_best_eval.get("runtime_ms") if ws_best_eval else None
                 bt = ws_best_eval.get("baseline_runtime_ms") if ws_best_eval else None
                 ct = ws_best_eval.get("compile_runtime_ms") if ws_best_eval else None
@@ -687,21 +796,37 @@ def _run_group_episodes(
                 if ct:
                     timing_lines.append(f"torch.compile: {ct:.3f}ms" + (f" ({ct/rt:.2f}x)" if rt else ""))
                 timing_str = "\n".join(timing_lines)
-                # Include profiler data if available from the best kernel
+
+                # Include profiler data if available
                 prof_fb = ws_best_eval.get("profiler_feedback") if ws_best_eval else None
                 profiler_str = f"\n\n{prof_fb}" if prof_fb else ""
+
+                # Assign a different optimization rule to each trajectory
+                rule = OPTIMIZATION_RULES[i % len(OPTIMIZATION_RULES)]
+                rule_str = (
+                    f"\n\n--- Optimization Technique to Apply ---\n"
+                    f"**{rule['name']}**\n{rule['rule']}\n"
+                    f"---\n"
+                    f"Apply this technique to the kernel above. "
+                    f"Keep the kernel correct while making it faster."
+                )
+
                 feedback = (
-                    f"Your previous answer was correct.\n{timing_str}{profiler_str}\n\n"
-                    "Keep your working approach and optimize it for speed. Generate the complete improved code."
+                    f"Your previous answer was correct.\n{timing_str}{profiler_str}"
+                    f"{rule_str}\n\n"
+                    "Apply the optimization technique above to improve speed. "
+                    "Generate the complete improved code."
                 )
 
                 if i == 0:
-                    print(f"  [DEBUG] WARM START traj=0 turn {turn_idx+1}: "
-                          f"using overall best ({ws_best_source}, {ws_best_speedup:.2f}x)")
-                    print(f"  [DEBUG] Feedback traj=0 →{turn_idx+1}:\n{feedback}")
+                    print(f"  [OPT TURN] traj=0 turn {turn_idx+1}: "
+                          f"best kernel from {ws_best_source} ({ws_best_speedup:.2f}x), "
+                          f"rule='{rule['name']}'")
+                    print(f"  [DEBUG] Feedback traj=0 →{turn_idx+1}:\n{feedback[:500]}...")
                 msgs.append({"role": "user", "content": feedback})
             else:
-                # Normal path: build context from this trajectory's own history
+                # Normal path (turn 1, or turn 2+ with no correct kernel yet):
+                # build context from this trajectory's own history
                 for t in range(turn_idx):
                     # Only keep full code for the most recent prior turn;
                     # older turns get code truncated to save context tokens.
@@ -747,20 +872,17 @@ def _run_group_episodes(
             if i == 0:
                 ctx_tokens = len(tokenizer(ctx_str).input_ids)
                 print(f"  [DEBUG] Context traj=0 turn {turn_idx+1}: {ctx_tokens} tokens"
-                      f"{' (warm start)' if use_warm_start else ''}")
+                      f"{' (opt turn)' if use_optimization_turn else ''}")
             context_texts.append(ctx_str)
 
-        # Warm start summary for this turn
-        if turn_idx > 0:
-            n_warm = sum(
-                1 for i in range(G)
-                if (traj_evals[i][turn_idx-1] is None
-                    or not traj_evals[i][turn_idx-1].get("correct", False))
-                and ws_best_code is not None
-            )
-            if n_warm > 0:
-                print(f"  [WARM START] Turn {turn_idx+1}: {n_warm}/{G} trajectories warm-started "
-                      f"with overall best ({ws_best_source}, {ws_best_speedup:.2f}x)")
+        # Optimization turn summary
+        if turn_idx > 0 and ws_best_code is not None:
+            print(f"  [OPT TURN] Turn {turn_idx+1}: ALL {G} trajectories optimizing "
+                  f"best kernel from {ws_best_source} ({ws_best_speedup:.2f}x)")
+            rules_used = [OPTIMIZATION_RULES[i % len(OPTIMIZATION_RULES)]["name"] for i in range(G)]
+            print(f"  [OPT TURN] Rules assigned: {rules_used}")
+        elif turn_idx > 0:
+            print(f"  [TURN {turn_idx+1}] No correct kernel yet — normal error-feedback path")
 
         # Generate G completions for this turn
         if not config.mock_mode:
@@ -1048,9 +1170,10 @@ def _compute_grpo_loss_and_backward(
         for i in range(G):
             loo_mean = (group_sum - disc_returns[i, t]) / max(G - 1, 1)
             loo_var = (group_sq_sum - disc_returns[i, t] ** 2) / max(G - 1, 1) - loo_mean ** 2
-            # Floor at 0.1 to prevent exploding advantages when all trajectories
-            # have near-identical rewards (e.g., 7x -0.5 + 1x -1.0 → std≈0 → adv=±5M)
-            loo_std = max(loo_var.clamp(min=0).sqrt().item(), 0.1)
+            # Floor at 1.0 to prevent exploding advantages. Reward range is
+            # -1.0 to 4.0, so 0.1 floor → advantages up to 43 when 1/8 correct.
+            # With 1.0 floor: same case → advantage ≈ 4.3, still strong signal.
+            loo_std = max(loo_var.clamp(min=0).sqrt().item(), 1.0)
             advantages[i, t] = (disc_returns[i, t] - loo_mean) / loo_std
 
     # ── DEBUG: discounted returns and advantages ─────────────────────────────
