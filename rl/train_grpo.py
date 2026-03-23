@@ -799,16 +799,14 @@ def _run_group_episodes(
             msgs = list(base_messages)
 
             # ── Optimization-first turn strategy ─────────────────────────────
-            # Turn 2+: if ANY correct kernel exists AND it beats eager,
-            # ALL trajectories get it and optimize using a specific technique.
-            # If the best kernel is slower than eager (< 1.0x), the kernel
-            # needs a complete rewrite, not micro-optimization — stay in
-            # normal error-feedback path so trajectories try new approaches.
+            # Turn 2+: if ANY correct kernel exists, ALL trajectories get it.
+            # If speedup >= 1.0: assign specific micro-optimization rules.
+            # If speedup < 1.0: skip rules, let profiler guide algorithmic fix.
             use_optimization_turn = (
                 turn_idx > 0
                 and ws_best_code is not None
-                and ws_best_speedup >= 1.0
             )
+            use_opt_rules = use_optimization_turn and ws_best_speedup >= 1.0
 
             if use_optimization_turn:
                 # Freeze baseline on first opt turn (Bug 1)
@@ -922,31 +920,49 @@ def _run_group_episodes(
                                     f"started at {baseline_sp:.2f}x). Try a different technique."
                                 )
 
-                # Assign a different optimization rule — rotate by BOTH
-                # trajectory index AND turn so each traj tries a different
-                # technique each turn instead of the same one every time.
-                rule = OPTIMIZATION_RULES[(i + turn_idx - 1) % len(OPTIMIZATION_RULES)]
-                rule_str = (
-                    f"\n\n--- Optimization Technique to Apply ---\n"
-                    f"**{rule['name']}**\n{rule['rule']}\n"
-                    f"---\n"
-                    f"Apply this technique to the kernel above. "
-                    f"Keep the kernel correct while making it faster."
-                )
-
-                feedback = (
-                    f"Your previous answer was correct.\n{timing_str}{profiler_str}"
-                    f"{delta_str}"
-                    f"{rule_str}\n\n"
-                    "Apply the optimization technique above to improve speed. "
-                    "Generate the complete improved code."
-                )
+                if use_opt_rules:
+                    # Assign a different optimization rule — rotate by BOTH
+                    # trajectory index AND turn so each traj tries a different
+                    # technique each turn instead of the same one every time.
+                    rule = OPTIMIZATION_RULES[(i + turn_idx - 1) % len(OPTIMIZATION_RULES)]
+                    rule_str = (
+                        f"\n\n--- Optimization Technique to Apply ---\n"
+                        f"**{rule['name']}**\n{rule['rule']}\n"
+                        f"---\n"
+                        f"Apply this technique to the kernel above. "
+                        f"Keep the kernel correct while making it faster."
+                    )
+                    feedback = (
+                        f"Your previous answer was correct.\n{timing_str}{profiler_str}"
+                        f"{delta_str}"
+                        f"{rule_str}\n\n"
+                        "Apply the optimization technique above to improve speed. "
+                        "Generate the complete improved code."
+                    )
+                else:
+                    # Kernel < 1.0x — slower than PyTorch. Don't prescribe
+                    # micro-optimizations; the model needs a fundamentally
+                    # different algorithm. Profiler feedback guides it.
+                    feedback = (
+                        f"Your previous answer was correct but SLOWER than PyTorch.\n"
+                        f"{timing_str}{profiler_str}"
+                        f"{delta_str}\n\n"
+                        f"Your kernel is {ws_best_speedup:.2f}x the speed of PyTorch eager — "
+                        f"it needs to be at LEAST 1.0x to be useful.\n"
+                        f"The problem is likely ALGORITHMIC, not micro-optimization. "
+                        f"Try a completely different approach to reduce total work."
+                    )
 
                 if i == 0:
-                    print(f"  [OPT TURN] traj=0 turn {turn_idx+1}: "
-                          f"best kernel from {ws_best_source} ({ws_best_speedup:.2f}x), "
-                          f"rule='{rule['name']}'"
-                          f"{', delta: ' + delta_str.strip()[:200] if delta_str else ''}")
+                    if use_opt_rules:
+                        print(f"  [OPT TURN] traj=0 turn {turn_idx+1}: "
+                              f"best kernel from {ws_best_source} ({ws_best_speedup:.2f}x), "
+                              f"rule='{rule['name']}'"
+                              f"{', delta: ' + delta_str.strip()[:200] if delta_str else ''}")
+                    else:
+                        print(f"  [REWRITE TURN] traj=0 turn {turn_idx+1}: "
+                              f"best kernel from {ws_best_source} ({ws_best_speedup:.2f}x) "
+                              f"— slower than eager, no rules prescribed")
                     print(f"  [DEBUG] Feedback traj=0 →{turn_idx+1}:\n{feedback[:800]}...")
                 msgs.append({"role": "user", "content": feedback})
             else:
@@ -1002,11 +1018,14 @@ def _run_group_episodes(
             context_texts.append(ctx_str)
 
         # Optimization turn summary
-        if turn_idx > 0 and ws_best_code is not None:
+        if use_optimization_turn and use_opt_rules:
             print(f"  [OPT TURN] Turn {turn_idx+1}: ALL {G} trajectories optimizing "
                   f"best kernel from {ws_best_source} ({ws_best_speedup:.2f}x)")
             rules_used = [OPTIMIZATION_RULES[(i + turn_idx - 1) % len(OPTIMIZATION_RULES)]["name"] for i in range(G)]
             print(f"  [OPT TURN] Rules assigned: {rules_used}")
+        elif use_optimization_turn:
+            print(f"  [REWRITE TURN] Turn {turn_idx+1}: ALL {G} trajectories rewriting "
+                  f"best kernel from {ws_best_source} ({ws_best_speedup:.2f}x) — no rules, needs algorithmic fix")
         elif turn_idx > 0:
             print(f"  [TURN {turn_idx+1}] No correct kernel yet — normal error-feedback path")
 
