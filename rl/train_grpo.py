@@ -445,7 +445,12 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
     profiler_str = f"\n\n{profiler_feedback}" if profiler_feedback else ""
     return (
         f"Your previous answer was correct.\n{timing_str}{profiler_str}\n\n"
-        "Keep your working approach and optimize it for speed. Generate the complete improved code."
+        "IMPORTANT: Your kernel is correct. Do NOT rewrite it from scratch.\n"
+        "Make small, incremental changes to improve speed while keeping the SAME kernel structure.\n"
+        "Examples of safe optimizations: adjust block/grid sizes, add #pragma unroll, "
+        "use float4 loads, reduce redundant computation.\n"
+        "Do NOT attempt shared memory tiling or major algorithmic rewrites — "
+        "those often break correctness. Generate the complete improved code."
     )
 
 
