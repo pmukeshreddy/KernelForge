@@ -1595,6 +1595,18 @@ def train(config: GRPOConfig = None):
             attn_implementation="kernels-community/flash-attn2",
         )
         print(f"Loading SFT adapter: {config.adapter_path}...")
+        # Fix accelerate bug: _no_split_modules can contain sets which are
+        # unhashable, causing get_balanced_memory() to crash. Flatten to
+        # a plain list of strings so set() works in accelerate internals.
+        _nsm = getattr(base_model, '_no_split_modules', None)
+        if _nsm is not None:
+            flat = []
+            for item in (_nsm if not isinstance(_nsm, str) else [_nsm]):
+                if isinstance(item, (set, frozenset, list, tuple)):
+                    flat.extend(str(x) for x in item)
+                else:
+                    flat.append(str(item))
+            base_model._no_split_modules = flat
         model = PeftModel.from_pretrained(base_model, config.adapter_path, is_trainable=True)
         
         # Enable gradient checkpointing to save VRAM
