@@ -898,7 +898,7 @@ def _run_group_episodes(
 
                     if not prev_opt_eval.get("compiles", False):
                         # Bug 4+5: include actual compiler error
-                        err_msg = prev_opt_eval.get("compiler_error", "Unknown error")
+                        err_msg = prev_opt_eval.get("compiler_error") or "Unknown error"
                         # Truncate to avoid flooding context
                         if len(err_msg) > 500:
                             err_msg = err_msg[:500] + "..."
@@ -910,7 +910,7 @@ def _run_group_episodes(
                         )
                     elif not prev_opt_eval.get("correct", False):
                         # Bug 4+5+6: include rich error detail from sandbox
-                        err_msg = prev_opt_eval.get("compiler_error", "Outputs do not match reference")
+                        err_msg = prev_opt_eval.get("compiler_error") or "Outputs do not match reference"
                         if len(err_msg) > 500:
                             err_msg = err_msg[:500] + "..."
                         wf = prev_opt_eval.get("wrong_frac")
