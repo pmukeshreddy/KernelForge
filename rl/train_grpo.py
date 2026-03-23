@@ -142,6 +142,11 @@ class GRPOConfig:
     dynamic_sampling: bool = True
     max_resample_attempts: int = 3
 
+    # SCoRe-style reward shaping: bonus for improvement, penalty for regression
+    # Widens the GRPO advantage gap between "optimize successfully" vs "break working code"
+    score_improvement_bonus: float = 0.5   # bonus when turn N improves over trajectory's best
+    score_regression_penalty: float = 0.3  # extra penalty when correct→wrong regression
+
     # Dataset cap: limit to N prompts (0 = use all). Useful for time-boxed runs.
     max_prompts: int = 0
 
@@ -796,6 +801,10 @@ def _run_group_episodes(
     traj_best_speedup: list[float | None] = [None] * G  # best speedup achieved so far
     traj_best_turn:    list[int | None]   = [None] * G  # which turn achieved it
 
+    # SCoRe tracking: per-trajectory correctness history for regression/improvement detection
+    traj_was_correct:  list[bool]  = [False] * G  # was this trajectory ever correct?
+    traj_best_reward:  list[float] = [float('-inf')] * G  # best reward achieved so far
+
     # Warm start: overall best correct kernel across ALL trajectories and ALL turns
     # Failed trajectories in turn 2+ get this kernel injected so they focus on optimization
     # Updated each turn — always tracks the fastest correct kernel seen so far
@@ -1194,6 +1203,29 @@ def _run_group_episodes(
                 sp_str = f" ({bt/rt:.2f}x)" if (rt and bt) else ""
                 opt_tag = " [OPT]" if use_optimization_turn else ""
                 print(f"    ✅ Turn {turn_idx+1} Traj {i}: {rt_str}{sp_str} reward={r:.2f}{opt_tag}")
+
+            # ── SCoRe reward shaping: bonus/penalty for improvement/regression ──
+            is_correct = (eval_res is not None
+                          and eval_res.get("compiles", False)
+                          and eval_res.get("correct", False))
+            score_tag = ""
+            if turn_idx > 0:
+                if traj_was_correct[i] and not is_correct:
+                    # Regression: was correct before, now broken → extra penalty
+                    r -= config.score_regression_penalty
+                    score_tag = f" [REG -{config.score_regression_penalty}]"
+                elif is_correct and r > traj_best_reward[i]:
+                    # Improvement: correct AND better than previous best → bonus
+                    r += config.score_improvement_bonus
+                    score_tag = f" [IMP +{config.score_improvement_bonus}]"
+            if score_tag:
+                print(f"      SCoRe traj {i}: {r:.2f}{score_tag}")
+
+            # Update SCoRe tracking
+            if is_correct:
+                traj_was_correct[i] = True
+            if r > traj_best_reward[i]:
+                traj_best_reward[i] = r
 
             group_rewards[i].append(r)
 
