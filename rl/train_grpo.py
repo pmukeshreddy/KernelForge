@@ -846,7 +846,14 @@ def _run_group_episodes(
                 delta_str = ""
                 prev_opt_eval = traj_evals[i][turn_idx - 1] if turn_idx > 1 and len(traj_evals[i]) >= turn_idx else None
                 if prev_opt_eval is not None:
-                    prev_rule = OPTIMIZATION_RULES[(i + turn_idx - 2) % len(OPTIMIZATION_RULES)]
+                    # Only reference a rule name if the previous turn actually
+                    # used opt rules.  When use_opt_rules is False the previous
+                    # turn was a free-form rewrite — no rule was assigned.
+                    if use_opt_rules:
+                        prev_rule = OPTIMIZATION_RULES[(i + turn_idx - 2) % len(OPTIMIZATION_RULES)]
+                        technique_ref = f"'{prev_rule['name']}'"
+                    else:
+                        technique_ref = "your rewrite"
 
                     # Bug 3: stuck detection — same error class 2 turns in a row
                     stuck_str = ""
@@ -867,7 +874,7 @@ def _run_group_episodes(
                         if len(err_msg) > 500:
                             err_msg = err_msg[:500] + "..."
                         delta_str = (
-                            f"\n\n⚠ REGRESSION: Last turn you tried '{prev_rule['name']}' — "
+                            f"\n\n⚠ REGRESSION: Last turn {technique_ref} — "
                             f"it BROKE COMPILATION of your working kernel.\n"
                             f"{stuck_str}"
                             f"Error: {err_msg}"
@@ -889,7 +896,7 @@ def _run_group_episodes(
                             detail_parts.append(f"systematic_bias={bias:+.4f} ({'too high' if bias > 0 else 'too low'})")
                         detail_suffix = " | ".join(detail_parts)
                         delta_str = (
-                            f"\n\n⚠ REGRESSION: Last turn you tried '{prev_rule['name']}' — "
+                            f"\n\n⚠ REGRESSION: Last turn {technique_ref} — "
                             f"it BROKE CORRECTNESS of your working kernel.\n"
                             f"{stuck_str}"
                             f"{err_msg}\n"
@@ -903,19 +910,19 @@ def _run_group_episodes(
                             prev_sp = bt / prev_rt
                             if prev_sp > baseline_sp * 1.05:
                                 delta_str = (
-                                    f"\n\n✓ Last turn you tried '{prev_rule['name']}' — "
+                                    f"\n\n✓ Last turn {technique_ref} — "
                                     f"it IMPROVED speed to {prev_sp:.2f}x "
                                     f"(started at {baseline_sp:.2f}x). Good technique."
                                 )
                             elif prev_sp < baseline_sp * 0.95:
                                 delta_str = (
-                                    f"\n\n✗ Last turn you tried '{prev_rule['name']}' — "
+                                    f"\n\n✗ Last turn {technique_ref} — "
                                     f"it made the kernel SLOWER at {prev_sp:.2f}x "
                                     f"(started at {baseline_sp:.2f}x). Avoid that approach."
                                 )
                             else:
                                 delta_str = (
-                                    f"\n\n→ Last turn you tried '{prev_rule['name']}' — "
+                                    f"\n\n→ Last turn {technique_ref} — "
                                     f"no significant speed change ({prev_sp:.2f}x vs "
                                     f"started at {baseline_sp:.2f}x). Try a different technique."
                                 )
