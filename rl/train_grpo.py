@@ -1595,7 +1595,17 @@ def train(config: GRPOConfig = None):
             attn_implementation="kernels-community/flash-attn2",
         )
         print(f"Loading SFT adapter: {config.adapter_path}...")
+        # Workaround: accelerate's get_balanced_memory() crashes with
+        # "unhashable type: 'set'" on some peft/accelerate versions.
+        # Temporarily hide hf_device_map so peft skips that code path —
+        # the adapter weights land on the correct devices regardless
+        # because peft attaches them to their corresponding base layers.
+        _device_map = getattr(base_model, "hf_device_map", None)
+        if _device_map is not None:
+            delattr(base_model, "hf_device_map")
         model = PeftModel.from_pretrained(base_model, config.adapter_path, is_trainable=True)
+        if _device_map is not None:
+            model.hf_device_map = _device_map
         
         # Enable gradient checkpointing to save VRAM
         model.enable_input_require_grads()
