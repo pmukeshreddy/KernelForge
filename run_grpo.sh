@@ -20,18 +20,43 @@ else
 fi
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$REPO_DIR/rl"
-python train_grpo.py \
-  --adapter mukeshreddy/kernelforge-qwen3-14b-lora-v2 \
-  --dataset ../sft/sft_training_pairs.jsonl \
-  --output_dir ./checkpoints/grpo_v1 \
-  --group_size 8 \
-  --batch_size 2 \
-  --num_turns 3 \
-  --think_budget 2000 \
-  --max_prompts 100 \
-  --grpo_epochs 1 \
-  --wandb_project kernelforge-rl \
-  --use_sglang \
-  --sglang_python ~/sglang_env/bin/python \
-  --sglang_port 30000 \
-  --sglang_tp 1
+
+# ── Mode: "test" for quick sanity check, "full" for real training ──
+MODE="${1:-test}"
+
+if [ "$MODE" = "test" ]; then
+  echo "=== QUICK TEST RUN (~20 min) ==="
+  python train_grpo.py \
+    --adapter mukeshreddy/kernelforge-qwen3-14b-lora-v2 \
+    --dataset ../sft/sft_training_pairs.jsonl \
+    --output_dir ./checkpoints/grpo_test \
+    --group_size 4 \
+    --batch_size 1 \
+    --num_turns 2 \
+    --think_budget 2000 \
+    --max_prompts 10 \
+    --grpo_epochs 1 \
+    --wandb_project kernelforge-rl \
+    --wandb_name grpo-speedup-reward-test \
+    --use_sglang \
+    --sglang_python ~/sglang_env/bin/python \
+    --sglang_port 30000 \
+    --sglang_tp 1
+else
+  echo "=== FULL TRAINING RUN ==="
+  python train_grpo.py \
+    --adapter mukeshreddy/kernelforge-qwen3-14b-lora-v2 \
+    --dataset ../sft/sft_training_pairs.jsonl \
+    --output_dir ./checkpoints/grpo_v1 \
+    --group_size 8 \
+    --batch_size 2 \
+    --num_turns 3 \
+    --think_budget 2000 \
+    --max_prompts 100 \
+    --grpo_epochs 1 \
+    --wandb_project kernelforge-rl \
+    --use_sglang \
+    --sglang_python ~/sglang_env/bin/python \
+    --sglang_port 30000 \
+    --sglang_tp 1
+fi
