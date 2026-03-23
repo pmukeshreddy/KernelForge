@@ -197,7 +197,7 @@ def _parse_ncu_csv(csv_text: str) -> Dict[str, float]:
 
 
 def _generate_feedback(metrics: Dict[str, float], speedup: float | None = None) -> str:
-    """Raw profiler metrics — no rule-based advice. Let the model reason."""
+    """Bottleneck-aware profiler feedback with actionable optimization techniques."""
     compute = metrics.get("compute", 0.0)
     memory = metrics.get("memory", 0.0)
     occupancy = metrics.get("occupancy", 0.0)
@@ -207,15 +207,177 @@ def _generate_feedback(metrics: Dict[str, float], speedup: float | None = None) 
     feedback += f"Compute Throughput: {compute:>5.1f}% of peak\n"
     feedback += f"Warp Occupancy:     {occupancy:>5.1f}% of theoretical peak\n"
 
-    # Simple bottleneck label — no advice
-    if memory < 30 and compute < 30:
-        feedback += f"Bottleneck: LATENCY-BOUND\n"
-    elif memory > compute * 1.5:
-        feedback += f"Bottleneck: MEMORY-BOUND\n"
+    # Detect "efficient but slow" pattern: high utilization but slower than PyTorch.
+    # Give bottleneck-specific advice instead of generic "reduce work" message.
+    if speedup is not None and speedup < 1.5 and (memory > 70 or compute > 50) and max(memory, compute) > 60:
+        feedback += f"\n--- WARNING: Efficient But Slow ({speedup:.2f}x) ---\n"
+        feedback += (
+            f"Your kernel has high hardware utilization but is "
+            f"{'SLOWER than' if speedup < 1.0 else 'barely faster than'} PyTorch.\n"
+        )
+
+        if compute > 70 and memory > 70:
+            feedback += (
+                f"Both compute ({compute:.0f}%) and memory ({memory:.0f}%) are near peak. "
+                f"The GPU is busy but each thread produces too little output.\n"
+                f"Fix: REGISTER TILING — each thread should compute a 4x4 or 8x8 tile "
+                f"of output elements, not just 1. This increases arithmetic intensity "
+                f"(FLOPs per byte loaded) and amortizes memory latency.\n"
+                f"- Load tiles of A and B into registers, not just shared memory\n"
+                f"- Use larger TILE_SIZE (64 or 128) with register-level sub-tiles\n"
+                f"- Double-buffer shared memory loads (load next tile while computing current)\n"
+            )
+        elif memory > compute * 1.3:
+            feedback += (
+                f"Memory throughput ({memory:.0f}%) is much higher than compute ({compute:.0f}%). "
+                f"The kernel reads too much data relative to the computation performed.\n"
+                f"This usually means redundant memory reads (e.g., overlapping windows).\n"
+                f"Fix: SHARED MEMORY CACHING — load input tiles into shared memory once, "
+                f"then all threads in the block reuse the cached data.\n"
+                f"- For sliding window ops (pool, conv): cache the input region, read from smem\n"
+                f"- Use __ldg() for read-only data to leverage L2 cache\n"
+                f"- Fuse multiple operations into one kernel to avoid extra memory passes\n"
+            )
+        else:
+            feedback += (
+                f"Compute ({compute:.0f}%) is high relative to memory ({memory:.0f}%). "
+                f"The kernel does too much arithmetic per element.\n"
+                f"Fix: REDUCE FLOPS — \n"
+                f"- Precompute constants outside the inner loop\n"
+                f"- Use fast math intrinsics (__fmaf_rn, __expf, __rsqrtf)\n"
+                f"- Simplify the algorithm (e.g., separable filters, FFT for large convolutions)\n"
+                f"- Avoid redundant computation across threads\n"
+            )
+
+        return feedback
+
+    # Diagnose bottleneck and suggest techniques based on ALL three metrics
+    feedback += f"\n--- Bottleneck Analysis ---\n"
+
+    # 1. Overall utilization check
+    if memory < 30 and compute < 30 and occupancy < 30:
+        feedback += (
+            "Bottleneck: LATENCY-BOUND (all three metrics very low).\n"
+            "The kernel is not doing enough work per launch.\n"
+            "Techniques: process multiple elements per thread (loop over elements), "
+            "use float4/int4 vectorized loads/stores (128-bit transactions), "
+            "fuse multiple operations into a single kernel."
+        )
+        if occupancy < 40:
+            feedback += (
+                f"\n\nLow occupancy ({occupancy:.0f}%): too few active warps. "
+                "Reduce registers per thread, reduce shared memory per block, "
+                "or use smaller block sizes (128 instead of 256)."
+            )
+        return feedback
+
+    # 2. Identify the primary bottleneck
+    if memory > compute * 1.5:
+        bottleneck = "MEMORY"
     elif compute > memory * 1.5:
-        feedback += f"Bottleneck: COMPUTE-BOUND\n"
+        bottleneck = "COMPUTE"
     else:
-        feedback += f"Bottleneck: BALANCED\n"
+        bottleneck = "BALANCED"
+
+    # 3. Build advice considering all three metrics together
+    if bottleneck == "MEMORY":
+        feedback += "Bottleneck: MEMORY-BOUND.\n"
+        if memory >= 80 and occupancy >= 60:
+            if speedup is not None and speedup < 2.0:
+                feedback += (
+                    f"Memory throughput is near peak ({memory:.0f}%) but kernel is only "
+                    f"{speedup:.2f}x faster than PyTorch. This suggests redundant memory "
+                    f"traffic — the GPU is busy but reading the same data multiple times.\n"
+                    f"Techniques: use shared memory to cache input tiles for overlapping "
+                    f"access patterns (pooling, convolution windows), use __ldg() for "
+                    f"read-only data to leverage L2 cache, reduce total bytes by computing "
+                    f"partial results in registers before writing to global memory."
+                )
+            else:
+                feedback += (
+                    "Memory throughput is near peak with good occupancy — this kernel is "
+                    "already well-optimized for a memory-bound workload. Further speedup "
+                    "requires reducing memory passes (fuse multiple operations into one kernel) "
+                    "or reducing total bytes moved (in-place ops, skip unnecessary copies)."
+                )
+        elif memory >= 80 and occupancy < 60:
+            feedback += (
+                f"Memory throughput is high but occupancy is low ({occupancy:.0f}%). "
+                "More active warps could hide memory latency better.\n"
+                "Techniques: reduce registers per thread, reduce shared memory per block, "
+                "use smaller block sizes to fit more blocks per SM, "
+                "process more elements per thread with a strided loop."
+            )
+        elif memory < 50:
+            feedback += (
+                "Memory bandwidth is underutilized.\n"
+                "Techniques: use float4 vectorized loads/stores (reinterpret_cast<float4*>), "
+                "ensure coalesced access patterns (consecutive threads access consecutive addresses), "
+                "process multiple elements per thread to hide memory latency."
+            )
+        else:
+            feedback += (
+                "Memory bandwidth is the primary limiter.\n"
+                "Techniques: use float4 vectorized loads/stores for 128-bit transactions, "
+                "use __ldg() for read-only data (L2 cache hint), "
+                "fuse sequential operations to avoid intermediate global memory writes, "
+                "process multiple elements per thread to overlap compute and memory."
+            )
+
+    elif bottleneck == "COMPUTE":
+        feedback += "Bottleneck: COMPUTE-BOUND.\n"
+        if compute >= 80 and occupancy >= 60:
+            feedback += (
+                "Compute throughput is near peak with good occupancy — well-optimized. "
+                "Further speedup requires reducing arithmetic (precompute constants, "
+                "use fast intrinsics like __fmaf_rn, __expf, __rsqrtf), "
+                "or algorithmic changes to reduce total FLOPs."
+            )
+        elif compute >= 80 and occupancy < 60:
+            feedback += (
+                f"Compute throughput is high but occupancy is low ({occupancy:.0f}%). "
+                "More warps could improve instruction-level parallelism.\n"
+                "Techniques: reduce registers per thread, use smaller block sizes, "
+                "simplify per-thread logic to reduce register pressure."
+            )
+        elif compute < 50:
+            feedback += (
+                "Compute units are underutilized.\n"
+                "Techniques: increase parallelism (more threads/blocks), "
+                "use warp-level primitives (__shfl_down_sync for reductions), "
+                "unroll inner loops (#pragma unroll), "
+                "reduce branch divergence within warps."
+            )
+        else:
+            feedback += (
+                "Compute is the primary limiter.\n"
+                "Techniques: use fast intrinsics (__fmaf_rn, __expf, __rsqrtf), "
+                "precompute constants outside the inner loop, "
+                "use warp shuffle (__shfl_down_sync) instead of shared memory for reductions."
+            )
+
+    else:  # BALANCED
+        feedback += "Bottleneck: BALANCED (compute and memory roughly equal).\n"
+        if memory >= 70 and compute >= 70:
+            feedback += (
+                "Both compute and memory are well-utilized. "
+                "Further speedup requires algorithmic changes: reduce total work or "
+                "fuse operations to eliminate intermediate memory traffic."
+            )
+        else:
+            feedback += (
+                "Techniques: overlap compute and memory with software pipelining, "
+                "use shared memory to stage data and reduce global accesses, "
+                "increase elements per thread to improve instruction-level parallelism."
+            )
+
+    # 4. Occupancy advice (always relevant when low, regardless of bottleneck)
+    if occupancy < 40 and not (memory < 30 and compute < 30):
+        feedback += (
+            f"\n\nLow occupancy ({occupancy:.0f}%): too few active warps. "
+            "Reduce registers per thread (fewer local variables, simpler logic), "
+            "reduce shared memory per block, or use smaller block sizes (128 instead of 256)."
+        )
 
     return feedback
 
