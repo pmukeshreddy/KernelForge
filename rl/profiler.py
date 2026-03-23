@@ -210,7 +210,7 @@ def _generate_feedback(metrics: Dict[str, float], speedup: float | None = None) 
     # Detect "efficient but slow" pattern: high utilization but slower than PyTorch.
     # This means the kernel is efficiently doing TOO MUCH WORK — the problem is
     # algorithmic (too many memory passes, too many FLOPs), not micro-optimization.
-    if speedup is not None and speedup < 1.0 and memory > 70 and compute > 50:
+    if speedup is not None and speedup < 1.5 and (memory > 70 or compute > 50) and max(memory, compute) > 60:
         feedback += (
             f"\n--- WARNING: Efficient But Slow ({speedup:.2f}x) ---\n"
             f"Your kernel has high hardware utilization but is SLOWER than PyTorch. "
@@ -258,13 +258,25 @@ def _generate_feedback(metrics: Dict[str, float], speedup: float | None = None) 
     if bottleneck == "MEMORY":
         feedback += "Bottleneck: MEMORY-BOUND.\n"
         if memory >= 80 and occupancy >= 60:
-            # Near peak on both memory and occupancy — genuinely well-optimized
-            feedback += (
-                "Memory throughput is near peak with good occupancy — this kernel is "
-                "already well-optimized for a memory-bound workload. Further speedup "
-                "requires reducing memory passes (fuse multiple operations into one kernel) "
-                "or reducing total bytes moved (in-place ops, skip unnecessary copies)."
-            )
+            if speedup is not None and speedup < 2.0:
+                # High throughput but not much faster than eager — likely redundant reads
+                feedback += (
+                    f"Memory throughput is near peak ({memory:.0f}%) but kernel is only "
+                    f"{speedup:.2f}x faster than PyTorch. This suggests redundant memory "
+                    f"traffic — the GPU is busy but reading the same data multiple times.\n"
+                    f"Techniques: use shared memory to cache input tiles for overlapping "
+                    f"access patterns (pooling, convolution windows), use __ldg() for "
+                    f"read-only data to leverage L2 cache, reduce total bytes by computing "
+                    f"partial results in registers before writing to global memory."
+                )
+            else:
+                # Genuinely well-optimized or no speedup data
+                feedback += (
+                    "Memory throughput is near peak with good occupancy — this kernel is "
+                    "already well-optimized for a memory-bound workload. Further speedup "
+                    "requires reducing memory passes (fuse multiple operations into one kernel) "
+                    "or reducing total bytes moved (in-place ops, skip unnecessary copies)."
+                )
         elif memory >= 80 and occupancy < 60:
             # High memory but low occupancy — could still improve
             feedback += (
