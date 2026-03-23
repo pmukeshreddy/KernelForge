@@ -1008,46 +1008,6 @@ def _run_group_episodes(
         elif turn_idx > 0:
             print(f"  [TURN {turn_idx+1}] No correct kernel yet — normal error-feedback path")
 
-        # ── Compute group error summary when ALL trajectories failed ────────
-        # This lets each trajectory learn from ALL failures, not just its own.
-        all_failed = all(
-            er is None or not er.get("correct", False)
-            for er in eval_results
-        )
-        if all_failed and turn_idx < T - 1:  # no point on last turn
-            error_classes = {}
-            for idx_e, er in enumerate(eval_results):
-                cls = _classify_error(er)
-                if cls not in error_classes:
-                    error_classes[cls] = []
-                # Get a short error description
-                if er is None:
-                    error_classes[cls].append(f"traj {idx_e}: format/parse error")
-                elif not er.get("compiles", False):
-                    raw = er.get("compiler_error", "unknown")
-                    # Extract first line only for summary
-                    first_line = raw.split('\n')[0][:120]
-                    error_classes[cls].append(f"traj {idx_e}: {first_line}")
-                elif not er.get("correct", False):
-                    wf = er.get("wrong_frac")
-                    mae = er.get("max_abs_error")
-                    bias = er.get("systematic_bias")
-                    parts = []
-                    if wf is not None: parts.append(f"{wf*100:.0f}% wrong")
-                    if mae is not None: parts.append(f"max_err={mae:.4f}")
-                    if bias and abs(bias) > 0.01: parts.append(f"bias={bias:+.3f}")
-                    error_classes[cls].append(f"traj {idx_e}: {', '.join(parts) or 'incorrect'}")
-            summary_lines = ["--- ALL 8 trajectories FAILED this turn ---"]
-            summary_lines.append("Common failure patterns (avoid ALL of these):")
-            for cls, examples in error_classes.items():
-                summary_lines.append(f"  [{cls.upper()}] ({len(examples)} trajs): {examples[0]}")
-                if len(examples) > 1:
-                    summary_lines.append(f"    + {len(examples)-1} more with same error type")
-            group_error_summary = "\n".join(summary_lines)
-            print(f"  [GROUP FAIL] {group_error_summary}")
-        else:
-            group_error_summary = None
-
         # Generate G completions for this turn
         if not config.mock_mode:
             if config.use_sglang and (SGLANG_AVAILABLE or config.sglang_python):
@@ -1239,6 +1199,44 @@ def _run_group_episodes(
         for i in range(G):
             traj_responses[i].append(completions[i])
             traj_evals[i].append(eval_results[i])
+
+        # ── Compute group error summary when ALL trajectories failed ────────
+        # This lets each trajectory learn from ALL failures, not just its own.
+        all_failed = all(
+            er is None or not er.get("correct", False)
+            for er in eval_results
+        )
+        if all_failed and turn_idx < T - 1:  # no point on last turn
+            error_classes = {}
+            for idx_e, er in enumerate(eval_results):
+                cls = _classify_error(er)
+                if cls not in error_classes:
+                    error_classes[cls] = []
+                if er is None:
+                    error_classes[cls].append(f"traj {idx_e}: format/parse error")
+                elif not er.get("compiles", False):
+                    raw = er.get("compiler_error", "unknown")
+                    first_line = raw.split('\n')[0][:120]
+                    error_classes[cls].append(f"traj {idx_e}: {first_line}")
+                elif not er.get("correct", False):
+                    wf = er.get("wrong_frac")
+                    mae = er.get("max_abs_error")
+                    bias = er.get("systematic_bias")
+                    parts = []
+                    if wf is not None: parts.append(f"{wf*100:.0f}% wrong")
+                    if mae is not None: parts.append(f"max_err={mae:.4f}")
+                    if bias and abs(bias) > 0.01: parts.append(f"bias={bias:+.3f}")
+                    error_classes[cls].append(f"traj {idx_e}: {', '.join(parts) or 'incorrect'}")
+            summary_lines = ["--- ALL 8 trajectories FAILED this turn ---"]
+            summary_lines.append("Common failure patterns (avoid ALL of these):")
+            for cls, examples in error_classes.items():
+                summary_lines.append(f"  [{cls.upper()}] ({len(examples)} trajs): {examples[0]}")
+                if len(examples) > 1:
+                    summary_lines.append(f"    + {len(examples)-1} more with same error type")
+            group_error_summary = "\n".join(summary_lines)
+            print(f"  [GROUP FAIL] {group_error_summary}")
+        else:
+            group_error_summary = None
 
     # ── DEBUG: final reward matrix ───────────────────────────────────────────
     print(f"  [DEBUG] Reward matrix [G={G} x T={T}]:")
