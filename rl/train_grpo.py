@@ -768,6 +768,9 @@ def _run_group_episodes(
     ws_best_completion: str | None = None
     ws_best_speedup: float = 0.0
     ws_best_source: str = ""  # "turn X traj Y" for debug logging
+    # Bug 1 fix: freeze the speedup when optimisation phase began so delta
+    # comparisons use a stable baseline instead of the drifting ws_best_speedup.
+    ws_speedup_at_opt_start: float | None = None
 
     # ── DEBUG: what operation is this prompt? ───────────────────────────────
     # Extract first torch call from prompt to label the operation
@@ -798,6 +801,10 @@ def _run_group_episodes(
             )
 
             if use_optimization_turn:
+                # Freeze baseline on first opt turn (Bug 1)
+                if ws_speedup_at_opt_start is None:
+                    ws_speedup_at_opt_start = ws_best_speedup
+
                 # ALL trajectories get the best correct kernel
                 stripped = _strip_thinking(ws_best_completion, truncate_code=False)
                 msgs.append({"role": "assistant", "content": stripped})
@@ -814,46 +821,95 @@ def _run_group_episodes(
                     timing_lines.append(f"torch.compile: {ct:.3f}ms" + (f" ({ct/rt:.2f}x)" if rt else ""))
                 timing_str = "\n".join(timing_lines)
 
-                # Include profiler data if available
-                prof_fb = ws_best_eval.get("profiler_feedback") if ws_best_eval else None
-                profiler_str = f"\n\n{prof_fb}" if prof_fb else ""
+                # Bug 2 fix: use THIS trajectory's profiler data if available,
+                # falling back to the base kernel's profile only if needed.
+                traj_prof = None
+                if turn_idx > 1 and len(traj_evals[i]) >= turn_idx:
+                    prev_e = traj_evals[i][turn_idx - 1]
+                    if prev_e and prev_e.get("correct") and prev_e.get("profiler_feedback"):
+                        traj_prof = prev_e["profiler_feedback"]
+                if traj_prof is None:
+                    traj_prof = ws_best_eval.get("profiler_feedback") if ws_best_eval else None
+                profiler_str = f"\n\n{traj_prof}" if traj_prof else ""
 
                 # ── Delta feedback from previous optimization attempt ─────
-                # Tell the model if its last rule application helped or hurt.
+                # Includes: rich error detail (Bug 5), regression warning
+                # (Bug 6), stuck detection (Bug 3), actual error messages (Bug 4).
                 delta_str = ""
                 prev_opt_eval = traj_evals[i][turn_idx - 1] if turn_idx > 1 and len(traj_evals[i]) >= turn_idx else None
                 if prev_opt_eval is not None:
                     prev_rule = OPTIMIZATION_RULES[(i + turn_idx - 2) % len(OPTIMIZATION_RULES)]
+
+                    # Bug 3: stuck detection — same error class 2 turns in a row
+                    stuck_str = ""
+                    if turn_idx > 2 and len(traj_evals[i]) >= turn_idx:
+                        prev_prev = traj_evals[i][turn_idx - 2]
+                        if (prev_prev is not None
+                                and _classify_error(prev_opt_eval) == _classify_error(prev_prev)
+                                and _classify_error(prev_opt_eval) != "correct"):
+                            stuck_str = (
+                                "You made the SAME TYPE of error two turns in a row. "
+                                "Try a COMPLETELY DIFFERENT approach. "
+                            )
+
                     if not prev_opt_eval.get("compiles", False):
+                        # Bug 4+5: include actual compiler error
+                        err_msg = prev_opt_eval.get("compiler_error", "Unknown error")
+                        # Truncate to avoid flooding context
+                        if len(err_msg) > 500:
+                            err_msg = err_msg[:500] + "..."
                         delta_str = (
-                            f"\n\n⚠ Last turn you tried '{prev_rule['name']}' — "
-                            f"it BROKE COMPILATION. Avoid that approach."
+                            f"\n\n⚠ REGRESSION: Last turn you tried '{prev_rule['name']}' — "
+                            f"it BROKE COMPILATION of your working kernel.\n"
+                            f"{stuck_str}"
+                            f"Error: {err_msg}"
                         )
                     elif not prev_opt_eval.get("correct", False):
+                        # Bug 4+5+6: include rich error detail from sandbox
+                        err_msg = prev_opt_eval.get("compiler_error", "Outputs do not match reference")
+                        if len(err_msg) > 500:
+                            err_msg = err_msg[:500] + "..."
+                        wf = prev_opt_eval.get("wrong_frac")
+                        mae = prev_opt_eval.get("max_abs_error")
+                        bias = prev_opt_eval.get("systematic_bias")
+                        detail_parts = []
+                        if wf is not None:
+                            detail_parts.append(f"{wf*100:.0f}% of elements wrong")
+                        if mae is not None:
+                            detail_parts.append(f"max_abs_error={mae:.5f}")
+                        if bias is not None and abs(bias) > 0.01:
+                            detail_parts.append(f"systematic_bias={bias:+.4f} ({'too high' if bias > 0 else 'too low'})")
+                        detail_suffix = " | ".join(detail_parts)
                         delta_str = (
-                            f"\n\n⚠ Last turn you tried '{prev_rule['name']}' — "
-                            f"it BROKE CORRECTNESS. The optimization introduced bugs."
+                            f"\n\n⚠ REGRESSION: Last turn you tried '{prev_rule['name']}' — "
+                            f"it BROKE CORRECTNESS of your working kernel.\n"
+                            f"{stuck_str}"
+                            f"{err_msg}\n"
+                            f"{detail_suffix}"
                         )
                     else:
+                        # Correct — compare against frozen baseline (Bug 1)
                         prev_rt = prev_opt_eval.get("runtime_ms")
+                        baseline_sp = ws_speedup_at_opt_start or ws_best_speedup
                         if prev_rt and bt:
                             prev_sp = bt / prev_rt
-                            if prev_sp > ws_best_speedup * 1.05:
+                            if prev_sp > baseline_sp * 1.05:
                                 delta_str = (
                                     f"\n\n✓ Last turn you tried '{prev_rule['name']}' — "
-                                    f"it IMPROVED speed to {prev_sp:.2f}x (was {ws_best_speedup:.2f}x). Good technique."
+                                    f"it IMPROVED speed to {prev_sp:.2f}x "
+                                    f"(started at {baseline_sp:.2f}x). Good technique."
                                 )
-                            elif prev_sp < ws_best_speedup * 0.95:
+                            elif prev_sp < baseline_sp * 0.95:
                                 delta_str = (
                                     f"\n\n✗ Last turn you tried '{prev_rule['name']}' — "
-                                    f"it made the kernel SLOWER at {prev_sp:.2f}x (was {ws_best_speedup:.2f}x). "
-                                    f"Avoid that approach."
+                                    f"it made the kernel SLOWER at {prev_sp:.2f}x "
+                                    f"(started at {baseline_sp:.2f}x). Avoid that approach."
                                 )
                             else:
                                 delta_str = (
                                     f"\n\n→ Last turn you tried '{prev_rule['name']}' — "
-                                    f"no significant speed change ({prev_sp:.2f}x vs {ws_best_speedup:.2f}x). "
-                                    f"Try a different technique."
+                                    f"no significant speed change ({prev_sp:.2f}x vs "
+                                    f"started at {baseline_sp:.2f}x). Try a different technique."
                                 )
 
                 # Assign a different optimization rule — rotate by BOTH
@@ -880,8 +936,8 @@ def _run_group_episodes(
                     print(f"  [OPT TURN] traj=0 turn {turn_idx+1}: "
                           f"best kernel from {ws_best_source} ({ws_best_speedup:.2f}x), "
                           f"rule='{rule['name']}'"
-                          f"{', delta: ' + delta_str.strip() if delta_str else ''}")
-                    print(f"  [DEBUG] Feedback traj=0 →{turn_idx+1}:\n{feedback[:600]}...")
+                          f"{', delta: ' + delta_str.strip()[:200] if delta_str else ''}")
+                    print(f"  [DEBUG] Feedback traj=0 →{turn_idx+1}:\n{feedback[:800]}...")
                 msgs.append({"role": "user", "content": feedback})
             else:
                 # Normal path (turn 1, or turn 2+ with no correct kernel yet):
