@@ -41,10 +41,14 @@ except ImportError:
     SGLANG_AVAILABLE = False
 
 from agent import _extract_cuda_code, _fix_cuda_api
+from cuda_rag import CudaRAG
 from profiler import profile_kernel
 from reward import calculate_reward, calculate_wrong_reward, calculate_opt_reward
 from sandbox import evaluate
 from sys_prompt import get_system_prompt
+
+# Global RAG instance — indexes cuda_best_practices.md once at import time
+_cuda_rag = CudaRAG()
 
 
 def _worker_run_eval(args):
@@ -375,7 +379,8 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
                          best_speedup: float | None = None,
                          best_turn: int | None = None,
                          profiler_feedback: str | None = None,
-                         group_error_summary: str | None = None) -> str:
+                         group_error_summary: str | None = None,
+                         rag_hint: str | None = None) -> str:
     """
     Feedback: raw execution results + high water mark for optimization context.
 
@@ -408,11 +413,14 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
                 f" at {best_speedup:.2f}x speedup over PyTorch."
             )
 
+    # RAG hint: inject relevant CUDA patterns from best practices doc
+    rag_suffix = f"\n\n{rag_hint}" if rag_hint else ""
+
     if eval_res is None:
         return (
             stuck_prefix +
             "Your previous answer failed to be parsed due to not adhering to the desired formatting."
-            + hwm_suffix + group_suffix + "\n\n"
+            + hwm_suffix + group_suffix + rag_suffix + "\n\n"
             "Try a completely different approach and generate new, complete code."
         )
     if not eval_res.get("compiles", False):
@@ -420,7 +428,7 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
         return (
             stuck_prefix +
             f"Your previous answer failed to compile. Here is the error message:\n{err}"
-            + hwm_suffix + group_suffix + "\n\n"
+            + hwm_suffix + group_suffix + rag_suffix + "\n\n"
             "Fix the compilation error and generate new, complete code."
         )
     if not eval_res.get("correct", False):
@@ -428,7 +436,7 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
         return (
             stuck_prefix +
             f"Your previous answer was incorrect. Here is the error message:\n{err}"
-            + hwm_suffix + group_suffix + "\n\n"
+            + hwm_suffix + group_suffix + rag_suffix + "\n\n"
             "Fix the correctness issue and generate new, complete code."
         )
     # Correct kernel — include timing milestones and optional profiler data
@@ -996,11 +1004,25 @@ def _run_group_episodes(
                             sp = pe["baseline_runtime_ms"] / pe["runtime_ms"]
                             if hwm_speedup is None or sp > hwm_speedup:
                                 hwm_speedup, hwm_turn = sp, pt + 1
+                    # BM25 RAG: retrieve relevant CUDA patterns for failed turns
+                    _rag_hint = None
+                    _eval_t = traj_evals[i][t]
+                    if _eval_t is None or not _eval_t.get("correct", False):
+                        _rag_query = prompt_text
+                        if _eval_t and _eval_t.get("compiler_error"):
+                            _rag_query += "\n" + _eval_t["compiler_error"]
+                        if t < len(traj_responses[i]) and traj_responses[i][t]:
+                            _code = _extract_python_block(traj_responses[i][t])
+                            if _code:
+                                _rag_query += "\n" + _code[:1000]  # cap code length
+                        _rag_hint = _cuda_rag.retrieve_text(_rag_query, top_k=2, max_chars=2000)
+
                     feedback = _build_turn_feedback(
-                        traj_evals[i][t], prev_eval=prev_eval,
+                        _eval_t, prev_eval=prev_eval,
                         best_speedup=hwm_speedup, best_turn=hwm_turn,
-                        profiler_feedback=traj_evals[i][t].get("profiler_feedback") if traj_evals[i][t] else None,
+                        profiler_feedback=_eval_t.get("profiler_feedback") if _eval_t else None,
                         group_error_summary=group_error_summary,
+                        rag_hint=_rag_hint,
                     )
                     if i == 0:
                         print(f"  [DEBUG] Feedback traj=0 turn {t+1}→{turn_idx+1}:\n{feedback}")
