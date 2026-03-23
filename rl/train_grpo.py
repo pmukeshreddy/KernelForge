@@ -757,6 +757,7 @@ def _run_group_episodes(
     tokenizer,
     config: GRPOConfig,
     difficulty: int = 1,
+    rag_prob: float = 1.0,
 ) -> tuple[list[list[TurnData]], list[list[float]]]:
     """
     Generate G trajectories × T turns (Kevin's multi-turn recipe).
@@ -1005,9 +1006,11 @@ def _run_group_episodes(
                             if hwm_speedup is None or sp > hwm_speedup:
                                 hwm_speedup, hwm_turn = sp, pt + 1
                     # BM25 RAG: retrieve relevant CUDA patterns for failed turns
+                    # Dropout: rag_prob decays from 1.0→0.0 over training so model
+                    # learns patterns early but doesn't depend on hints later.
                     _rag_hint = None
                     _eval_t = traj_evals[i][t]
-                    if _eval_t is None or not _eval_t.get("correct", False):
+                    if (_eval_t is None or not _eval_t.get("correct", False)) and random.random() < rag_prob:
                         _rag_query = prompt_text
                         if _eval_t and _eval_t.get("compiler_error"):
                             _rag_query += "\n" + _eval_t["compiler_error"]
@@ -1755,7 +1758,9 @@ def train(config: GRPOConfig = None):
             t0 = time.time()
             for p_idx, (prompt_text, level) in enumerate(batch):
                 print(f"\n[Prompt {p_idx+1}/{len(batch)} level={level}] Generating {config.group_size} trajectories (batched/parallel)...")
-                group_turns, group_rewards = _run_group_episodes(prompt_text, model, tokenizer, config, difficulty=level)
+                # RAG dropout: decay from 100% → 0% over training
+                _rag_prob = max(0.0, 1.0 - (global_step / max(total_steps, 1)))
+                group_turns, group_rewards = _run_group_episodes(prompt_text, model, tokenizer, config, difficulty=level, rag_prob=_rag_prob)
 
                 # Dynamic Sampling: skip degenerate groups (DAPO).
                 # Use mean-reward-per-trajectory as the degeneracy signal.
