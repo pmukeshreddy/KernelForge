@@ -208,20 +208,50 @@ def _generate_feedback(metrics: Dict[str, float], speedup: float | None = None) 
     feedback += f"Warp Occupancy:     {occupancy:>5.1f}% of theoretical peak\n"
 
     # Detect "efficient but slow" pattern: high utilization but slower than PyTorch.
-    # This means the kernel is efficiently doing TOO MUCH WORK — the problem is
-    # algorithmic (too many memory passes, too many FLOPs), not micro-optimization.
+    # Give bottleneck-specific advice instead of generic "reduce work" message.
     if speedup is not None and speedup < 1.5 and (memory > 70 or compute > 50) and max(memory, compute) > 60:
+        feedback += f"\n--- WARNING: Efficient But Slow ({speedup:.2f}x) ---\n"
         feedback += (
-            f"\n--- WARNING: Efficient But Slow ({speedup:.2f}x) ---\n"
-            f"Your kernel has high hardware utilization but is SLOWER than PyTorch. "
-            f"This means the GPU is efficiently executing TOO MUCH WORK.\n"
-            f"The problem is NOT micro-optimization — it is algorithmic:\n"
-            f"- Are you reading/writing the full tensor multiple times? Fuse into one pass.\n"
-            f"- Are you computing the same values redundantly? Precompute and reuse.\n"
-            f"- Is your loop order causing redundant memory traffic? Reorder for locality.\n"
-            f"- Can you reduce total FLOPs with a mathematical simplification?\n"
-            f"Focus on reducing TOTAL WORK, not improving utilization.\n"
+            f"Your kernel has high hardware utilization but is "
+            f"{'SLOWER than' if speedup < 1.0 else 'barely faster than'} PyTorch.\n"
         )
+
+        if compute > 70 and memory > 70:
+            # BALANCED-HIGH: both saturated — needs register tiling (matmul pattern)
+            feedback += (
+                f"Both compute ({compute:.0f}%) and memory ({memory:.0f}%) are near peak. "
+                f"The GPU is busy but each thread produces too little output.\n"
+                f"Fix: REGISTER TILING — each thread should compute a 4x4 or 8x8 tile "
+                f"of output elements, not just 1. This increases arithmetic intensity "
+                f"(FLOPs per byte loaded) and amortizes memory latency.\n"
+                f"- Load tiles of A and B into registers, not just shared memory\n"
+                f"- Use larger TILE_SIZE (64 or 128) with register-level sub-tiles\n"
+                f"- Double-buffer shared memory loads (load next tile while computing current)\n"
+            )
+        elif memory > compute * 1.3:
+            # MEMORY-DOMINATED: too many reads for the compute done (pooling/conv pattern)
+            feedback += (
+                f"Memory throughput ({memory:.0f}%) is much higher than compute ({compute:.0f}%). "
+                f"The kernel reads too much data relative to the computation performed.\n"
+                f"This usually means redundant memory reads (e.g., overlapping windows).\n"
+                f"Fix: SHARED MEMORY CACHING — load input tiles into shared memory once, "
+                f"then all threads in the block reuse the cached data.\n"
+                f"- For sliding window ops (pool, conv): cache the input region, read from smem\n"
+                f"- Use __ldg() for read-only data to leverage L2 cache\n"
+                f"- Fuse multiple operations into one kernel to avoid extra memory passes\n"
+            )
+        else:
+            # COMPUTE-DOMINATED: too many FLOPs for the data moved
+            feedback += (
+                f"Compute ({compute:.0f}%) is high relative to memory ({memory:.0f}%). "
+                f"The kernel does too much arithmetic per element.\n"
+                f"Fix: REDUCE FLOPS — \n"
+                f"- Precompute constants outside the inner loop\n"
+                f"- Use fast math intrinsics (__fmaf_rn, __expf, __rsqrtf)\n"
+                f"- Simplify the algorithm (e.g., separable filters, FFT for large convolutions)\n"
+                f"- Avoid redundant computation across threads\n"
+            )
+
         return feedback
 
     # Diagnose bottleneck and suggest techniques based on ALL three metrics
