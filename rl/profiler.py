@@ -217,39 +217,41 @@ def _generate_feedback(metrics: Dict[str, float], speedup: float | None = None) 
         )
 
         if compute > 70 and memory > 70:
-            # BALANCED-HIGH: both saturated — needs register tiling (matmul pattern)
+            # BALANCED-HIGH: both saturated — each thread does too little useful work
             feedback += (
-                f"Both compute ({compute:.0f}%) and memory ({memory:.0f}%) are near peak. "
-                f"The GPU is busy but each thread produces too little output.\n"
-                f"Fix: REGISTER TILING — each thread should compute a 4x4 or 8x8 tile "
-                f"of output elements, not just 1. This increases arithmetic intensity "
-                f"(FLOPs per byte loaded) and amortizes memory latency.\n"
-                f"- Load tiles of A and B into registers, not just shared memory\n"
-                f"- Use larger TILE_SIZE (64 or 128) with register-level sub-tiles\n"
-                f"- Double-buffer shared memory loads (load next tile while computing current)\n"
+                f"Both compute ({compute:.0f}%) and memory ({memory:.0f}%) are near peak, "
+                f"but the kernel is still slow. Each thread produces too little output.\n"
+                f"Fix: INCREASE ARITHMETIC INTENSITY — make each thread compute more output "
+                f"elements (e.g., a 4x4 or 8x8 tile instead of 1 element). This amortizes "
+                f"memory loads across more FLOPs.\n"
+                f"- Use register-level tiling: load data into registers and reuse across multiple outputs\n"
+                f"- Increase tile/block size (64-128) with sub-tiles computed in registers\n"
+                f"- Double-buffer shared memory: load the next tile while computing the current one\n"
+                f"- Ensure coalesced global memory access (consecutive threads read consecutive addresses)\n"
             )
         elif memory > compute * 1.3:
-            # MEMORY-DOMINATED: too many reads for the compute done (pooling/conv pattern)
+            # MEMORY-DOMINATED: too many global memory reads relative to compute
             feedback += (
                 f"Memory throughput ({memory:.0f}%) is much higher than compute ({compute:.0f}%). "
-                f"The kernel reads too much data relative to the computation performed.\n"
-                f"This usually means redundant memory reads (e.g., overlapping windows).\n"
-                f"Fix: SHARED MEMORY CACHING — load input tiles into shared memory once, "
-                f"then all threads in the block reuse the cached data.\n"
-                f"- For sliding window ops (pool, conv): cache the input region, read from smem\n"
+                f"The kernel moves too much data for the computation it performs.\n"
+                f"This means multiple threads are reading the same data from global memory redundantly.\n"
+                f"Fix: DATA REUSE VIA SHARED MEMORY — load data tiles into shared memory once, "
+                f"then let all threads in the block reuse the cached data.\n"
+                f"- Identify which input elements are read by multiple threads and cache them in __shared__\n"
                 f"- Use __ldg() for read-only data to leverage L2 cache\n"
-                f"- Fuse multiple operations into one kernel to avoid extra memory passes\n"
+                f"- Process multiple output elements per thread to amortize load cost\n"
+                f"- Fuse sequential operations into one kernel to avoid extra global memory passes\n"
             )
         else:
             # COMPUTE-DOMINATED: too many FLOPs for the data moved
             feedback += (
                 f"Compute ({compute:.0f}%) is high relative to memory ({memory:.0f}%). "
-                f"The kernel does too much arithmetic per element.\n"
-                f"Fix: REDUCE FLOPS — \n"
-                f"- Precompute constants outside the inner loop\n"
+                f"The kernel performs too much arithmetic relative to the data it accesses.\n"
+                f"Fix: REDUCE TOTAL FLOPS — \n"
+                f"- Precompute constants and invariants outside the inner loop\n"
                 f"- Use fast math intrinsics (__fmaf_rn, __expf, __rsqrtf)\n"
-                f"- Simplify the algorithm (e.g., separable filters, FFT for large convolutions)\n"
-                f"- Avoid redundant computation across threads\n"
+                f"- Restructure the algorithm to eliminate redundant computation across threads\n"
+                f"- Consider if there is a mathematically equivalent formulation with fewer operations\n"
             )
 
         return feedback
