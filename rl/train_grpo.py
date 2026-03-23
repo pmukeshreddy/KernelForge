@@ -799,13 +799,15 @@ def _run_group_episodes(
             msgs = list(base_messages)
 
             # ── Optimization-first turn strategy ─────────────────────────────
-            # Turn 2+: if ANY correct kernel exists, ALL trajectories get it
-            # and are asked to optimize using a specific technique (different
-            # per trajectory for GRPO diversity). This replaces the old
-            # "warm start only for failed trajectories" approach.
+            # Turn 2+: if ANY correct kernel exists AND it beats eager,
+            # ALL trajectories get it and optimize using a specific technique.
+            # If the best kernel is slower than eager (< 1.0x), the kernel
+            # needs a complete rewrite, not micro-optimization — stay in
+            # normal error-feedback path so trajectories try new approaches.
             use_optimization_turn = (
                 turn_idx > 0
                 and ws_best_code is not None
+                and ws_best_speedup >= 1.0
             )
 
             if use_optimization_turn:
