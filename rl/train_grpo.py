@@ -374,7 +374,8 @@ def _classify_error(eval_res: dict | None) -> str:
 def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
                          best_speedup: float | None = None,
                          best_turn: int | None = None,
-                         profiler_feedback: str | None = None) -> str:
+                         profiler_feedback: str | None = None,
+                         group_error_summary: str | None = None) -> str:
     """
     Feedback: raw execution results + high water mark for optimization context.
 
@@ -386,6 +387,11 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
     - On final turn: optionally includes profiler hardware metrics.
     - When ALL trajectories failed: includes group error summary so model avoids dead ends.
     """
+    # Group error suffix: when ALL trajectories failed, show what everyone tried
+    group_suffix = ""
+    if group_error_summary and (eval_res is None or not eval_res.get("correct", False)):
+        group_suffix = f"\n\n{group_error_summary}"
+
     stuck = (
         prev_eval is not None
         and _classify_error(eval_res) == _classify_error(prev_eval)
@@ -406,7 +412,7 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
         return (
             stuck_prefix +
             "Your previous answer failed to be parsed due to not adhering to the desired formatting."
-            + hwm_suffix + "\n\n"
+            + hwm_suffix + group_suffix + "\n\n"
             "Try a completely different approach and generate new, complete code."
         )
     if not eval_res.get("compiles", False):
@@ -414,7 +420,7 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
         return (
             stuck_prefix +
             f"Your previous answer failed to compile. Here is the error message:\n{err}"
-            + hwm_suffix + "\n\n"
+            + hwm_suffix + group_suffix + "\n\n"
             "Fix the compilation error and generate new, complete code."
         )
     if not eval_res.get("correct", False):
@@ -422,7 +428,7 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
         return (
             stuck_prefix +
             f"Your previous answer was incorrect. Here is the error message:\n{err}"
-            + hwm_suffix + "\n\n"
+            + hwm_suffix + group_suffix + "\n\n"
             "Fix the correctness issue and generate new, complete code."
         )
     # Correct kernel — include timing milestones and optional profiler data
@@ -780,6 +786,8 @@ def _run_group_episodes(
     print(f"  [DEBUG] Prompt: {op_label}, {prompt_lines} lines, {len(prompt_text)} chars")
     # ── END DEBUG ────────────────────────────────────────────────────────────
 
+    group_error_summary = None  # set after each turn if all failed
+
     for turn_idx in range(T):
         turn_label = f"Turn {turn_idx+1}/{T}"
 
@@ -966,6 +974,7 @@ def _run_group_episodes(
                         traj_evals[i][t], prev_eval=prev_eval,
                         best_speedup=hwm_speedup, best_turn=hwm_turn,
                         profiler_feedback=traj_evals[i][t].get("profiler_feedback") if traj_evals[i][t] else None,
+                        group_error_summary=group_error_summary,
                     )
                     if i == 0:
                         print(f"  [DEBUG] Feedback traj=0 turn {t+1}→{turn_idx+1}:\n{feedback}")
@@ -998,6 +1007,46 @@ def _run_group_episodes(
             print(f"  [OPT TURN] Rules assigned: {rules_used}")
         elif turn_idx > 0:
             print(f"  [TURN {turn_idx+1}] No correct kernel yet — normal error-feedback path")
+
+        # ── Compute group error summary when ALL trajectories failed ────────
+        # This lets each trajectory learn from ALL failures, not just its own.
+        all_failed = all(
+            er is None or not er.get("correct", False)
+            for er in eval_results
+        )
+        if all_failed and turn_idx < T - 1:  # no point on last turn
+            error_classes = {}
+            for idx_e, er in enumerate(eval_results):
+                cls = _classify_error(er)
+                if cls not in error_classes:
+                    error_classes[cls] = []
+                # Get a short error description
+                if er is None:
+                    error_classes[cls].append(f"traj {idx_e}: format/parse error")
+                elif not er.get("compiles", False):
+                    raw = er.get("compiler_error", "unknown")
+                    # Extract first line only for summary
+                    first_line = raw.split('\n')[0][:120]
+                    error_classes[cls].append(f"traj {idx_e}: {first_line}")
+                elif not er.get("correct", False):
+                    wf = er.get("wrong_frac")
+                    mae = er.get("max_abs_error")
+                    bias = er.get("systematic_bias")
+                    parts = []
+                    if wf is not None: parts.append(f"{wf*100:.0f}% wrong")
+                    if mae is not None: parts.append(f"max_err={mae:.4f}")
+                    if bias and abs(bias) > 0.01: parts.append(f"bias={bias:+.3f}")
+                    error_classes[cls].append(f"traj {idx_e}: {', '.join(parts) or 'incorrect'}")
+            summary_lines = ["--- ALL 8 trajectories FAILED this turn ---"]
+            summary_lines.append("Common failure patterns (avoid ALL of these):")
+            for cls, examples in error_classes.items():
+                summary_lines.append(f"  [{cls.upper()}] ({len(examples)} trajs): {examples[0]}")
+                if len(examples) > 1:
+                    summary_lines.append(f"    + {len(examples)-1} more with same error type")
+            group_error_summary = "\n".join(summary_lines)
+            print(f"  [GROUP FAIL] {group_error_summary}")
+        else:
+            group_error_summary = None
 
         # Generate G completions for this turn
         if not config.mock_mode:
