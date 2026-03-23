@@ -1421,8 +1421,8 @@ def _compute_grpo_loss_and_backward(
             loo_mean = (group_sum - disc_returns[i, t]) / max(G - 1, 1)
             loo_var = (group_sq_sum - disc_returns[i, t] ** 2) / max(G - 1, 1) - loo_mean ** 2
             # Floor at 1.0 to prevent exploding advantages. Reward range is
-            # -1.0 to 4.0, so 0.1 floor → advantages up to 43 when 1/8 correct.
-            # With 1.0 floor: same case → advantage ≈ 4.3, still strong signal.
+            # -1.0 to ~10.0 (reward = speedup), so 1.0 floor keeps advantages
+            # bounded while preserving clear signal between speed levels.
             loo_std = max(loo_var.clamp(min=0).sqrt().item(), 1.0)
             advantages[i, t] = (disc_returns[i, t] - loo_mean) / loo_std
 
