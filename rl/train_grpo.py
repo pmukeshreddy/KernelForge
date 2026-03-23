@@ -42,7 +42,7 @@ except ImportError:
 
 from agent import _extract_cuda_code, _fix_cuda_api
 from profiler import profile_kernel
-from reward import calculate_reward, calculate_wrong_reward
+from reward import calculate_reward, calculate_wrong_reward, calculate_opt_reward
 from sandbox import evaluate
 from sys_prompt import get_system_prompt
 
@@ -1126,7 +1126,11 @@ def _run_group_episodes(
             elif not eval_res["correct"]:
                 r = calculate_wrong_reward(eval_res) * penalty_scale
             else:
-                r = calculate_reward(eval_res) * diff_scale  # scale by difficulty
+                # Use opt reward during optimization turns for speed gradient
+                if use_optimization_turn and ws_speedup_at_opt_start and ws_speedup_at_opt_start > 0:
+                    r = calculate_opt_reward(eval_res, ws_speedup_at_opt_start) * diff_scale
+                else:
+                    r = calculate_reward(eval_res) * diff_scale  # scale by difficulty
                 # Update high water mark for this trajectory
                 rt = eval_res.get("runtime_ms")
                 bt = eval_res.get("baseline_runtime_ms")
@@ -1137,7 +1141,8 @@ def _run_group_episodes(
                         traj_best_turn[i] = turn_idx + 1
                 rt_str = f"{eval_res['runtime_ms']:.3f}ms" if eval_res.get('runtime_ms') is not None else "no timing"
                 sp_str = f" ({bt/rt:.2f}x)" if (rt and bt) else ""
-                print(f"    ✅ Turn {turn_idx+1} Traj {i}: {rt_str}{sp_str} reward={r:.2f}")
+                opt_tag = " [OPT]" if use_optimization_turn else ""
+                print(f"    ✅ Turn {turn_idx+1} Traj {i}: {rt_str}{sp_str} reward={r:.2f}{opt_tag}")
 
             group_rewards[i].append(r)
 
