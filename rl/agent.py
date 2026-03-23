@@ -28,15 +28,15 @@ def _fix_cuda_api(cuda_code: str) -> str:
         cuda_code,
     )
 
-    # getCurrentCUDAStream(): remove from <<<>>> launches (default stream is fine)
+    # getCurrentCUDAStream() / current_stream(): remove from <<<>>> launches (default stream is fine)
     cuda_code = re.sub(
-        r',\s*(?:at|c10|torch)::cuda::getCurrentCUDAStream\([^)]*\)\s*(>>>)',
+        r',\s*(?:at|c10|torch)::cuda::(?:getCurrentCUDAStream|current_stream)\([^)]*\)\s*(>>>)',
         r'\1',
         cuda_code,
     )
-    # Any remaining getCurrentCUDAStream() call → replace with 0 (null/default stream)
+    # Any remaining getCurrentCUDAStream()/current_stream() call → replace with 0 (null/default stream)
     cuda_code = re.sub(
-        r'(?:at|c10|torch)::cuda::getCurrentCUDAStream\([^)]*\)',
+        r'(?:at|c10|torch)::cuda::(?:getCurrentCUDAStream|current_stream)\([^)]*\)',
         '0',
         cuda_code,
     )
@@ -191,6 +191,15 @@ def _fix_cuda_api(cuda_code: str) -> str:
             line,
         )
     cuda_code = '\n'.join(_fix_no_options_alloc(l) for l in cuda_code.splitlines())
+
+    # Bug 7 — torch::Tensor in Python type hints (model mixes C++/Python syntax).
+    # "def forward(self, x: torch::Tensor)" → "def forward(self, x: torch.Tensor)"
+    # Only fix on lines that start with def (Python function signatures).
+    cuda_code = re.sub(
+        r'(def\s+\w+\s*\([^)]*)\btorch::Tensor\b',
+        r'\1torch.Tensor',
+        cuda_code,
+    )
 
     return cuda_code
 
