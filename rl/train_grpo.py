@@ -2407,7 +2407,6 @@ if __name__ == "__main__":
     )
 
     # Initialize LLM feedback if model path is provided
-    global _llm_feedback  # noqa: used conditionally
     if cfg.llm_feedback_model:
         _llm_feedback = LLMFeedback(cfg.llm_feedback_model)
     
