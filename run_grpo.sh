@@ -1,5 +1,6 @@
 #!/bin/bash
 export PYTORCH_ALLOC_CONF=expandable_segments:True
+export PYTHONUNBUFFERED=1  # ensure all prints appear immediately in logs
 
 # Find nvcc — it's not in PATH on this server, search common locations
 NVCC_PATH=$(find /usr/local/cuda* /usr/cuda* /opt/cuda* -name nvcc -type f 2>/dev/null | head -1)

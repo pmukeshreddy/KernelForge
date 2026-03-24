@@ -1019,6 +1019,7 @@ def _run_group_episodes(
                     # Dropout: rag_prob decays from 1.0→0.0 over training so model
                     # learns patterns early but doesn't depend on hints later.
                     _rag_hint = None
+                    _rag_sections = []
                     _eval_t = traj_evals[i][t]
                     if (_eval_t is None or not _eval_t.get("correct", False)) and random.random() < rag_prob:
                         _rag_query = prompt_text
@@ -1029,13 +1030,13 @@ def _run_group_episodes(
                             if _code:
                                 _rag_query += "\n" + _code[:1000]  # cap code length
                         _rag_sections = _cuda_rag.retrieve(_rag_query, top_k=2)
-                    _rag_hint = _cuda_rag.retrieve_text(_rag_query, top_k=2, max_chars=2000)
+                        _rag_hint = _cuda_rag.retrieve_text(_rag_query, top_k=2, max_chars=2000)
                     if i == 0 and _rag_sections:
-                        print(f"  [RAG] traj=0 turn {t+1}→{turn_idx+1}: retrieved {len(_rag_sections)} sections:")
+                        print(f"  [RAG] traj=0 turn {t+1}→{turn_idx+1}: retrieved {len(_rag_sections)} sections:", flush=True)
                         for _rs in _rag_sections:
-                            print(f"    → '{_rs.title}' ({len(_rs.content)} chars)")
+                            print(f"    → '{_rs.title}' ({len(_rs.content)} chars)", flush=True)
                     elif i == 0:
-                        print(f"  [RAG] traj=0 turn {t+1}→{turn_idx+1}: NO sections retrieved (rag_prob={rag_prob:.2f})")
+                        print(f"  [RAG] traj=0 turn {t+1}→{turn_idx+1}: skipped (correct={_eval_t.get('correct', False) if _eval_t else None}, rag_prob={rag_prob:.2f})", flush=True)
 
                     feedback = _build_turn_feedback(
                         _eval_t, prev_eval=prev_eval,
@@ -1051,7 +1052,7 @@ def _run_group_episodes(
                         print(f"  [DEBUG] Feedback traj=0 turn {t+1}→{turn_idx+1} "
                               f"({len(feedback)} chars, RAG={'YES' if _fb_has_rag else 'NO'}, "
                               f"group_fail={'YES' if _fb_has_group else 'NO'}, "
-                              f"stuck={'YES' if _fb_has_stuck else 'NO'}):\n{feedback}")
+                              f"stuck={'YES' if _fb_has_stuck else 'NO'}):\n{feedback}", flush=True)
                     elif (traj_evals[i][t] is not None
                           and not traj_evals[i][t].get("correct", False)
                           and t == turn_idx - 1):
@@ -1139,11 +1140,11 @@ def _run_group_episodes(
             _code_text = _extract_python_block(_raw0)
             _code_tokens = len(_code_text.split()) if _code_text else 0
             print(f"  [THINK] traj=0 turn {turn_idx+1}: {_think_tokens} words thinking, "
-                  f"{_code_tokens} words code, {_total_tokens} words total")
+                  f"{_code_tokens} words code, {_total_tokens} words total", flush=True)
             # Show first 500 chars of thinking so we can see the model's reasoning
-            print(f"  [THINK CONTENT] traj=0:\n    {_think_text[:500]}")
+            print(f"  [THINK CONTENT] traj=0:\n    {_think_text[:500]}", flush=True)
             if len(_think_text) > 500:
-                print(f"    ... ({len(_think_text) - 500} more chars)")
+                print(f"    ... ({len(_think_text) - 500} more chars)", flush=True)
         # ── END DEBUG ─────────────────────────────────────────────────────────
 
         # Extract code and evaluate
@@ -1174,7 +1175,7 @@ def _run_group_episodes(
 
         # ── DEBUG: when all fail on turn 2+, show what each traj was thinking ──
         if turn_idx > 0 and n_correct == 0:
-            print(f"  [ALL FAIL DEBUG] Turn {turn_idx+1}: 0/{G} correct. Think summaries:")
+            print(f"  [ALL FAIL DEBUG] Turn {turn_idx+1}: 0/{G} correct. Think summaries:", flush=True)
             for i, gen_text in enumerate(completions):
                 _tm = re.search(r'<think>(.*?)</think>', gen_text, re.DOTALL)
                 if not _tm:
@@ -1183,7 +1184,7 @@ def _run_group_episodes(
                 _err = "compile" if (eval_results[i] and not eval_results[i].get("compiles")) else \
                        "wrong" if (eval_results[i] and not eval_results[i].get("correct")) else \
                        "no_code" if not candidates[i] else "?"
-                print(f"    traj {i} [{_err}]: {_tt}")
+                print(f"    traj {i} [{_err}]: {_tt}", flush=True)
 
         # OOM detection: if ALL evals on turn 1 fail (often means ref model itself OOMs),
         # skip this prompt entirely — no useful learning signal.
