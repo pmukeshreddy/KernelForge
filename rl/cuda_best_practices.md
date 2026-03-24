@@ -109,9 +109,9 @@ kernel<<<grid, block, shared_bytes>>>(...)
 
 ---
 
-## 4. Parallel Reductions
+## 4. Parallel Reductions (sum, min, max, mean, argmin, argmax, prod)
 
-Reductions (sum, max, min, mean) over large arrays are the most common source of incorrect CUDA kernels. The pattern depends on the array size.
+Reductions (sum, max, min, mean, prod, argmin, argmax, norm) over arrays are the most common source of incorrect CUDA kernels. The pattern depends on the array size.
 
 ### Warp-level reduction (≤ 32 elements)
 ```cpp
@@ -174,6 +174,30 @@ __global__ void reduce_sum(const float* input, float* output, int n) {
 - ❌ Multiple threads write to the same shared variable without atomics or synchronization
 - ❌ Using `cudaMalloc`/`cudaMemcpy` for intermediate results — use `torch::zeros({1}, input.options())` to keep data on GPU
 - ❌ `std::vector` or `std::` containers in `__global__` functions — not available in device code
+
+### Reducing along a dimension (keepdim pattern)
+When reducing along one dimension (e.g., `torch.min(x, dim=1)`), the output must **preserve all other dimensions**:
+```cpp
+// Reduce dim=1 of input [B, D, N] → output [B, N]
+// Each thread handles one output element
+__global__ void min_along_dim1(const float* input, float* output,
+                                int B, int D, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * N) return;
+    int b = idx / N;
+    int n = idx % N;
+
+    float min_val = INFINITY;
+    for (int d = 0; d < D; ++d) {
+        float val = input[b * D * N + d * N + n];
+        if (val < min_val) min_val = val;
+    }
+    output[b * N + n] = min_val;
+}
+// Output shape = input shape with reduced dim removed.
+// Use input.size(0), input.size(1), etc. to get dims — NOT .sizes().
+// Reshape output: torch::empty({B, N}, input.options())
+```
 
 ---
 

@@ -247,6 +247,15 @@ def _fix_cuda_api(cuda_code: str) -> str:
         cuda_code,
     )
 
+    # Bug 13 — kernel parameters typed int64_t* that receive .sizes().data() / .strides().data().
+    # These are const int64_t* at the call site, so the kernel param must also be const.
+    # Match: int64_t* <name> in kernel parameter lists (preceded by , or ( and followed by , or ))
+    cuda_code = re.sub(
+        r'(?<=[\(,])\s*int64_t\s*\*\s*(\w*(?:shape|stride|size|dim)\w*)\s*(?=[,\)])',
+        r' const int64_t* \1',
+        cuda_code,
+    )
+
     return cuda_code
 
 
