@@ -1,5 +1,9 @@
 """
 test_fix_cuda_api.py - Unit tests for _fix_cuda_api() auto-fix patterns.
+
+Only tests patterns we KEEP (silent bugs, type system, environment fixes).
+Removed patterns (std::max, .type(), VLA, __shared__ VLA, __fminf, __clamp)
+are now learned by the model through RL error feedback.
 """
 import sys
 import os
@@ -31,7 +35,6 @@ def test_bug9_stride_and_size_no_arg():
 
 def test_bug10_intarrayref_data():
     """Bug 10: .sizes()/.strides() → .sizes().data() in kernel arg contexts"""
-    # Kernel arg context (followed by comma)
     code = "kernel<<<b,t>>>(input.sizes(), input.strides(), n);"
     fixed = _fix_cuda_api(code)
     assert "input.sizes().data()" in fixed, f"Expected .data(), got: {fixed}"
@@ -56,14 +59,6 @@ def test_bug10_no_apply_on_subscript():
     print("✅ Bug 10c: subscript access preserved")
 
 
-def test_bug11_vla_to_vector():
-    """Bug 11: int64_t arr[ndim] → std::vector<int64_t> arr(ndim)"""
-    code = "int64_t output_shape[ndim];"
-    fixed = _fix_cuda_api(code)
-    assert "std::vector<int64_t> output_shape(ndim);" in fixed, f"Expected vector, got: {fixed}"
-    print("✅ Bug 11: VLA → std::vector")
-
-
 def test_bug12_const_pointer():
     """Bug 12: int64_t* shape = input.sizes() → const int64_t* shape = ..."""
     code = "int64_t* shape = input.sizes().data();"
@@ -72,59 +67,34 @@ def test_bug12_const_pointer():
     print("✅ Bug 12: const pointer from sizes()/strides()")
 
 
-def test_bug14_shared_vla():
-    """Bug 14: __shared__ float arr[ndim] → extern __shared__ (dynamic)"""
-    code = "__shared__ float tile[block_size];"
-    fixed = _fix_cuda_api(code)
-    assert "extern __shared__ float tile[]" in fixed, f"Expected extern __shared__, got: {fixed}"
-    # Compile-time constant (ALL_CAPS) should NOT be changed
-    code2 = "__shared__ float tile[BLOCK_SIZE];"
-    fixed2 = _fix_cuda_api(code2)
-    assert "__shared__ float tile[BLOCK_SIZE]" in fixed2, f"Constant should be preserved, got: {fixed2}"
-    # double type
-    code3 = "__shared__ double sdata[num_threads];"
-    fixed3 = _fix_cuda_api(code3)
-    assert "extern __shared__ double sdata[]" in fixed3, f"Expected extern __shared__ double, got: {fixed3}"
-    print("✅ Bug 14: __shared__ VLA → extern __shared__")
-
-
-def test_bug15_host_fminf_fmaxf():
-    """Bug 15: __fminf/__fmaxf (host) → fminf/fmaxf (device)"""
-    code = "output[idx] = __fminf(__fmaxf(input[idx], -1.0f), 1.0f);"
-    fixed = _fix_cuda_api(code)
-    assert "__fminf" not in fixed, f"__fminf should be replaced, got: {fixed}"
-    assert "__fmaxf" not in fixed, f"__fmaxf should be replaced, got: {fixed}"
-    assert "fminf(fmaxf(" in fixed, f"Expected fminf(fmaxf(...)), got: {fixed}"
-    print("✅ Bug 15: __fminf/__fmaxf → fminf/fmaxf")
-
-
-def test_bug16_clamp():
-    """Bug 16: __clamp(x, a, b) → fminf(fmaxf(x, a), b)"""
-    code = "output[idx] = __clamp(input[idx], -1.0f, 1.0f);"
-    fixed = _fix_cuda_api(code)
-    assert "__clamp" not in fixed, f"__clamp should be replaced, got: {fixed}"
-    assert "fminf(fmaxf(input[idx], -1.0f), 1.0f)" in fixed, f"Expected clamp expansion, got: {fixed}"
-    print("✅ Bug 16: __clamp → fminf(fmaxf(...))")
-
-
-def test_regression_existing_patterns():
-    """Ensure existing patterns still work."""
+def test_regression_kept_patterns():
+    """Ensure kept patterns still work."""
     # Bug 3: .ptr<T> → .data_ptr<T>
     code = "input.ptr<float>()"
     fixed = _fix_cuda_api(code)
     assert ".data_ptr<float>" in fixed, f"Bug 3 regression: {fixed}"
 
-    # Bug 4: .type() → .scalar_type()
+    print("✅ Kept patterns still work")
+
+
+def test_removed_patterns_no_longer_fixed():
+    """Verify removed auto-fixes are actually gone (model learns these via RL)."""
+    # std::max should NOT be auto-fixed anymore
+    code = "float r = std::max(a, b);"
+    fixed = _fix_cuda_api(code)
+    assert "std::max" in fixed, f"std::max should NOT be auto-fixed, got: {fixed}"
+
+    # .type() should NOT be auto-fixed anymore
     code2 = "auto t = input.type();"
     fixed2 = _fix_cuda_api(code2)
-    assert ".scalar_type()" in fixed2, f"Bug 4 regression: {fixed2}"
+    assert ".type()" in fixed2, f".type() should NOT be auto-fixed, got: {fixed2}"
 
-    # std::max → fmaxf
-    code3 = "float r = std::max(a, b);"
+    # __fminf should NOT be auto-fixed anymore
+    code3 = "__fminf(a, b)"
     fixed3 = _fix_cuda_api(code3)
-    assert "fmaxf(" in fixed3, f"std::max regression: {fixed3}"
+    assert "__fminf" in fixed3, f"__fminf should NOT be auto-fixed, got: {fixed3}"
 
-    print("✅ Existing patterns still work")
+    print("✅ Removed patterns are gone (model learns via RL)")
 
 
 if __name__ == "__main__":
@@ -133,12 +103,9 @@ if __name__ == "__main__":
         test_bug10_intarrayref_data,
         test_bug10_no_double_data,
         test_bug10_no_apply_on_subscript,
-        test_bug11_vla_to_vector,
         test_bug12_const_pointer,
-        test_bug14_shared_vla,
-        test_bug15_host_fminf_fmaxf,
-        test_bug16_clamp,
-        test_regression_existing_patterns,
+        test_regression_kept_patterns,
+        test_removed_patterns_no_longer_fixed,
     ]
     passed = 0
     for t in tests:

@@ -368,39 +368,124 @@ def _get_bottleneck_type(profiler_feedback: str) -> str:
     return "unknown"
 
 
-def _get_operation_type(prompt_text: str) -> str:
-    """Classify the kernel operation type from the prompt text.
+def _classify_code_structure(cuda_code: str) -> dict:
+    """Analyze generated CUDA code to detect what structures are present.
+    Returns a dict of boolean flags for code features.
+
+    This is the ground truth — looks at the ACTUAL code the model wrote,
+    not keywords in the prompt. Works for any operation type.
+    """
+    if not cuda_code:
+        return {}
+    features = {}
+
+    # Inner for-loops (candidates for unrolling / tiling)
+    # Look for `for (` patterns inside __global__ functions
+    for_loops = re.findall(r'for\s*\(', cuda_code)
+    features["has_inner_loops"] = len(for_loops) >= 2  # at least 2 loops = nested
+
+    # Shared memory usage
+    features["has_shared_memory"] = "__shared__" in cuda_code
+
+    # Reduction patterns (atomicAdd, __shfl, warp-level ops)
+    features["has_reduction"] = any(p in cuda_code for p in [
+        "atomicAdd", "atomicMax", "atomicMin",
+        "__shfl_down_sync", "__shfl_xor_sync", "__shfl_sync",
+        "__syncthreads",  # often signals data sharing / reduction
+    ])
+
+    # Data reuse patterns (same array indexed with different offsets in a loop)
+    # Heuristic: multiple accesses to same array in a for-loop body
+    features["has_data_reuse"] = bool(re.search(
+        r'for\s*\(.*?\).*?\{[^}]*\w+\[[^]]+\].*?\w+\[[^]]+\].*?\}',
+        cuda_code, re.DOTALL
+    ))
+
+    # Simple elementwise pattern: one idx, one read, one write, no loops
+    features["is_simple_elementwise"] = (
+        not features["has_inner_loops"]
+        and not features["has_shared_memory"]
+        and not features["has_reduction"]
+        and bool(re.search(r'blockIdx\.x\s*\*\s*blockDim\.x\s*\+\s*threadIdx\.x', cuda_code))
+    )
+
+    # Multiple nested loops with accumulation (matmul-like)
+    features["has_accumulation_loop"] = bool(re.search(
+        r'for\s*\(.*?\).*?\{[^}]*\+=', cuda_code, re.DOTALL
+    ))
+
+    # Sliding window / stencil pattern (offsets like [i+1], [i-1], [row+k])
+    features["has_stencil"] = bool(re.search(
+        r'\w+\[\s*\w+\s*[+-]\s*\d+\s*\]', cuda_code
+    ))
+
+    return features
+
+
+def _get_operation_type(prompt_text: str, cuda_code: str | None = None) -> str:
+    """Classify the kernel operation type.
     Returns 'elementwise', 'reduction', 'matmul', 'conv', or 'other'.
 
-    This determines which optimization rules are safe to apply:
-    - elementwise: float4, grid-stride, fusion, __ldg (NOT shared mem tiling, NOT loop unrolling)
-    - reduction: warp shuffle, grid-stride (NOT shared mem tiling)
-    - matmul: shared mem tiling, loop unrolling, coalesced access
-    - conv: shared mem tiling, __ldg, coalesced access
+    Primary signal: structural analysis of the generated CUDA code (if available).
+    Fallback: keyword matching on the prompt text.
+
+    Code-based classification generalizes to ANY operation because it looks at
+    what the model actually wrote, not what the prompt asked for.
     """
+    # ── Primary: analyze the actual generated code ──
+    if cuda_code:
+        feat = _classify_code_structure(cuda_code)
+
+        # Simple elementwise: no loops, no shared mem, no reduction, just idx→read→write
+        if feat.get("is_simple_elementwise"):
+            return "elementwise"
+
+        # Reduction: has warp shuffles, atomics, or syncthreads without nested loops
+        if feat.get("has_reduction") and not feat.get("has_inner_loops"):
+            return "reduction"
+
+        # Matmul-like: nested loops with accumulation, possible data reuse
+        if feat.get("has_inner_loops") and feat.get("has_accumulation_loop"):
+            # Distinguish matmul from conv by checking for stencil patterns
+            if feat.get("has_stencil"):
+                return "conv"
+            return "matmul"
+
+        # Stencil/conv: sliding window with offsets
+        if feat.get("has_stencil") and feat.get("has_inner_loops"):
+            return "conv"
+
+        # Reduction with loops (block-wide reduction, layernorm-style)
+        if feat.get("has_reduction") and feat.get("has_inner_loops"):
+            return "reduction"
+
+        # Has loops but no accumulation or reduction — could be complex elementwise
+        if feat.get("has_inner_loops") and not feat.get("has_accumulation_loop"):
+            return "other"
+
+        # Simple kernel with no interesting structure
+        if not feat.get("has_inner_loops") and not feat.get("has_reduction"):
+            return "elementwise"
+
+    # ── Fallback: keyword matching on prompt text ──
     text = prompt_text.lower()
 
-    # Check for matmul/gemm patterns
     matmul_kw = ["matmul", "matrix_multiply", "matrix multiply", "gemm",
                  "matrix multiplication", "torch.mm", "torch.bmm",
-                 "torch.matmul", "@", "einsum"]
+                 "torch.matmul", "einsum"]
     if any(kw in text for kw in matmul_kw):
-        # einsum could be many things — check if it's a matmul pattern
         if "einsum" in text:
-            # Common matmul einsum patterns
             if any(p in text for p in ["ij,jk", "bij,bjk", "bhij,bhjk", "ik,kj"]):
                 return "matmul"
-            return "other"  # non-matmul einsum
+            return "other"
         return "matmul"
 
-    # Check for convolution patterns
     conv_kw = ["conv1d", "conv2d", "conv3d", "convolution", "conv_transpose",
                "depthwise_conv", "deconv", "sliding window", "stencil",
                "torch.nn.conv", "f.conv"]
     if any(kw in text for kw in conv_kw):
         return "conv"
 
-    # Check for reduction patterns
     reduce_kw = ["reduce", "sum(", ".sum(", "mean(", ".mean(", "norm(",
                  ".norm(", "softmax", "layernorm", "layer_norm",
                  "batchnorm", "batch_norm", "groupnorm", "group_norm",
@@ -409,7 +494,6 @@ def _get_operation_type(prompt_text: str) -> str:
     if any(kw in text for kw in reduce_kw):
         return "reduction"
 
-    # Check for elementwise patterns (activation functions, pointwise ops)
     elem_kw = ["relu", "gelu", "silu", "sigmoid", "tanh", "leaky_relu",
                "leakyrelu", "elu(", "selu", "mish", "swish", "hardswish",
                "hardsigmoid", "softplus", "clamp", "elementwise",
@@ -808,40 +892,56 @@ def _generate_with_sglang(context_texts: list[str], config: "GRPOConfig") -> lis
     """
     Budget-forcing generation:
       Phase 1 — let the model think for up to think_budget tokens,
-                 stop early if it writes ```python or </think> on its own.
-      Phase 2 — if no code block started after phase 1, inject
-                 </think>\n```python\n and generate the code.
+                 stop at </think> or ```python (whichever comes first).
+      Phase 1b — if thinking was too short (< MIN_THINK_WORDS), retry once
+                 with a nudge to encourage deeper reasoning.
+      Phase 2 — inject </think>\n```python\n and generate the code.
 
     This prevents the model from spending all 6000 tokens in <think>
-    and never writing any code.
+    and never writing any code, AND prevents it from skipping thinking entirely.
     """
     think_budget = config.think_budget
     code_budget   = config.max_new_tokens - think_budget
+    MIN_THINK_WORDS = 30  # minimum words of reasoning before we accept
 
     # ── Phase 1: thinking ───────────────────────────────────────────────────
+    # Stop at </think> so model can't skip thinking and jump straight to code.
+    # SGLang strips stop tokens from output, so comp won't contain </think>.
     phase1_raw = _sglang_post(
         config.sglang_port, context_texts, think_budget, config.temperature,
-        stop=["<|im_end|>", "```python"],
+        stop=["<|im_end|>", "```python", "</think>"],
     )
-    # phase1_raw contains the full text (context + partial completion)
+
+    # ── Phase 1b: retry if thinking too short ────────────────────────────────
+    for i, (ctx, full) in enumerate(zip(context_texts, phase1_raw)):
+        comp = full[len(ctx):] if full.startswith(ctx) else full
+        think_words = len(comp.strip().split())
+        if think_words < MIN_THINK_WORDS:
+            # Model skipped thinking — retry with accumulated context + nudge
+            retry_ctx = ctx + comp + "\nLet me think step by step about the CUDA kernel:\n1. "
+            retry_raw = _sglang_post(
+                config.sglang_port, [retry_ctx], think_budget, config.temperature,
+                stop=["<|im_end|>", "```python", "</think>"],
+            )
+            phase1_raw[i] = retry_raw[0]
+            context_texts[i] = retry_ctx  # update for phase 2
+            print(f"  [THINK] traj={i}: thinking too short ({think_words} words), retried", flush=True)
 
     # ── Build phase-2 contexts ───────────────────────────────────────────────
     phase2_contexts = []
-    phase1_completions = []   # what the model produced in phase 1 (no context prefix)
+    phase1_completions = []
 
     for ctx, full in zip(context_texts, phase1_raw):
         comp = full[len(ctx):] if full.startswith(ctx) else full
         phase1_completions.append(comp)
 
         if "```python" in comp:
-            # Model already started writing code — continue from exactly here
+            # Model started writing code inside thinking — split at code boundary
             idx = comp.index("```python")
             phase2_contexts.append(ctx + comp[:idx] + "```python\n")
-        elif "</think>" in comp:
-            # Model closed its thinking naturally — let it continue normally
-            phase2_contexts.append(ctx + comp)
         else:
-            # Thinking budget exhausted without closing — inject the transition
+            # Normal case: thinking stopped at </think> or budget.
+            # Inject transition to code.
             phase2_contexts.append(ctx + comp + "\n</think>\n```python\n")
 
     # ── Phase 2: code ────────────────────────────────────────────────────────
@@ -853,7 +953,6 @@ def _generate_with_sglang(context_texts: list[str], config: "GRPOConfig") -> lis
     # ── Combine: return context + phase1 + phase2 ────────────────────────────
     results = []
     for ctx, p2ctx, p2full in zip(context_texts, phase2_contexts, phase2_raw):
-        # p2ctx already contains ctx + phase1 prefix; p2full = p2ctx + phase2 completion
         full_with_ctx = p2full if p2full.startswith(ctx) else (p2ctx + p2full)
         results.append(full_with_ctx)
     return results
@@ -1007,8 +1106,10 @@ def _run_group_episodes(
                 prev_opt_eval = traj_evals[i][turn_idx - 1] if turn_idx > 1 and len(traj_evals[i]) >= turn_idx else None
                 # Filter OPT rules by profiler bottleneck AND operation type —
                 # don't assign shared memory tiling to elementwise ops, etc.
+                # Uses the actual generated code (ws_best_code) for classification,
+                # not just prompt keywords — generalizes to any operation.
                 _bottleneck = _get_bottleneck_type(traj_prof or "")
-                _op_type = _get_operation_type(prompt_text)
+                _op_type = _get_operation_type(prompt_text, cuda_code=ws_best_code)
                 _filtered_rules = _filter_rules_by_bottleneck(_bottleneck, _op_type)
 
                 if prev_opt_eval is not None:
