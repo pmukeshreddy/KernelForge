@@ -183,10 +183,19 @@ class LLMFeedback:
             code=code_trunc,
             error=error_trunc,
         )
+        print(f"[LLM Feedback DEBUG] === DIAGNOSE INPUT ===", flush=True)
+        print(f"[LLM Feedback DEBUG] System prompt ({len(_DIAGNOSE_SYSTEM)} chars):\n{_DIAGNOSE_SYSTEM}", flush=True)
+        print(f"[LLM Feedback DEBUG] User msg ({len(user_msg)} chars):\n{user_msg[:1500]}{'...(truncated)' if len(user_msg) > 1500 else ''}", flush=True)
+        print(f"[LLM Feedback DEBUG] === END INPUT ===", flush=True)
         t0 = time.time()
         result = self._call(_DIAGNOSE_SYSTEM, user_msg, max_tokens=200)
+        elapsed = time.time() - t0
         if result:
-            print(f"[LLM Feedback] Diagnosis ({time.time()-t0:.1f}s): {result[:150]}...")
+            print(f"[LLM Feedback DEBUG] === DIAGNOSE OUTPUT ({elapsed:.1f}s) ===", flush=True)
+            print(f"[LLM Feedback DEBUG] Full response ({len(result)} chars):\n{result}", flush=True)
+            print(f"[LLM Feedback DEBUG] === END OUTPUT ===", flush=True)
+        else:
+            print(f"[LLM Feedback DEBUG] No response after {elapsed:.1f}s", flush=True)
         return result
 
     def suggest_optimization(self, task: str, code: str,
@@ -215,10 +224,19 @@ class LLMFeedback:
             speedup=speedup,
             profiler_section=profiler_section,
         )
+        print(f"[LLM Feedback DEBUG] === OPTIMIZE INPUT ===", flush=True)
+        print(f"[LLM Feedback DEBUG] System prompt ({len(_OPTIMIZE_SYSTEM)} chars):\n{_OPTIMIZE_SYSTEM}", flush=True)
+        print(f"[LLM Feedback DEBUG] User msg ({len(user_msg)} chars):\n{user_msg[:1500]}{'...(truncated)' if len(user_msg) > 1500 else ''}", flush=True)
+        print(f"[LLM Feedback DEBUG] === END INPUT ===", flush=True)
         t0 = time.time()
         result = self._call(_OPTIMIZE_SYSTEM, user_msg, max_tokens=250)
+        elapsed = time.time() - t0
         if result:
-            print(f"[LLM Feedback] Optimization hint ({time.time()-t0:.1f}s): {result[:150]}...")
+            print(f"[LLM Feedback DEBUG] === OPTIMIZE OUTPUT ({elapsed:.1f}s) ===", flush=True)
+            print(f"[LLM Feedback DEBUG] Full response ({len(result)} chars):\n{result}", flush=True)
+            print(f"[LLM Feedback DEBUG] === END OUTPUT ===", flush=True)
+        else:
+            print(f"[LLM Feedback DEBUG] No response after {elapsed:.1f}s", flush=True)
         return result
 
     def diagnose_batch(self, items: list[dict], max_workers: int = 2) -> list[str]:
