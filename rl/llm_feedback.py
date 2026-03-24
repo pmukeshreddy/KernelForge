@@ -62,6 +62,33 @@ CUDA kernel ({speedup:.2f}x vs PyTorch) for: {task}
 What is the #1 bottleneck?"""
 
 
+import re as _re
+
+# Preamble patterns the model loves to generate despite instructions
+_PREAMBLE_PATTERNS = [
+    _re.compile(r'^(?:The user is asking me to|Let me analyze|Looking at|I need to|Here\'s my analysis)[^.]*\.\s*', _re.IGNORECASE),
+    _re.compile(r'^(?:Looking at the (?:CUDA |code|kernel|error)[^.]*\.\s*)+', _re.IGNORECASE),
+    _re.compile(r'^(?:Let me (?:look|check|examine|analyze|find)[^.]*\.\s*)+', _re.IGNORECASE),
+]
+
+def _strip_preamble(text: str) -> str:
+    """Remove LLM filler preamble, code blocks, and bullet lists."""
+    # Remove code blocks
+    text = _re.sub(r'```\w*\n?.*?```', '', text, flags=_re.DOTALL)
+    # Remove numbered lists (1. 2. 3.)
+    text = _re.sub(r'^\s*\d+\.\s+\*?\*?', '', text, flags=_re.MULTILINE)
+    # Remove bullet points
+    text = _re.sub(r'^\s*[-*]\s+', '', text, flags=_re.MULTILINE)
+    # Remove bold markers
+    text = _re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
+    # Strip known preamble patterns
+    for pat in _PREAMBLE_PATTERNS:
+        text = pat.sub('', text)
+    # Collapse whitespace
+    text = ' '.join(text.split())
+    return text.strip()
+
+
 class LLMFeedback:
     """LLM-based feedback using a local GGUF model via llama-cpp-python.
 
@@ -108,8 +135,14 @@ class LLMFeedback:
     def available(self) -> bool:
         return self._llm is not None
 
-    def _call(self, system: str, user: str, max_tokens: int = 250) -> str:
-        """Make a single LLM call with timeout. Returns empty string on failure."""
+    def _call(self, system: str, user: str, max_tokens: int = 250,
+              prefill: str = "") -> str:
+        """Make a single LLM call with timeout. Returns empty string on failure.
+
+        Args:
+            prefill: Optional assistant prefill to force response format.
+                     The model continues from this text.
+        """
         if not self.available:
             return ""
 
@@ -119,16 +152,23 @@ class LLMFeedback:
         def _generate():
             try:
                 with self._lock:
+                    messages = [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ]
+                    if prefill:
+                        messages.append({"role": "assistant", "content": prefill})
                     resp = self._llm.create_chat_completion(
-                        messages=[
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": user},
-                        ],
+                        messages=messages,
                         max_tokens=max_tokens,
                         temperature=0.3,  # low temp for consistent diagnosis
                         top_p=0.9,
                     )
-                result[0] = resp["choices"][0]["message"]["content"].strip()
+                    raw = resp["choices"][0]["message"]["content"].strip()
+                    # Prepend prefill since model continues from it
+                    if prefill and not raw.startswith(prefill):
+                        raw = prefill + raw
+                    result[0] = _strip_preamble(raw)
             except Exception as e:
                 error[0] = str(e)
 
@@ -170,7 +210,8 @@ class LLMFeedback:
         print(f"[LLM Feedback DEBUG] User msg ({len(user_msg)} chars):\n{user_msg[:1500]}{'...(truncated)' if len(user_msg) > 1500 else ''}", flush=True)
         print(f"[LLM Feedback DEBUG] === END INPUT ===", flush=True)
         t0 = time.time()
-        result = self._call(_DIAGNOSE_SYSTEM, user_msg, max_tokens=100)
+        result = self._call(_DIAGNOSE_SYSTEM, user_msg, max_tokens=100,
+                             prefill="The bug is in `")
         elapsed = time.time() - t0
         if result:
             print(f"[LLM Feedback DEBUG] === DIAGNOSE OUTPUT ({elapsed:.1f}s) ===", flush=True)
@@ -211,7 +252,8 @@ class LLMFeedback:
         print(f"[LLM Feedback DEBUG] User msg ({len(user_msg)} chars):\n{user_msg[:1500]}{'...(truncated)' if len(user_msg) > 1500 else ''}", flush=True)
         print(f"[LLM Feedback DEBUG] === END INPUT ===", flush=True)
         t0 = time.time()
-        result = self._call(_OPTIMIZE_SYSTEM, user_msg, max_tokens=100)
+        result = self._call(_OPTIMIZE_SYSTEM, user_msg, max_tokens=100,
+                             prefill="The bottleneck is ")
         elapsed = time.time() - t0
         if result:
             print(f"[LLM Feedback DEBUG] === OPTIMIZE OUTPUT ({elapsed:.1f}s) ===", flush=True)
