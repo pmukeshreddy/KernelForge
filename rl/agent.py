@@ -249,6 +249,18 @@ def _fix_cuda_api(cuda_code: str) -> str:
         cuda_code,
     )
 
+    # Bug 15 — __fminf/__fmaxf are host-only intrinsics; device code needs fminf/fmaxf.
+    # The model confuses the double-underscore host versions with the device math functions.
+    cuda_code = re.sub(r'__fminf\b', 'fminf', cuda_code)
+    cuda_code = re.sub(r'__fmaxf\b', 'fmaxf', cuda_code)
+
+    # Bug 16 — __clamp doesn't exist in CUDA. Replace with fminf(fmaxf(...)).
+    cuda_code = re.sub(
+        r'__clamp\s*\(\s*([^,]+),\s*([^,]+),\s*([^)]+)\)',
+        r'fminf(fmaxf(\1, \2), \3)',
+        cuda_code,
+    )
+
     # Bug 12 — non-const pointer assigned from .sizes()/.strides().data().
     # These return const int64_t*, not int64_t*. Add const qualifier.
     cuda_code = re.sub(

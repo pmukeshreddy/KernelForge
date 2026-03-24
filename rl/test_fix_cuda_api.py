@@ -88,6 +88,25 @@ def test_bug14_shared_vla():
     print("✅ Bug 14: __shared__ VLA → extern __shared__")
 
 
+def test_bug15_host_fminf_fmaxf():
+    """Bug 15: __fminf/__fmaxf (host) → fminf/fmaxf (device)"""
+    code = "output[idx] = __fminf(__fmaxf(input[idx], -1.0f), 1.0f);"
+    fixed = _fix_cuda_api(code)
+    assert "__fminf" not in fixed, f"__fminf should be replaced, got: {fixed}"
+    assert "__fmaxf" not in fixed, f"__fmaxf should be replaced, got: {fixed}"
+    assert "fminf(fmaxf(" in fixed, f"Expected fminf(fmaxf(...)), got: {fixed}"
+    print("✅ Bug 15: __fminf/__fmaxf → fminf/fmaxf")
+
+
+def test_bug16_clamp():
+    """Bug 16: __clamp(x, a, b) → fminf(fmaxf(x, a), b)"""
+    code = "output[idx] = __clamp(input[idx], -1.0f, 1.0f);"
+    fixed = _fix_cuda_api(code)
+    assert "__clamp" not in fixed, f"__clamp should be replaced, got: {fixed}"
+    assert "fminf(fmaxf(input[idx], -1.0f), 1.0f)" in fixed, f"Expected clamp expansion, got: {fixed}"
+    print("✅ Bug 16: __clamp → fminf(fmaxf(...))")
+
+
 def test_regression_existing_patterns():
     """Ensure existing patterns still work."""
     # Bug 3: .ptr<T> → .data_ptr<T>
@@ -117,6 +136,8 @@ if __name__ == "__main__":
         test_bug11_vla_to_vector,
         test_bug12_const_pointer,
         test_bug14_shared_vla,
+        test_bug15_host_fminf_fmaxf,
+        test_bug16_clamp,
         test_regression_existing_patterns,
     ]
     passed = 0
