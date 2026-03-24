@@ -34,9 +34,9 @@ You are a CUDA kernel debugging expert. You will be shown a broken CUDA kernel \
 and the error it produced. Your job is to diagnose the root cause concisely.
 
 Rules:
-- Be direct. No preamble or filler (no "Let me analyze..."). Start with the bug.
+- Start your response with the bug itself. NEVER begin with "Let me", "Looking at", or any preamble.
 - Identify the SPECIFIC bug (wrong indexing, missing sync, type mismatch, etc.)
-- Be concrete: reference line numbers or variable names from the code
+- Be concrete: reference variable names from the code
 - Keep your response to 2-4 sentences
 - Do NOT provide corrected code — only diagnose the problem
 - If the error is a compiler error, focus on the C++ syntax/API issue
@@ -186,7 +186,7 @@ class LLMFeedback:
             error=error_trunc,
         )
         t0 = time.time()
-        result = self._call(_DIAGNOSE_SYSTEM, user_msg, max_tokens=400)
+        result = self._call(_DIAGNOSE_SYSTEM, user_msg, max_tokens=512)
         if result:
             print(f"[LLM Feedback] Diagnosis ({time.time()-t0:.1f}s): {result[:150]}...")
         return result

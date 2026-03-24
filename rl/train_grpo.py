@@ -1082,6 +1082,58 @@ def _run_group_episodes(
         # Kevin, Dr. Kernel, and MURPHY all keep full history — the model needs to
         # see all prior attempts to identify which approach was best and avoid repeating mistakes.
         context_texts = []
+
+        # ── Pre-compute deduplicated LLM diagnoses for this turn ──────────
+        # When multiple trajectories have the same error class on the
+        # previous turn, diagnose once and reuse — avoids redundant
+        # sequential LLM calls (saves ~35s per duplicate).
+        _diag_cache: dict[str, str] = {}  # error_class → formatted diagnosis
+        if (turn_idx > 0
+                and _llm_feedback is not None and _llm_feedback.available):
+            _prev_turn = turn_idx - 1
+            # Group trajectories by error class
+            _error_classes: dict[str, int] = {}  # class → first traj index
+            for _gi in range(G):
+                _prev_eval = traj_evals[_gi][_prev_turn] if _prev_turn < len(traj_evals[_gi]) else None
+                _ec = _classify_error(_prev_eval)
+                if _ec != "correct" and _ec not in _error_classes:
+                    _error_classes[_ec] = _gi
+            # Diagnose one representative per error class
+            for _ec, _rep_i in _error_classes.items():
+                _rep_eval = traj_evals[_rep_i][_prev_turn]
+                _rep_code = ""
+                if _prev_turn < len(traj_responses[_rep_i]) and traj_responses[_rep_i][_prev_turn]:
+                    _rep_code = _extract_python_block(traj_responses[_rep_i][_prev_turn])
+                _rep_error = ""
+                if _rep_eval is None:
+                    _rep_error = "No code was extracted from the response"
+                elif not _rep_eval.get("compiles", False):
+                    _rep_error = _rep_eval.get("compiler_error") or "Unknown compile error"
+                else:
+                    _rep_error = _rep_eval.get("compiler_error") or "Outputs do not match reference"
+                    _wf = _rep_eval.get("wrong_frac")
+                    _mae = _rep_eval.get("max_abs_error")
+                    if _wf is not None:
+                        _rep_error += f" | {_wf*100:.0f}% of elements wrong"
+                    if _mae is not None:
+                        _rep_error += f" | max_abs_error={_mae:.5f}"
+                _hint = _llm_feedback.diagnose_error(
+                    task=prompt_text,
+                    code=_rep_code or "(no code extracted)",
+                    error=_rep_error,
+                )
+                if _hint:
+                    _diag_cache[_ec] = _format_llm_hint(_hint, "diagnosis")
+            _n_unique = len(_error_classes)
+            _n_failed = sum(1 for _gi in range(G)
+                            if _classify_error(
+                                traj_evals[_gi][_prev_turn] if _prev_turn < len(traj_evals[_gi]) else None
+                            ) != "correct")
+            if _n_unique > 0:
+                print(f"  [LLM-DEDUP] {_n_failed} failed trajs → {_n_unique} unique error class(es), "
+                      f"{_n_unique} diagnosis call(s) (saved {max(0, _n_failed - _n_unique)})",
+                      flush=True)
+
         for i in range(G):
             msgs = list(base_messages)
 
@@ -1353,32 +1405,42 @@ def _run_group_episodes(
                             _code = _extract_python_block(traj_responses[i][t])
 
                         # LLM feedback ALWAYS fires for errors (not gated by rag_prob)
+                        # Use pre-computed deduplicated cache for the most recent
+                        # prior turn; fall back to direct call for older turns.
                         if _llm_feedback is not None and _llm_feedback.available:
-                            _error_msg = ""
-                            if _eval_t is None:
-                                _error_msg = "No code was extracted from the response"
-                            elif not _eval_t.get("compiles", False):
-                                _error_msg = _eval_t.get("compiler_error") or "Unknown compile error"
+                            _ec = _classify_error(_eval_t)
+                            if t == turn_idx - 1 and _ec in _diag_cache:
+                                # Reuse cached diagnosis (deduplicated)
+                                _rag_hint = _diag_cache[_ec]
+                                _llm_hint = _rag_hint  # for printing
                             else:
-                                _error_msg = _eval_t.get("compiler_error") or "Outputs do not match reference"
-                                # Add numerical error details
-                                _wf = _eval_t.get("wrong_frac")
-                                _mae = _eval_t.get("max_abs_error")
-                                if _wf is not None:
-                                    _error_msg += f" | {_wf*100:.0f}% of elements wrong"
-                                if _mae is not None:
-                                    _error_msg += f" | max_abs_error={_mae:.5f}"
+                                # Direct call for older turns or cache miss
+                                _error_msg = ""
+                                if _eval_t is None:
+                                    _error_msg = "No code was extracted from the response"
+                                elif not _eval_t.get("compiles", False):
+                                    _error_msg = _eval_t.get("compiler_error") or "Unknown compile error"
+                                else:
+                                    _error_msg = _eval_t.get("compiler_error") or "Outputs do not match reference"
+                                    _wf = _eval_t.get("wrong_frac")
+                                    _mae = _eval_t.get("max_abs_error")
+                                    if _wf is not None:
+                                        _error_msg += f" | {_wf*100:.0f}% of elements wrong"
+                                    if _mae is not None:
+                                        _error_msg += f" | max_abs_error={_mae:.5f}"
 
-                            _llm_hint = _llm_feedback.diagnose_error(
-                                task=prompt_text,
-                                code=_code or "(no code extracted)",
-                                error=_error_msg,
-                            )
-                            if _llm_hint:
-                                _rag_hint = _format_llm_hint(_llm_hint, "diagnosis")
+                                _llm_hint = _llm_feedback.diagnose_error(
+                                    task=prompt_text,
+                                    code=_code or "(no code extracted)",
+                                    error=_error_msg,
+                                )
+                                if _llm_hint:
+                                    _rag_hint = _format_llm_hint(_llm_hint, "diagnosis")
                             if i == 0:
+                                _cache_hit = (t == turn_idx - 1 and _ec in _diag_cache)
                                 print(f"  [LLM] traj=0 turn {t+1}→{turn_idx+1}: "
-                                      f"{'got diagnosis' if _llm_hint else 'no response, falling back to RAG'}",
+                                      f"{'got diagnosis' if _llm_hint else 'no response, falling back to RAG'}"
+                                      f"{' (cached)' if _cache_hit else ''}",
                                       flush=True)
 
                         # Fallback to BM25 RAG if LLM unavailable or returned nothing
