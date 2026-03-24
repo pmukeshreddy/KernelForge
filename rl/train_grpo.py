@@ -357,10 +357,13 @@ OPTIMIZATION_RULES = [
 
 def _get_bottleneck_type(profiler_feedback: str) -> str:
     """Extract bottleneck type from profiler feedback text.
-    Returns 'memory', 'compute', or 'unknown'."""
+    Returns 'memory', 'compute', 'fast', or 'unknown'.
+    'fast' = already faster than PyTorch with low utilization → safe micro-opts only."""
     if not profiler_feedback:
         return "unknown"
     text = profiler_feedback.upper()
+    if "ALREADY FASTER" in text:
+        return "fast"
     if "MEMORY-BOUND" in text or "MEMORY BOUND" in text:
         return "memory"
     if "COMPUTE-BOUND" in text or "COMPUTE BOUND" in text:
@@ -505,9 +508,20 @@ def _get_operation_type(prompt_text: str, cuda_code: str | None = None) -> str:
     return "other"
 
 
+_SAFE_MICRO_OPT_NAMES = {
+    "Occupancy Tuning", "Read-Only Cache (__ldg)", "Grid-Stride Loop", "Loop Unrolling"
+}
+
+
 def _filter_rules_by_bottleneck(bottleneck: str, op_type: str = "other") -> list:
     """Return rules matching the profiler bottleneck AND operation type.
-    'both' rules always included for bottleneck. Falls back if too few match."""
+    'both' rules always included for bottleneck. Falls back if too few match.
+    'fast' bottleneck = already faster than PyTorch → safe micro-opts only."""
+    # Already-fast kernels: only safe micro-optimizations to avoid regressions
+    if bottleneck == "fast":
+        safe = [r for r in OPTIMIZATION_RULES if r["name"] in _SAFE_MICRO_OPT_NAMES]
+        return safe if len(safe) >= 2 else OPTIMIZATION_RULES
+
     # First filter by bottleneck
     if bottleneck == "unknown":
         by_bottleneck = OPTIMIZATION_RULES
@@ -521,8 +535,7 @@ def _filter_rules_by_bottleneck(bottleneck: str, op_type: str = "other") -> list
     matching = [r for r in by_bottleneck if op_type in r.get("ops", ["other"])]
     if len(matching) < 2:
         # Fallback: at least return safe universal rules
-        safe = [r for r in by_bottleneck
-                if r["name"] in ("Occupancy Tuning", "Read-Only Cache (__ldg)", "Grid-Stride Loop")]
+        safe = [r for r in by_bottleneck if r["name"] in _SAFE_MICRO_OPT_NAMES]
         return safe if len(safe) >= 2 else by_bottleneck
     return matching
 
