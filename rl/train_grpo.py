@@ -1090,11 +1090,27 @@ def _run_group_episodes(
             # trajectories get it with specific optimization rules + profiler.
             # >= 0.5x: algorithm is sound, needs micro-optimization (float4, etc.)
             # < 0.5x:  algorithm is fundamentally wrong, needs rewrite not tuning
+            #
+            # Skip opt turn when profiler says "Already Faster" with low
+            # utilization — the kernel is already near-optimal for a small
+            # workload. Forcing optimization risks breaking correctness
+            # for marginal gain.
+            _ws_prof = ws_best_eval.get("profiler_feedback", "") if ws_best_eval else ""
+            _already_fast_low_util = (
+                "Already Faster Than PyTorch" in _ws_prof
+                and ws_best_speedup >= 1.0
+            )
             use_optimization_turn = (
                 turn_idx > 0
                 and ws_best_code is not None
                 and ws_best_speedup >= 0.5
+                and not _already_fast_low_util
             )
+            if _already_fast_low_util and turn_idx > 0 and ws_best_code is not None:
+                if i == 0:
+                    print(f"  [OPT SKIP] Profiler says 'Already Faster' with low util "
+                          f"({ws_best_speedup:.2f}x) — skipping optimization turn",
+                          flush=True)
             use_opt_rules = use_optimization_turn  # always True when opt turn is active
 
             if use_optimization_turn:
@@ -1224,35 +1240,46 @@ def _run_group_episodes(
                 # Rules are filtered by profiler bottleneck type.
                 rule = _filtered_rules[(i + turn_idx - 1) % len(_filtered_rules)]
 
-                # Try LLM optimization hint first (targeted to actual code)
+                # LLM hints for even-indexed trajectories (with per-traj
+                # technique + varied temperature for diversity).
+                # Odd-indexed trajectories use hardcoded rule rotation
+                # to maintain exploration diversity across the group.
+                _LLM_OPT_TEMPS = [0.3, 0.5, 0.7, 0.9]
+                _use_llm_for_traj = (i % 2 == 0) and _llm_feedback is not None and _llm_feedback.available
+
                 _opt_llm_hint = None
-                if _llm_feedback is not None and _llm_feedback.available:
+                if _use_llm_for_traj:
                     _opt_speedup = 0.0
                     if rt and bt and rt > 0:
                         _opt_speedup = bt / rt
                     _opt_code = ws_best_code or ""
+                    _traj_temp = _LLM_OPT_TEMPS[i % len(_LLM_OPT_TEMPS)]
                     _opt_llm_hint = _llm_feedback.suggest_optimization(
                         task=prompt_text,
                         code=_opt_code,
                         speedup=_opt_speedup,
                         profiler_info=traj_prof or "",
+                        technique_hint=rule["name"],
+                        temperature=_traj_temp,
                     )
                     if i == 0:
                         print(f"  [LLM-OPT] traj=0 turn {turn_idx+1}: "
-                              f"{'got hint' if _opt_llm_hint else 'no response, using rules'}",
+                              f"{'got hint' if _opt_llm_hint else 'no response, using rules'}"
+                              f" (technique={rule['name']}, temp={_traj_temp})",
                               flush=True)
 
                 if _opt_llm_hint:
-                    # Use LLM-generated optimization hint
+                    # Use LLM-generated optimization hint (targeted to rule)
                     rule_str = _format_llm_hint(_opt_llm_hint, "optimization")
                     traj_turn_feedback_source[i] = {
                         "type": "OPT-LLM",
+                        "rule": rule["name"],
                         "bottleneck": _bottleneck,
                         "op_type": _op_type,
                         "profiler": bool(traj_prof),
                     }
                 else:
-                    # Fallback to hardcoded rules
+                    # Hardcoded rules (odd trajectories, or LLM fallback)
                     traj_turn_feedback_source[i] = {
                         "type": "OPT",
                         "rule": rule["name"],
@@ -1281,7 +1308,7 @@ def _run_group_episodes(
                 )
 
                 if i == 0:
-                    _hint_source = "LLM" if _opt_llm_hint else f"rule='{rule['name']}'"
+                    _hint_source = f"LLM(rule={rule['name']})" if _opt_llm_hint else f"rule='{rule['name']}'"
                     print(f"  [OPT TURN] traj=0 turn {turn_idx+1}: "
                           f"best kernel from {ws_best_source} ({ws_best_speedup:.2f}x), "
                           f"{_hint_source}"
@@ -1459,7 +1486,11 @@ def _run_group_episodes(
                   f"[bottleneck={_sum_bottleneck}, op_type={_sum_op_type}, "
                   f"{len(_sum_filtered)}/{len(OPTIMIZATION_RULES)} rules]")
             rules_used = [_sum_filtered[(i + turn_idx - 1) % len(_sum_filtered)]["name"] for i in range(G)]
+            _llm_avail = _llm_feedback is not None and _llm_feedback.available
+            _llm_trajs = [j for j in range(G) if j % 2 == 0 and _llm_avail]
+            _rule_trajs = [j for j in range(G) if j not in _llm_trajs]
             print(f"  [OPT TURN] Rules assigned: {rules_used}")
+            print(f"  [OPT TURN] LLM trajs: {_llm_trajs}, Rule trajs: {_rule_trajs}")
         elif turn_idx > 0:
             print(f"  [TURN {turn_idx+1}] No correct kernel yet — normal error-feedback path")
 

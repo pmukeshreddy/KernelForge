@@ -126,7 +126,8 @@ class LLMFeedback:
     def available(self) -> bool:
         return self._llm is not None
 
-    def _call(self, system: str, user: str, max_tokens: int = 250) -> str:
+    def _call(self, system: str, user: str, max_tokens: int = 250,
+              temperature: float = 0.3) -> str:
         """Make a single LLM call with timeout. Returns empty string on failure."""
         if not self.available:
             return ""
@@ -143,7 +144,7 @@ class LLMFeedback:
                             {"role": "user", "content": user},
                         ],
                         max_tokens=max_tokens,
-                        temperature=0.3,  # low temp for consistent diagnosis
+                        temperature=temperature,
                         top_p=0.9,
                     )
                 result[0] = resp["choices"][0]["message"]["content"].strip()
@@ -184,13 +185,15 @@ class LLMFeedback:
             error=error_trunc,
         )
         t0 = time.time()
-        result = self._call(_DIAGNOSE_SYSTEM, user_msg, max_tokens=200)
+        result = self._call(_DIAGNOSE_SYSTEM, user_msg, max_tokens=400)
         if result:
             print(f"[LLM Feedback] Diagnosis ({time.time()-t0:.1f}s): {result[:150]}...")
         return result
 
     def suggest_optimization(self, task: str, code: str,
-                              speedup: float, profiler_info: str = "") -> str:
+                              speedup: float, profiler_info: str = "",
+                              technique_hint: str = "",
+                              temperature: float = 0.3) -> str:
         """Suggest optimization for a correct-but-slow kernel.
 
         Args:
@@ -198,6 +201,8 @@ class LLMFeedback:
             code: The correct CUDA kernel code
             speedup: Current speedup vs PyTorch (e.g., 0.8 = 80% of PyTorch speed)
             profiler_info: Optional profiler output (bottleneck analysis)
+            technique_hint: Optional specific technique to focus on (e.g. rule name)
+            temperature: Sampling temperature (vary across trajectories for diversity)
 
         Returns:
             3-5 sentence optimization suggestion, or empty string on failure
@@ -209,14 +214,24 @@ class LLMFeedback:
             if profiler_info else ""
         )
 
+        # If a specific technique is given, append it to the prompt so the LLM
+        # gives targeted advice instead of generic suggestions.
+        technique_section = ""
+        if technique_hint:
+            technique_section = (
+                f"\n\nFocus your suggestion on applying this technique: "
+                f"**{technique_hint}**. Explain how it applies to this specific kernel."
+            )
+
         user_msg = _OPTIMIZE_USER.format(
             task=task_trunc,
             code=code_trunc,
             speedup=speedup,
             profiler_section=profiler_section,
-        )
+        ) + technique_section
         t0 = time.time()
-        result = self._call(_OPTIMIZE_SYSTEM, user_msg, max_tokens=250)
+        result = self._call(_OPTIMIZE_SYSTEM, user_msg, max_tokens=250,
+                            temperature=temperature)
         if result:
             print(f"[LLM Feedback] Optimization hint ({time.time()-t0:.1f}s): {result[:150]}...")
         return result
