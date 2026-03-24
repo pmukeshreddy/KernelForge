@@ -845,6 +845,10 @@ def _run_group_episodes(
     traj_was_correct:  list[bool]  = [False] * G  # was this trajectory ever correct?
     traj_best_reward:  list[float] = [float('-inf')] * G  # best reward achieved so far
 
+    # Track what feedback each trajectory received on turn 2+ (rule, profiler, RAG)
+    # so we can correlate feedback → outcome
+    traj_turn_feedback_source: list[dict] = [{} for _ in range(G)]  # reset each turn
+
     # Warm start: overall best correct kernel across ALL trajectories and ALL turns
     # Failed trajectories in turn 2+ get this kernel injected so they focus on optimization
     # Updated each turn — always tracks the fastest correct kernel seen so far
@@ -1015,6 +1019,12 @@ def _run_group_episodes(
                 # technique each turn instead of the same one every time.
                 # Rules are filtered by profiler bottleneck type.
                 rule = _filtered_rules[(i + turn_idx - 1) % len(_filtered_rules)]
+                traj_turn_feedback_source[i] = {
+                    "type": "OPT",
+                    "rule": rule["name"],
+                    "bottleneck": _bottleneck,
+                    "profiler": bool(traj_prof),
+                }
                 rule_str = (
                     f"\n\n--- Optimization Technique to Apply ---\n"
                     f"**{rule['name']}**\n{rule['rule']}\n"
@@ -1083,6 +1093,14 @@ def _run_group_episodes(
                     elif i == 0:
                         print(f"  [RAG] traj=0 turn {t+1}→{turn_idx+1}: skipped (correct={_eval_t.get('correct', False) if _eval_t else None}, rag_prob={rag_prob:.2f})", flush=True)
 
+                    _has_profiler = bool(_eval_t and _eval_t.get("profiler_feedback"))
+                    _rag_titles = [_rs.title for _rs in _rag_sections] if _rag_sections else []
+                    traj_turn_feedback_source[i] = {
+                        "type": "NORMAL",
+                        "profiler": _has_profiler,
+                        "rag": _rag_titles,
+                        "correct_prev": bool(_eval_t and _eval_t.get("correct")),
+                    }
                     feedback = _build_turn_feedback(
                         _eval_t, prev_eval=prev_eval,
                         best_speedup=hwm_speedup, best_turn=hwm_turn,
@@ -1363,6 +1381,42 @@ def _run_group_episodes(
         print(f"  [DEBUG] Turn {turn_idx+1} rewards: correct={n_correct} wrong={n_wrong} "
               f"| values=[{', '.join(f'{r:.2f}' for r in turn_rewards)}] "
               f"std={torch.tensor(turn_rewards).std().item():.3f}")
+
+        # ── FEEDBACK→OUTCOME: track what advice each traj got and what happened ──
+        if turn_idx > 0:
+            print(f"  [FEEDBACK→OUTCOME] Turn {turn_idx+1}:", flush=True)
+            for i in range(G):
+                fb = traj_turn_feedback_source[i]
+                er = eval_results[i]
+                # Determine outcome
+                if er is None or not er.get("compiles", False):
+                    outcome = "COMPILE_FAIL"
+                elif not er.get("correct", False):
+                    outcome = "WRONG"
+                else:
+                    rt = er.get("runtime_ms")
+                    bt = er.get("baseline_runtime_ms")
+                    if rt and bt:
+                        sp = bt / rt
+                        prev_sp = ws_speedup_at_opt_start or ws_best_speedup or 0
+                        if prev_sp > 0 and sp > prev_sp * 1.02:
+                            outcome = f"IMPROVED ({sp:.2f}x vs {prev_sp:.2f}x)"
+                        elif prev_sp > 0 and sp < prev_sp * 0.98:
+                            outcome = f"SLOWER ({sp:.2f}x vs {prev_sp:.2f}x)"
+                        else:
+                            outcome = f"SAME ({sp:.2f}x)"
+                    else:
+                        outcome = "CORRECT (no timing)"
+
+                if fb.get("type") == "OPT":
+                    print(f"    traj {i}: rule='{fb['rule']}' bottleneck={fb['bottleneck']} → {outcome}", flush=True)
+                elif fb.get("type") == "NORMAL":
+                    rag_str = f" RAG={fb['rag']}" if fb.get('rag') else ""
+                    prof_str = " +profiler" if fb.get('profiler') else ""
+                    print(f"    traj {i}: NORMAL (prev_correct={fb.get('correct_prev')}){prof_str}{rag_str} → {outcome}", flush=True)
+                else:
+                    print(f"    traj {i}: (no feedback tracked) → {outcome}", flush=True)
+        # ── END FEEDBACK→OUTCOME ────────────────────────────────────────────
         # ── END DEBUG ────────────────────────────────────────────────────────
 
         # Run profiler on correct kernels when there's a next turn to use the feedback.
