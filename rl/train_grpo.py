@@ -789,6 +789,7 @@ def _run_group_episodes(
         {"role": "system", "content": sys_content},
         {"role": "user", "content": user_msg},
     ]
+    print(f"  [DEBUG] System prompt: {len(sys_content)} chars | User msg: {len(user_msg)} chars")
 
     group_turns:   list[list[TurnData]]   = [[] for _ in range(G)]
     group_rewards: list[list[float]]      = [[] for _ in range(G)]
@@ -1027,7 +1028,14 @@ def _run_group_episodes(
                             _code = _extract_python_block(traj_responses[i][t])
                             if _code:
                                 _rag_query += "\n" + _code[:1000]  # cap code length
-                        _rag_hint = _cuda_rag.retrieve_text(_rag_query, top_k=2, max_chars=2000)
+                        _rag_sections = _cuda_rag.retrieve(_rag_query, top_k=2)
+                    _rag_hint = _cuda_rag.retrieve_text(_rag_query, top_k=2, max_chars=2000)
+                    if i == 0 and _rag_sections:
+                        print(f"  [RAG] traj=0 turn {t+1}→{turn_idx+1}: retrieved {len(_rag_sections)} sections:")
+                        for _rs in _rag_sections:
+                            print(f"    → '{_rs.title}' ({len(_rs.content)} chars)")
+                    elif i == 0:
+                        print(f"  [RAG] traj=0 turn {t+1}→{turn_idx+1}: NO sections retrieved (rag_prob={rag_prob:.2f})")
 
                     feedback = _build_turn_feedback(
                         _eval_t, prev_eval=prev_eval,
@@ -1037,7 +1045,13 @@ def _run_group_episodes(
                         rag_hint=_rag_hint,
                     )
                     if i == 0:
-                        print(f"  [DEBUG] Feedback traj=0 turn {t+1}→{turn_idx+1}:\n{feedback}")
+                        _fb_has_rag = "--- Relevant CUDA Pattern ---" in feedback
+                        _fb_has_group = "ALL" in feedback and "FAILED" in feedback
+                        _fb_has_stuck = "same type of error" in feedback
+                        print(f"  [DEBUG] Feedback traj=0 turn {t+1}→{turn_idx+1} "
+                              f"({len(feedback)} chars, RAG={'YES' if _fb_has_rag else 'NO'}, "
+                              f"group_fail={'YES' if _fb_has_group else 'NO'}, "
+                              f"stuck={'YES' if _fb_has_stuck else 'NO'}):\n{feedback}")
                     elif (traj_evals[i][t] is not None
                           and not traj_evals[i][t].get("correct", False)
                           and t == turn_idx - 1):
@@ -1112,6 +1126,26 @@ def _run_group_episodes(
                 resp_ids = tokenizer(gen_text,  return_tensors="pt").input_ids[0]
             group_turns[i].append((ctx_ids.cpu(), resp_ids.cpu()))
 
+        # ── DEBUG: dump model's thinking for traj 0 ──────────────────────────
+        if completions:
+            _raw0 = completions[0]
+            # Extract think block
+            _think_match = re.search(r'<think>(.*?)</think>', _raw0, re.DOTALL)
+            if not _think_match:
+                _think_match = re.search(r'<think>(.*)', _raw0, re.DOTALL)
+            _think_text = _think_match.group(1).strip() if _think_match else "(no think block)"
+            _think_tokens = len(_think_text.split())
+            _total_tokens = len(_raw0.split())
+            _code_text = _extract_python_block(_raw0)
+            _code_tokens = len(_code_text.split()) if _code_text else 0
+            print(f"  [THINK] traj=0 turn {turn_idx+1}: {_think_tokens} words thinking, "
+                  f"{_code_tokens} words code, {_total_tokens} words total")
+            # Show first 500 chars of thinking so we can see the model's reasoning
+            print(f"  [THINK CONTENT] traj=0:\n    {_think_text[:500]}")
+            if len(_think_text) > 500:
+                print(f"    ... ({len(_think_text) - 500} more chars)")
+        # ── END DEBUG ─────────────────────────────────────────────────────────
+
         # Extract code and evaluate
         candidates = []
         for i, gen_text in enumerate(completions):
@@ -1137,6 +1171,19 @@ def _run_group_episodes(
         n_compiled = sum(1 for r in eval_results if r is not None and r.get("compiles", False))
         n_correct  = sum(1 for r in eval_results if r is not None and r.get("correct",  False))
         print(f"done ({time.time()-t_eval:.1f}s) | compiled={n_compiled}/{n_valid} correct={n_correct}/{G}")
+
+        # ── DEBUG: when all fail on turn 2+, show what each traj was thinking ──
+        if turn_idx > 0 and n_correct == 0:
+            print(f"  [ALL FAIL DEBUG] Turn {turn_idx+1}: 0/{G} correct. Think summaries:")
+            for i, gen_text in enumerate(completions):
+                _tm = re.search(r'<think>(.*?)</think>', gen_text, re.DOTALL)
+                if not _tm:
+                    _tm = re.search(r'<think>(.*)', gen_text, re.DOTALL)
+                _tt = _tm.group(1).strip()[:200] if _tm else "(no think)"
+                _err = "compile" if (eval_results[i] and not eval_results[i].get("compiles")) else \
+                       "wrong" if (eval_results[i] and not eval_results[i].get("correct")) else \
+                       "no_code" if not candidates[i] else "?"
+                print(f"    traj {i} [{_err}]: {_tt}")
 
         # OOM detection: if ALL evals on turn 1 fail (often means ref model itself OOMs),
         # skip this prompt entirely — no useful learning signal.
