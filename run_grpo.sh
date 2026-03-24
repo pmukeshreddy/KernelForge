@@ -34,7 +34,7 @@ if [ ! -f "$LLM_MODEL" ]; then
   echo "[Setup] Downloading Qwen3.5-9B GGUF for LLM feedback..."
   mkdir -p "$REPO_DIR/models"
   wget -q --show-progress -O "$LLM_MODEL" \
-    "https://huggingface.co/Qwen/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf"
+    "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf"
   if [ $? -ne 0 ]; then
     echo "[Setup] WARNING: Failed to download GGUF model. LLM feedback will be disabled."
     LLM_MODEL=""
