@@ -30,54 +30,36 @@ except ImportError:
 # ── Prompt templates ─────────────────────────────────────────────────────────
 
 _DIAGNOSE_SYSTEM = """\
-You are a CUDA kernel debugging expert. You will be shown a broken CUDA kernel \
-and the error it produced. Your job is to diagnose the root cause concisely.
+CUDA kernel debugger. Reply with ONLY 1-2 sentences. No preamble. No code blocks. No bullet lists.
 
-Rules:
-- Identify the SPECIFIC bug (wrong indexing, missing sync, type mismatch, etc.)
-- Be concrete: reference line numbers or variable names from the code
-- Keep your response to 2-4 sentences
-- Do NOT provide corrected code — only diagnose the problem
-- If the error is a compiler error, focus on the C++ syntax/API issue
-- If the error is a correctness error, focus on the algorithmic/indexing bug"""
+WRONG: "Let me analyze the code. Looking at line 54..."
+WRONG: "```cpp\nfloat x = ...```"
+RIGHT: "The variable `g_idx` overflows shared memory bounds because group*1024+tid exceeds 1024 when group>0."
+RIGHT: "`gelu_kernel` is called but never defined — only a `__device__ gelu` function exists."
+
+Name the buggy variable or expression and say why it's wrong. Nothing else."""
 
 _DIAGNOSE_USER = """\
-Task: Implement a CUDA kernel for the following PyTorch operation:
-{task}
+CUDA kernel for: {task}
 
-Generated kernel code:
-```python
 {code}
-```
 
-Error:
-{error}
-
-Diagnose the root cause of this error in 2-4 sentences."""
+Error: {error}"""
 
 _OPTIMIZE_SYSTEM = """\
-You are a CUDA performance optimization expert. You will be shown a correct but \
-potentially slow CUDA kernel. Your job is to identify its #1 performance bottleneck \
-and suggest ONE specific optimization.
+CUDA performance expert. Reply with ONLY 1-2 sentences. No preamble. No code blocks. No bullet lists.
 
-Rules:
-- Analyze the actual code structure (memory access pattern, thread utilization, etc.)
-- Identify the SINGLE most impactful bottleneck
-- Suggest ONE concrete optimization technique with a brief explanation
-- Keep your response to 3-5 sentences
-- Do NOT rewrite the kernel — just describe what to change and why
-- Reference specific parts of the code (variable names, loop structures, etc.)"""
+WRONG: "Let me analyze the memory access pattern..."
+RIGHT: "The inner loop in `conv_kernel` reads `weight[oc*IC + ic]` with stride IC, causing uncoalesced global memory access — tiling into shared memory would fix this."
+
+Name the bottleneck variable/loop and say what optimization to apply. Nothing else."""
 
 _OPTIMIZE_USER = """\
-Task: Implement a CUDA kernel for the following PyTorch operation:
-{task}
+CUDA kernel ({speedup:.2f}x vs PyTorch) for: {task}
 
-Current kernel code (correct, {speedup:.2f}x vs PyTorch):
-```python
 {code}
-```
 {profiler_section}
-Identify the #1 performance bottleneck and suggest ONE specific optimization."""
+What is the #1 bottleneck?"""
 
 
 class LLMFeedback:
@@ -188,7 +170,7 @@ class LLMFeedback:
         print(f"[LLM Feedback DEBUG] User msg ({len(user_msg)} chars):\n{user_msg[:1500]}{'...(truncated)' if len(user_msg) > 1500 else ''}", flush=True)
         print(f"[LLM Feedback DEBUG] === END INPUT ===", flush=True)
         t0 = time.time()
-        result = self._call(_DIAGNOSE_SYSTEM, user_msg, max_tokens=200)
+        result = self._call(_DIAGNOSE_SYSTEM, user_msg, max_tokens=100)
         elapsed = time.time() - t0
         if result:
             print(f"[LLM Feedback DEBUG] === DIAGNOSE OUTPUT ({elapsed:.1f}s) ===", flush=True)
@@ -229,7 +211,7 @@ class LLMFeedback:
         print(f"[LLM Feedback DEBUG] User msg ({len(user_msg)} chars):\n{user_msg[:1500]}{'...(truncated)' if len(user_msg) > 1500 else ''}", flush=True)
         print(f"[LLM Feedback DEBUG] === END INPUT ===", flush=True)
         t0 = time.time()
-        result = self._call(_OPTIMIZE_SYSTEM, user_msg, max_tokens=250)
+        result = self._call(_OPTIMIZE_SYSTEM, user_msg, max_tokens=100)
         elapsed = time.time() - t0
         if result:
             print(f"[LLM Feedback DEBUG] === OPTIMIZE OUTPUT ({elapsed:.1f}s) ===", flush=True)
