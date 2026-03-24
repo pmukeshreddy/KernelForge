@@ -207,6 +207,22 @@ def _generate_feedback(metrics: Dict[str, float], speedup: float | None = None) 
     feedback += f"Compute Throughput: {compute:>5.1f}% of peak\n"
     feedback += f"Warp Occupancy:     {occupancy:>5.1f}% of theoretical peak\n"
 
+    # For kernels already faster than PyTorch with low utilization: the workload
+    # is too small to saturate the GPU.  Don't suggest aggressive structural changes
+    # that are likely to break correctness (e.g., float4 on strided pointers,
+    # shared memory tiling on elementwise ops).
+    if speedup is not None and speedup >= 1.0 and memory < 50 and compute < 50:
+        feedback += (
+            f"\n--- Already Faster Than PyTorch ({speedup:.2f}x) ---\n"
+            f"Low utilization numbers are expected for small/fast kernels — the GPU "
+            f"cannot saturate bandwidth with very short kernels.\n"
+            f"DO NOT make aggressive structural changes (shared memory tiling, major "
+            f"algorithmic rewrites). These risk breaking correctness for marginal gain.\n"
+            f"Safe micro-optimizations only: adjust block/grid sizes, add __ldg() for "
+            f"read-only inputs, try #pragma unroll on existing loops."
+        )
+        return feedback
+
     # Detect "efficient but slow" pattern: high utilization but slower than PyTorch.
     # Give bottleneck-specific advice instead of generic "reduce work" message.
     if speedup is not None and speedup < 1.5 and (memory > 70 or compute > 50) and max(memory, compute) > 60:

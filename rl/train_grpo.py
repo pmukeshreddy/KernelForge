@@ -212,6 +212,7 @@ OPTIMIZATION_RULES = [
     {
         "name": "Vectorized Memory Access (float4)",
         "bottleneck": "memory",
+        "ops": ["elementwise", "reduction", "other"],  # NOT matmul/conv (complex indexing)
         "rule": (
             "Load/store 4 floats at once using float4 for 128-bit memory transactions (4x fewer transactions).\n"
             "Replace:\n"
@@ -231,6 +232,7 @@ OPTIMIZATION_RULES = [
     {
         "name": "Grid-Stride Loop",
         "bottleneck": "both",
+        "ops": ["elementwise", "reduction", "other"],  # universal for simple kernels
         "rule": (
             "Process multiple elements per thread with a grid-stride loop. Handles any size, improves occupancy.\n"
             "Replace:\n"
@@ -246,6 +248,7 @@ OPTIMIZATION_RULES = [
     {
         "name": "Warp-Level Reduction",
         "bottleneck": "compute",
+        "ops": ["reduction"],  # ONLY reductions — never elementwise/matmul
         "rule": (
             "For reductions (sum, max, min), use warp shuffle instead of shared memory — no sync needed.\n"
             "  float val = thread_value;\n"
@@ -258,6 +261,7 @@ OPTIMIZATION_RULES = [
     {
         "name": "Shared Memory Tiling",
         "bottleneck": "memory",
+        "ops": ["matmul", "conv"],  # ONLY matmul/conv — never elementwise
         "rule": (
             "For operations that reuse data (matmul, conv, stencil), tile data into shared memory.\n"
             "IMPORTANT: __shared__ array sizes MUST be compile-time constants (not runtime variables).\n"
@@ -276,6 +280,7 @@ OPTIMIZATION_RULES = [
     {
         "name": "Loop Unrolling",
         "bottleneck": "both",
+        "ops": ["matmul", "conv", "reduction"],  # needs inner loops — NOT pure elementwise
         "rule": (
             "Unroll inner loops so the compiler can pipeline instructions and use registers efficiently.\n"
             "  #pragma unroll\n"
@@ -290,6 +295,7 @@ OPTIMIZATION_RULES = [
     {
         "name": "Kernel Fusion",
         "bottleneck": "memory",
+        "ops": ["elementwise", "other"],  # fusing is for multi-op elementwise chains
         "rule": (
             "Combine multiple element-wise operations into a single kernel to eliminate intermediate memory traffic.\n"
             "Instead of separate kernels:\n"
@@ -303,6 +309,7 @@ OPTIMIZATION_RULES = [
     {
         "name": "Read-Only Cache (__ldg)",
         "bottleneck": "memory",
+        "ops": ["elementwise", "reduction", "matmul", "conv", "other"],  # universal
         "rule": (
             "For read-only input data, use __ldg() to use the texture/L2 cache path.\n"
             "Replace:\n"
@@ -316,6 +323,7 @@ OPTIMIZATION_RULES = [
     {
         "name": "Occupancy Tuning",
         "bottleneck": "both",
+        "ops": ["elementwise", "reduction", "matmul", "conv", "other"],  # universal
         "rule": (
             "Increase occupancy (active warps per SM) to better hide memory latency.\n"
             "- Try 128 threads/block instead of 256 — more blocks fit per SM.\n"
@@ -329,6 +337,7 @@ OPTIMIZATION_RULES = [
     {
         "name": "Coalesced Memory Access (Loop Reordering)",
         "bottleneck": "memory",
+        "ops": ["matmul", "conv", "reduction", "other"],  # NOT pure elementwise (already coalesced)
         "rule": (
             "Ensure consecutive threads access consecutive memory addresses (coalesced access).\n"
             "Bad (strided access — threads jump across memory):\n"
@@ -359,15 +368,78 @@ def _get_bottleneck_type(profiler_feedback: str) -> str:
     return "unknown"
 
 
-def _filter_rules_by_bottleneck(bottleneck: str) -> list:
-    """Return rules matching the profiler bottleneck.
-    'both' rules always included. Falls back to all rules if unknown."""
+def _get_operation_type(prompt_text: str) -> str:
+    """Classify the kernel operation type from the prompt text.
+    Returns 'elementwise', 'reduction', 'matmul', 'conv', or 'other'.
+
+    This determines which optimization rules are safe to apply:
+    - elementwise: float4, grid-stride, fusion, __ldg (NOT shared mem tiling, NOT loop unrolling)
+    - reduction: warp shuffle, grid-stride (NOT shared mem tiling)
+    - matmul: shared mem tiling, loop unrolling, coalesced access
+    - conv: shared mem tiling, __ldg, coalesced access
+    """
+    text = prompt_text.lower()
+
+    # Check for matmul/gemm patterns
+    matmul_kw = ["matmul", "matrix_multiply", "matrix multiply", "gemm",
+                 "matrix multiplication", "torch.mm", "torch.bmm",
+                 "torch.matmul", "@", "einsum"]
+    if any(kw in text for kw in matmul_kw):
+        # einsum could be many things — check if it's a matmul pattern
+        if "einsum" in text:
+            # Common matmul einsum patterns
+            if any(p in text for p in ["ij,jk", "bij,bjk", "bhij,bhjk", "ik,kj"]):
+                return "matmul"
+            return "other"  # non-matmul einsum
+        return "matmul"
+
+    # Check for convolution patterns
+    conv_kw = ["conv1d", "conv2d", "conv3d", "convolution", "conv_transpose",
+               "depthwise_conv", "deconv", "sliding window", "stencil",
+               "torch.nn.conv", "f.conv"]
+    if any(kw in text for kw in conv_kw):
+        return "conv"
+
+    # Check for reduction patterns
+    reduce_kw = ["reduce", "sum(", ".sum(", "mean(", ".mean(", "norm(",
+                 ".norm(", "softmax", "layernorm", "layer_norm",
+                 "batchnorm", "batch_norm", "groupnorm", "group_norm",
+                 "argmax", "argmin", ".max(", ".min(", "logsumexp",
+                 "cross_entropy", "nll_loss"]
+    if any(kw in text for kw in reduce_kw):
+        return "reduction"
+
+    # Check for elementwise patterns (activation functions, pointwise ops)
+    elem_kw = ["relu", "gelu", "silu", "sigmoid", "tanh", "leaky_relu",
+               "leakyrelu", "elu(", "selu", "mish", "swish", "hardswish",
+               "hardsigmoid", "softplus", "clamp", "elementwise",
+               "pointwise", "element-wise", "point-wise",
+               "activation", "+ bias", "add(", "mul(", "dropout"]
+    if any(kw in text for kw in elem_kw):
+        return "elementwise"
+
+    return "other"
+
+
+def _filter_rules_by_bottleneck(bottleneck: str, op_type: str = "other") -> list:
+    """Return rules matching the profiler bottleneck AND operation type.
+    'both' rules always included for bottleneck. Falls back if too few match."""
+    # First filter by bottleneck
     if bottleneck == "unknown":
-        return OPTIMIZATION_RULES
-    matching = [r for r in OPTIMIZATION_RULES
-                if r["bottleneck"] == bottleneck or r["bottleneck"] == "both"]
+        by_bottleneck = OPTIMIZATION_RULES
+    else:
+        by_bottleneck = [r for r in OPTIMIZATION_RULES
+                         if r["bottleneck"] == bottleneck or r["bottleneck"] == "both"]
+        if len(by_bottleneck) < 2:
+            by_bottleneck = OPTIMIZATION_RULES
+
+    # Then filter by operation type
+    matching = [r for r in by_bottleneck if op_type in r.get("ops", ["other"])]
     if len(matching) < 2:
-        return OPTIMIZATION_RULES  # fallback if too few
+        # Fallback: at least return safe universal rules
+        safe = [r for r in by_bottleneck
+                if r["name"] in ("Occupancy Tuning", "Read-Only Cache (__ldg)", "Grid-Stride Loop")]
+        return safe if len(safe) >= 2 else by_bottleneck
     return matching
 
 
@@ -933,10 +1005,11 @@ def _run_group_episodes(
                 # (Bug 6), stuck detection (Bug 3), actual error messages (Bug 4).
                 delta_str = ""
                 prev_opt_eval = traj_evals[i][turn_idx - 1] if turn_idx > 1 and len(traj_evals[i]) >= turn_idx else None
-                # Filter OPT rules by profiler bottleneck — don't assign
-                # compute techniques to memory-bound kernels or vice versa.
+                # Filter OPT rules by profiler bottleneck AND operation type —
+                # don't assign shared memory tiling to elementwise ops, etc.
                 _bottleneck = _get_bottleneck_type(traj_prof or "")
-                _filtered_rules = _filter_rules_by_bottleneck(_bottleneck)
+                _op_type = _get_operation_type(prompt_text)
+                _filtered_rules = _filter_rules_by_bottleneck(_bottleneck, _op_type)
 
                 if prev_opt_eval is not None:
                     prev_rule = _filtered_rules[(i + turn_idx - 2) % len(_filtered_rules)]
@@ -1023,6 +1096,7 @@ def _run_group_episodes(
                     "type": "OPT",
                     "rule": rule["name"],
                     "bottleneck": _bottleneck,
+                    "op_type": _op_type,
                     "profiler": bool(traj_prof),
                 }
                 rule_str = (
@@ -1030,7 +1104,11 @@ def _run_group_episodes(
                     f"**{rule['name']}**\n{rule['rule']}\n"
                     f"---\n"
                     f"Apply this technique to the kernel above. "
-                    f"Keep the kernel correct while making it faster."
+                    f"Keep the kernel correct while making it faster.\n"
+                    f"IMPORTANT: If this technique does not naturally fit your kernel "
+                    f"(e.g., no inner loops to unroll, no data reuse for shared memory), "
+                    f"skip it and instead do minor tuning: adjust block/grid sizes, "
+                    f"add __ldg() for read-only data, or try #pragma unroll on any existing loops."
                 )
                 feedback = (
                     f"Your previous answer was correct.\n{timing_str}{profiler_str}"
@@ -1141,13 +1219,15 @@ def _run_group_episodes(
 
         # Optimization turn summary
         if use_optimization_turn:
-            # Determine bottleneck from best kernel's profiler for the summary
+            # Determine bottleneck and op type from best kernel's profiler for the summary
             _sum_prof = ws_best_eval.get("profiler_feedback", "") if ws_best_eval else ""
             _sum_bottleneck = _get_bottleneck_type(_sum_prof)
-            _sum_filtered = _filter_rules_by_bottleneck(_sum_bottleneck)
+            _sum_op_type = _get_operation_type(prompt_text)
+            _sum_filtered = _filter_rules_by_bottleneck(_sum_bottleneck, _sum_op_type)
             print(f"  [OPT TURN] Turn {turn_idx+1}: ALL {G} trajectories optimizing "
                   f"best kernel from {ws_best_source} ({ws_best_speedup:.2f}x) "
-                  f"[bottleneck={_sum_bottleneck}, {len(_sum_filtered)}/{len(OPTIMIZATION_RULES)} rules]")
+                  f"[bottleneck={_sum_bottleneck}, op_type={_sum_op_type}, "
+                  f"{len(_sum_filtered)}/{len(OPTIMIZATION_RULES)} rules]")
             rules_used = [_sum_filtered[(i + turn_idx - 1) % len(_sum_filtered)]["name"] for i in range(G)]
             print(f"  [OPT TURN] Rules assigned: {rules_used}")
         elif turn_idx > 0:
@@ -1409,7 +1489,7 @@ def _run_group_episodes(
                         outcome = "CORRECT (no timing)"
 
                 if fb.get("type") == "OPT":
-                    print(f"    traj {i}: rule='{fb['rule']}' bottleneck={fb['bottleneck']} → {outcome}", flush=True)
+                    print(f"    traj {i}: rule='{fb['rule']}' bottleneck={fb['bottleneck']} op_type={fb.get('op_type','?')} → {outcome}", flush=True)
                 elif fb.get("type") == "NORMAL":
                     rag_str = f" RAG={fb['rag']}" if fb.get('rag') else ""
                     prof_str = " +profiler" if fb.get('profiler') else ""
