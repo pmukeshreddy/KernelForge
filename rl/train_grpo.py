@@ -1223,36 +1223,68 @@ def _run_group_episodes(
                 # technique each turn instead of the same one every time.
                 # Rules are filtered by profiler bottleneck type.
                 rule = _filtered_rules[(i + turn_idx - 1) % len(_filtered_rules)]
-                traj_turn_feedback_source[i] = {
-                    "type": "OPT",
-                    "rule": rule["name"],
-                    "bottleneck": _bottleneck,
-                    "op_type": _op_type,
-                    "profiler": bool(traj_prof),
-                }
-                rule_str = (
-                    f"\n\n--- Optimization Technique to Apply ---\n"
-                    f"**{rule['name']}**\n{rule['rule']}\n"
-                    f"---\n"
-                    f"Apply this technique to the kernel above. "
-                    f"Keep the kernel correct while making it faster.\n"
-                    f"IMPORTANT: If this technique does not naturally fit your kernel "
-                    f"(e.g., no inner loops to unroll, no data reuse for shared memory), "
-                    f"skip it and instead do minor tuning: adjust block/grid sizes, "
-                    f"add __ldg() for read-only data, or try #pragma unroll on any existing loops."
-                )
+
+                # Try LLM optimization hint first (targeted to actual code)
+                _opt_llm_hint = None
+                if _llm_feedback is not None and _llm_feedback.available:
+                    _opt_speedup = 0.0
+                    if rt and bt and rt > 0:
+                        _opt_speedup = bt / rt
+                    _opt_code = ws_best_code or ""
+                    _opt_llm_hint = _llm_feedback.suggest_optimization(
+                        task=prompt_text,
+                        code=_opt_code,
+                        speedup=_opt_speedup,
+                        profiler_info=traj_prof or "",
+                    )
+                    if i == 0:
+                        print(f"  [LLM-OPT] traj=0 turn {turn_idx+1}: "
+                              f"{'got hint' if _opt_llm_hint else 'no response, using rules'}",
+                              flush=True)
+
+                if _opt_llm_hint:
+                    # Use LLM-generated optimization hint
+                    rule_str = _format_llm_hint(_opt_llm_hint, "optimization")
+                    traj_turn_feedback_source[i] = {
+                        "type": "OPT-LLM",
+                        "bottleneck": _bottleneck,
+                        "op_type": _op_type,
+                        "profiler": bool(traj_prof),
+                    }
+                else:
+                    # Fallback to hardcoded rules
+                    traj_turn_feedback_source[i] = {
+                        "type": "OPT",
+                        "rule": rule["name"],
+                        "bottleneck": _bottleneck,
+                        "op_type": _op_type,
+                        "profiler": bool(traj_prof),
+                    }
+                    rule_str = (
+                        f"\n\n--- Optimization Technique to Apply ---\n"
+                        f"**{rule['name']}**\n{rule['rule']}\n"
+                        f"---\n"
+                        f"Apply this technique to the kernel above. "
+                        f"Keep the kernel correct while making it faster.\n"
+                        f"IMPORTANT: If this technique does not naturally fit your kernel "
+                        f"(e.g., no inner loops to unroll, no data reuse for shared memory), "
+                        f"skip it and instead do minor tuning: adjust block/grid sizes, "
+                        f"add __ldg() for read-only data, or try #pragma unroll on any existing loops."
+                    )
+
                 feedback = (
                     f"Your previous answer was correct.\n{timing_str}{profiler_str}"
                     f"{delta_str}"
                     f"{rule_str}\n\n"
-                    "Apply the optimization technique above to improve speed. "
+                    "Apply the optimization above to improve speed. "
                     "Generate the complete improved code."
                 )
 
                 if i == 0:
+                    _hint_source = "LLM" if _opt_llm_hint else f"rule='{rule['name']}'"
                     print(f"  [OPT TURN] traj=0 turn {turn_idx+1}: "
                           f"best kernel from {ws_best_source} ({ws_best_speedup:.2f}x), "
-                          f"rule='{rule['name']}'"
+                          f"{_hint_source}"
                           f"{', delta: ' + delta_str.strip()[:200] if delta_str else ''}")
                     print(f"  [DEBUG] Feedback traj=0 →{turn_idx+1}:\n{feedback[:800]}...")
                 msgs.append({"role": "user", "content": feedback})
@@ -1286,13 +1318,14 @@ def _run_group_episodes(
                     _rag_sections = []
                     _llm_hint = None
                     _eval_t = traj_evals[i][t]
-                    if (_eval_t is None or not _eval_t.get("correct", False)) and random.random() < rag_prob:
+                    _is_error = (_eval_t is None or not _eval_t.get("correct", False))
+                    if _is_error:
                         # Extract code for diagnosis
                         _code = ""
                         if t < len(traj_responses[i]) and traj_responses[i][t]:
                             _code = _extract_python_block(traj_responses[i][t])
 
-                        # Try LLM feedback first (targeted diagnosis)
+                        # LLM feedback ALWAYS fires for errors (not gated by rag_prob)
                         if _llm_feedback is not None and _llm_feedback.available:
                             _error_msg = ""
                             if _eval_t is None:
@@ -1322,7 +1355,8 @@ def _run_group_episodes(
                                       flush=True)
 
                         # Fallback to BM25 RAG if LLM unavailable or returned nothing
-                        if not _rag_hint:
+                        # RAG is gated by rag_prob dropout (decays over training)
+                        if not _rag_hint and random.random() < rag_prob:
                             _rag_query = prompt_text
                             if _eval_t and _eval_t.get("compiler_error"):
                                 _rag_query += "\n" + _eval_t["compiler_error"]
