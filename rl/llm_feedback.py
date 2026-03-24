@@ -30,74 +30,54 @@ except ImportError:
 # ── Prompt templates ─────────────────────────────────────────────────────────
 
 _DIAGNOSE_SYSTEM = """\
-CUDA kernel debugger. Reply with ONLY 1-2 sentences. No preamble. No code blocks. No bullet lists.
+You are a CUDA kernel debugging expert. You will be shown a broken CUDA kernel \
+and the error it produced. Your job is to diagnose the root cause concisely.
 
-WRONG: "Let me analyze the code. Looking at line 54..."
-WRONG: "```cpp\nfloat x = ...```"
-RIGHT: "The variable `g_idx` overflows shared memory bounds because group*1024+tid exceeds 1024 when group>0."
-RIGHT: "`gelu_kernel` is called but never defined — only a `__device__ gelu` function exists."
-
-Name the buggy variable or expression and say why it's wrong. Nothing else."""
+Rules:
+- Identify the SPECIFIC bug (wrong indexing, missing sync, type mismatch, etc.)
+- Be concrete: reference line numbers or variable names from the code
+- Keep your response to 2-4 sentences
+- Do NOT provide corrected code — only diagnose the problem
+- If the error is a compiler error, focus on the C++ syntax/API issue
+- If the error is a correctness error, focus on the algorithmic/indexing bug"""
 
 _DIAGNOSE_USER = """\
-CUDA kernel for: {task}
+Task: Implement a CUDA kernel for the following PyTorch operation:
+{task}
 
+Generated kernel code:
+```python
 {code}
+```
 
-Error: {error}"""
+Error:
+{error}
+
+Diagnose the root cause of this error in 2-4 sentences."""
 
 _OPTIMIZE_SYSTEM = """\
-CUDA performance expert. Reply with ONLY 1-2 sentences. No preamble. No code blocks. No bullet lists.
+You are a CUDA performance optimization expert. You will be shown a correct but \
+potentially slow CUDA kernel. Your job is to identify its #1 performance bottleneck \
+and suggest ONE specific optimization.
 
-WRONG: "Let me analyze the memory access pattern..."
-RIGHT: "The inner loop in `conv_kernel` reads `weight[oc*IC + ic]` with stride IC, causing uncoalesced global memory access — tiling into shared memory would fix this."
-
-Name the bottleneck variable/loop and say what optimization to apply. Nothing else."""
+Rules:
+- Analyze the actual code structure (memory access pattern, thread utilization, etc.)
+- Identify the SINGLE most impactful bottleneck
+- Suggest ONE concrete optimization technique with a brief explanation
+- Keep your response to 3-5 sentences
+- Do NOT rewrite the kernel — just describe what to change and why
+- Reference specific parts of the code (variable names, loop structures, etc.)"""
 
 _OPTIMIZE_USER = """\
-CUDA kernel ({speedup:.2f}x vs PyTorch) for: {task}
+Task: Implement a CUDA kernel for the following PyTorch operation:
+{task}
 
+Current kernel code (correct, {speedup:.2f}x vs PyTorch):
+```python
 {code}
+```
 {profiler_section}
-What is the #1 bottleneck?"""
-
-
-import re as _re
-
-def _strip_preamble(text: str) -> str:
-    """Aggressively strip LLM filler to extract just the diagnosis."""
-    # Remove think tags (Qwen reasoning model artifact)
-    text = _re.sub(r'</?think>', '', text)
-    # Remove code blocks
-    text = _re.sub(r'```\w*\n?.*?```', '', text, flags=_re.DOTALL)
-    # Remove bold markers
-    text = _re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
-
-    # Split into sentences and skip filler
-    sentences = _re.split(r'(?<=[.!])\s+', text)
-    useful = []
-    found_anchor = False
-    for sent in sentences:
-        if not found_anchor:
-            # Skip filler / refusal sentences
-            if _re.match(r'^(?:The user|Let me|Looking at|I need to|Here\'s|I can see|'
-                         r'Looking more|More critically|Let me look|Now let me|'
-                         r'First|However|The error message shown|Since the|'
-                         r'The provided code|I should inform|I cannot|'
-                         r'This is a|Looking at the code)', sent, _re.IGNORECASE):
-                continue
-            # Found a non-filler sentence
-            found_anchor = True
-        useful.append(sent)
-
-    result = ' '.join(useful) if useful else text
-    # Collapse whitespace
-    result = ' '.join(result.split())
-    # If result is a refusal ("I cannot", "impossible", "incomplete"), return empty
-    if _re.search(r'(?:cannot|impossible|incomplete|truncated|not able to)', result, _re.IGNORECASE):
-        if '`' not in result:  # no backtick-quoted identifier = no real diagnosis
-            return ""
-    return result.strip()
+Identify the #1 performance bottleneck and suggest ONE specific optimization."""
 
 
 class LLMFeedback:
@@ -166,8 +146,7 @@ class LLMFeedback:
                         temperature=0.3,  # low temp for consistent diagnosis
                         top_p=0.9,
                     )
-                    raw = resp["choices"][0]["message"]["content"].strip()
-                    result[0] = _strip_preamble(raw)
+                result[0] = resp["choices"][0]["message"]["content"].strip()
             except Exception as e:
                 error[0] = str(e)
 
@@ -204,19 +183,10 @@ class LLMFeedback:
             code=code_trunc,
             error=error_trunc,
         )
-        print(f"[LLM Feedback DEBUG] === DIAGNOSE INPUT ===", flush=True)
-        print(f"[LLM Feedback DEBUG] System prompt ({len(_DIAGNOSE_SYSTEM)} chars):\n{_DIAGNOSE_SYSTEM}", flush=True)
-        print(f"[LLM Feedback DEBUG] User msg ({len(user_msg)} chars):\n{user_msg[:1500]}{'...(truncated)' if len(user_msg) > 1500 else ''}", flush=True)
-        print(f"[LLM Feedback DEBUG] === END INPUT ===", flush=True)
         t0 = time.time()
-        result = self._call(_DIAGNOSE_SYSTEM, user_msg, max_tokens=150)
-        elapsed = time.time() - t0
+        result = self._call(_DIAGNOSE_SYSTEM, user_msg, max_tokens=200)
         if result:
-            print(f"[LLM Feedback DEBUG] === DIAGNOSE OUTPUT ({elapsed:.1f}s) ===", flush=True)
-            print(f"[LLM Feedback DEBUG] Full response ({len(result)} chars):\n{result}", flush=True)
-            print(f"[LLM Feedback DEBUG] === END OUTPUT ===", flush=True)
-        else:
-            print(f"[LLM Feedback DEBUG] No response after {elapsed:.1f}s", flush=True)
+            print(f"[LLM Feedback] Diagnosis ({time.time()-t0:.1f}s): {result[:150]}...")
         return result
 
     def suggest_optimization(self, task: str, code: str,
@@ -245,19 +215,10 @@ class LLMFeedback:
             speedup=speedup,
             profiler_section=profiler_section,
         )
-        print(f"[LLM Feedback DEBUG] === OPTIMIZE INPUT ===", flush=True)
-        print(f"[LLM Feedback DEBUG] System prompt ({len(_OPTIMIZE_SYSTEM)} chars):\n{_OPTIMIZE_SYSTEM}", flush=True)
-        print(f"[LLM Feedback DEBUG] User msg ({len(user_msg)} chars):\n{user_msg[:1500]}{'...(truncated)' if len(user_msg) > 1500 else ''}", flush=True)
-        print(f"[LLM Feedback DEBUG] === END INPUT ===", flush=True)
         t0 = time.time()
-        result = self._call(_OPTIMIZE_SYSTEM, user_msg, max_tokens=150)
-        elapsed = time.time() - t0
+        result = self._call(_OPTIMIZE_SYSTEM, user_msg, max_tokens=250)
         if result:
-            print(f"[LLM Feedback DEBUG] === OPTIMIZE OUTPUT ({elapsed:.1f}s) ===", flush=True)
-            print(f"[LLM Feedback DEBUG] Full response ({len(result)} chars):\n{result}", flush=True)
-            print(f"[LLM Feedback DEBUG] === END OUTPUT ===", flush=True)
-        else:
-            print(f"[LLM Feedback DEBUG] No response after {elapsed:.1f}s", flush=True)
+            print(f"[LLM Feedback] Optimization hint ({time.time()-t0:.1f}s): {result[:150]}...")
         return result
 
     def diagnose_batch(self, items: list[dict], max_workers: int = 2) -> list[str]:

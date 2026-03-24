@@ -22,25 +22,6 @@ fi
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$REPO_DIR/rl"
 
-# ── LLM Feedback Setup: install llama-cpp-python + download GGUF model ──
-LLM_MODEL="$REPO_DIR/models/Qwen3.5-9B.Q4_K_M.gguf"
-
-if ! python -c "import llama_cpp" 2>/dev/null; then
-  echo "[Setup] Installing llama-cpp-python (CPU-only)..."
-  pip install llama-cpp-python 2>&1 | tail -1
-fi
-
-if [ ! -f "$LLM_MODEL" ]; then
-  echo "[Setup] Downloading Qwen3.5-9B Claude-Opus-Reasoning GGUF for LLM feedback..."
-  mkdir -p "$REPO_DIR/models"
-  wget -q --show-progress -O "$LLM_MODEL" \
-    "https://huggingface.co/Jackrong/Qwen3.5-9B-Claude-4.6-Opus-Reasoning-Distilled-v2-GGUF/resolve/main/Qwen3.5-9B.Q4_K_M.gguf"
-  if [ $? -ne 0 ]; then
-    echo "[Setup] WARNING: Failed to download GGUF model. LLM feedback will be disabled."
-    LLM_MODEL=""
-  fi
-fi
-
 # ── Mode: "test" for quick sanity check, "full" for real training ──
 MODE="${1:-test}"
 
@@ -63,7 +44,7 @@ if [ "$MODE" = "test" ]; then
     --sglang_python ~/sglang_env/bin/python \
     --sglang_port 30000 \
     --sglang_tp 1 \
-    ${LLM_MODEL:+--llm_feedback_model "$LLM_MODEL"}
+    --llm_feedback_model ../models/Qwen3.5-9B.Q4_K_M.gguf
 else
   echo "=== FULL TRAINING RUN ==="
   python train_grpo.py \
@@ -81,6 +62,6 @@ else
     --sglang_python ~/sglang_env/bin/python \
     --sglang_port 30000 \
     --sglang_tp 1 \
-    ${LLM_MODEL:+--llm_feedback_model "$LLM_MODEL"}
+    --llm_feedback_model ../models/Qwen3.5-9B.Q4_K_M.gguf
 fi
 

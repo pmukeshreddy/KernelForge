@@ -130,8 +130,8 @@ class GRPOConfig:
     # Discrete milestone rewards (CUDA Agent style + graduated negatives)
     # -1 = no code/compile fail, -0.5 = wrong output, 1 = correct, 2 = beats eager, 3 = beats torch.compile
     reward_no_code: float = -1.0        # no ```python block found at all
-    reward_compile_fail: float = -1.0   # code found but fails to compile
-    reward_wrong_output: float = -1.0   # compiles but wrong output
+    reward_compile_fail: float = -0.7   # code found but fails to compile
+    reward_wrong_output: float = -0.5   # compiles but wrong output (stepping stone)
 
     # Entropy bonus — prevents entropy collapse (critical for coding tasks)
     # A small positive coefficient adds H(π) to the objective, keeping exploration alive.
@@ -590,8 +590,7 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
                          best_turn: int | None = None,
                          profiler_feedback: str | None = None,
                          group_error_summary: str | None = None,
-                         rag_hint: str | None = None,
-                         opt_hint: str | None = None) -> str:
+                         rag_hint: str | None = None) -> str:
     """
     Feedback: raw execution results + high water mark for optimization context.
 
@@ -665,48 +664,26 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
 
     speedup_val = (bt / rt) if (rt and bt and rt > 0) else 0.0
 
-    # LLM optimization hint (if available) replaces generic advice
-    opt_suffix = f"\n\n{opt_hint}" if opt_hint else ""
-
     if speedup_val >= 1.0:
         # OPT TURN: already faster than PyTorch — safe micro-optimizations only
-        if opt_hint:
-            advice = (
-                "IMPORTANT: Your kernel is correct AND already faster than PyTorch.\n"
-                "Do NOT rewrite it from scratch. Make small, incremental changes only."
-                + opt_suffix
-            )
-        else:
-            advice = (
-                "IMPORTANT: Your kernel is correct AND already faster than PyTorch.\n"
-                "Do NOT rewrite it from scratch. Make small, incremental changes only.\n"
-                "Safe optimizations: adjust block/grid sizes, add #pragma unroll, "
-                "use float4/int4 vectorized loads, reduce redundant computation.\n"
-                "Do NOT attempt shared memory tiling or major algorithmic rewrites — "
-                "those often break correctness."
-            )
         return (
             f"Your previous answer was correct.\n{timing_str}{profiler_str}\n\n"
-            + advice + "\nGenerate the complete improved code."
+            "IMPORTANT: Your kernel is correct AND already faster than PyTorch.\n"
+            "Do NOT rewrite it from scratch. Make small, incremental changes only.\n"
+            "Safe optimizations: adjust block/grid sizes, add #pragma unroll, "
+            "use float4/int4 vectorized loads, reduce redundant computation.\n"
+            "Do NOT attempt shared memory tiling or major algorithmic rewrites — "
+            "those often break correctness. Generate the complete improved code."
         )
     else:
         # REWRITE TURN: slower than PyTorch — allow algorithmic restructuring
-        if opt_hint:
-            advice = (
-                "Your kernel is correct but SLOWER than PyTorch. "
-                "You may restructure the algorithm to improve performance."
-                + opt_suffix
-            )
-        else:
-            advice = (
-                "Your kernel is correct but SLOWER than PyTorch. "
-                "You may restructure the algorithm to improve performance.\n"
-                "Focus on: reducing total work, improving memory access patterns, "
-                "increasing parallelism, and ensuring coalesced memory access."
-            )
         return (
             f"Your previous answer was correct.\n{timing_str}{profiler_str}\n\n"
-            + advice + "\nKeep the same function signature and output shape. "
+            "Your kernel is correct but SLOWER than PyTorch. "
+            "You may restructure the algorithm to improve performance.\n"
+            "Focus on: reducing total work, improving memory access patterns, "
+            "increasing parallelism, and ensuring coalesced memory access.\n"
+            "Keep the same function signature and output shape. "
             "Generate the complete improved code."
         )
 
@@ -1337,39 +1314,13 @@ def _run_group_episodes(
                             elif i == 0:
                                 print(f"  [RAG] traj=0 turn {t+1}→{turn_idx+1}: skipped (correct={_eval_t.get('correct', False) if _eval_t else None}, rag_prob={rag_prob:.2f})", flush=True)
 
-                    # LLM optimization hint for correct-but-improvable kernels
-                    _opt_hint = None
-                    if (_eval_t is not None and _eval_t.get("correct", False)
-                            and _llm_feedback is not None and _llm_feedback.available):
-                        _speedup = 0.0
-                        _rt = _eval_t.get("runtime_ms")
-                        _bt = _eval_t.get("baseline_runtime_ms")
-                        if _rt and _bt and _rt > 0:
-                            _speedup = _bt / _rt
-                        _opt_code = ""
-                        if t < len(traj_responses[i]) and traj_responses[i][t]:
-                            _opt_code = _extract_python_block(traj_responses[i][t])
-                        _opt_hint = _llm_feedback.suggest_optimization(
-                            task=prompt_text,
-                            code=_opt_code or "(no code extracted)",
-                            speedup=_speedup,
-                            profiler_info=_eval_t.get("profiler_feedback") or "",
-                        )
-                        if _opt_hint:
-                            _opt_hint = _format_llm_hint(_opt_hint, "optimization")
-                        if i == 0:
-                            print(f"  [LLM-OPT] traj=0 turn {t+1}→{turn_idx+1}: "
-                                  f"{'got optimization hint' if _opt_hint else 'no response'}",
-                                  flush=True)
-
                     _has_profiler = bool(_eval_t and _eval_t.get("profiler_feedback"))
                     _rag_titles = [_rs.title for _rs in _rag_sections] if _rag_sections else []
                     traj_turn_feedback_source[i] = {
-                        "type": "LLM" if (_llm_hint or _opt_hint) else "NORMAL",
+                        "type": "LLM" if _llm_hint else "NORMAL",
                         "profiler": _has_profiler,
                         "rag": _rag_titles,
                         "llm_diagnosis": bool(_llm_hint),
-                        "llm_optimization": bool(_opt_hint),
                         "correct_prev": bool(_eval_t and _eval_t.get("correct")),
                     }
                     feedback = _build_turn_feedback(
@@ -1378,10 +1329,9 @@ def _run_group_episodes(
                         profiler_feedback=_eval_t.get("profiler_feedback") if _eval_t else None,
                         group_error_summary=group_error_summary,
                         rag_hint=_rag_hint,
-                        opt_hint=_opt_hint,
                     )
                     if i == 0:
-                        _fb_has_llm = "Bug Diagnosis" in feedback or "Optimization Hint" in feedback
+                        _fb_has_llm = "Bug Diagnosis" in feedback
                         _fb_has_rag = "--- Relevant CUDA Pattern ---" in feedback
                         _fb_has_group = "ALL" in feedback and "FAILED" in feedback
                         _fb_has_stuck = "same type of error" in feedback
@@ -1605,7 +1555,7 @@ def _run_group_episodes(
             elif eval_res is None or not eval_res.get("compiles", False):
                 r = config.reward_compile_fail * penalty_scale
             elif not eval_res["correct"]:
-                r = config.reward_wrong_output * penalty_scale
+                r = calculate_wrong_reward(eval_res) * penalty_scale
             else:
                 # Use opt reward during optimization turns for speed gradient
                 if use_optimization_turn and ws_speedup_at_opt_start and ws_speedup_at_opt_start > 0:
