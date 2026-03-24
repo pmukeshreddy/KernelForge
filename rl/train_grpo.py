@@ -211,6 +211,7 @@ Reflection: <2-3 sentences covering: (1) your parallelization strategy and block
 OPTIMIZATION_RULES = [
     {
         "name": "Vectorized Memory Access (float4)",
+        "bottleneck": "memory",
         "rule": (
             "Load/store 4 floats at once using float4 for 128-bit memory transactions (4x fewer transactions).\n"
             "Replace:\n"
@@ -222,11 +223,14 @@ OPTIMIZATION_RULES = [
             "  out4.x = f(in4.x); out4.y = f(in4.y); out4.z = f(in4.z); out4.w = f(in4.w);\n"
             "  reinterpret_cast<float4*>(output)[idx] = out4;\n"
             "Adjust grid size: blocks = (n/4 + threads - 1) / threads. Handle remainder elements separately if n % 4 != 0.\n"
-            "IMPORTANT: data pointer must be 16-byte aligned (torch tensors are by default). n should be divisible by 4."
+            "IMPORTANT: only use float4 on the CONTIGUOUS dimension (last dim). The pointer must be 16-byte aligned.\n"
+            "Check alignment: if (n % 4 != 0) fall back to scalar loads for remainder. "
+            "Do NOT cast strided pointers (e.g. input + b*stride) to float4* — this causes misaligned address crashes."
         ),
     },
     {
         "name": "Grid-Stride Loop",
+        "bottleneck": "both",
         "rule": (
             "Process multiple elements per thread with a grid-stride loop. Handles any size, improves occupancy.\n"
             "Replace:\n"
@@ -241,6 +245,7 @@ OPTIMIZATION_RULES = [
     },
     {
         "name": "Warp-Level Reduction",
+        "bottleneck": "compute",
         "rule": (
             "For reductions (sum, max, min), use warp shuffle instead of shared memory — no sync needed.\n"
             "  float val = thread_value;\n"
@@ -252,8 +257,11 @@ OPTIMIZATION_RULES = [
     },
     {
         "name": "Shared Memory Tiling",
+        "bottleneck": "memory",
         "rule": (
             "For operations that reuse data (matmul, conv, stencil), tile data into shared memory.\n"
+            "IMPORTANT: __shared__ array sizes MUST be compile-time constants (not runtime variables).\n"
+            "  #define TILE_SIZE 32\n"
             "  __shared__ float tile[TILE_SIZE][TILE_SIZE];\n"
             "  // Step 1: Load tile from global memory (coalesced access)\n"
             "  tile[ty][tx] = input[row * N + col];\n"
@@ -261,11 +269,13 @@ OPTIMIZATION_RULES = [
             "  // Step 2: Compute from shared memory (fast, no global memory latency)\n"
             "  for (int k = 0; k < TILE_SIZE; k++) sum += tile[ty][k] * ...;\n"
             "  __syncthreads();\n"
+            "For dynamic sizes use: extern __shared__ float tile[]; and pass size as 3rd kernel launch arg.\n"
             "Typical tile sizes: 16x16 or 32x32. Shared memory is ~100x faster than global."
         ),
     },
     {
         "name": "Loop Unrolling",
+        "bottleneck": "both",
         "rule": (
             "Unroll inner loops so the compiler can pipeline instructions and use registers efficiently.\n"
             "  #pragma unroll\n"
@@ -279,6 +289,7 @@ OPTIMIZATION_RULES = [
     },
     {
         "name": "Kernel Fusion",
+        "bottleneck": "memory",
         "rule": (
             "Combine multiple element-wise operations into a single kernel to eliminate intermediate memory traffic.\n"
             "Instead of separate kernels:\n"
@@ -291,6 +302,7 @@ OPTIMIZATION_RULES = [
     },
     {
         "name": "Read-Only Cache (__ldg)",
+        "bottleneck": "memory",
         "rule": (
             "For read-only input data, use __ldg() to use the texture/L2 cache path.\n"
             "Replace:\n"
@@ -303,6 +315,7 @@ OPTIMIZATION_RULES = [
     },
     {
         "name": "Occupancy Tuning",
+        "bottleneck": "both",
         "rule": (
             "Increase occupancy (active warps per SM) to better hide memory latency.\n"
             "- Try 128 threads/block instead of 256 — more blocks fit per SM.\n"
@@ -315,6 +328,7 @@ OPTIMIZATION_RULES = [
     },
     {
         "name": "Coalesced Memory Access (Loop Reordering)",
+        "bottleneck": "memory",
         "rule": (
             "Ensure consecutive threads access consecutive memory addresses (coalesced access).\n"
             "Bad (strided access — threads jump across memory):\n"
@@ -330,6 +344,31 @@ OPTIMIZATION_RULES = [
         ),
     },
 ]
+
+
+def _get_bottleneck_type(profiler_feedback: str) -> str:
+    """Extract bottleneck type from profiler feedback text.
+    Returns 'memory', 'compute', or 'unknown'."""
+    if not profiler_feedback:
+        return "unknown"
+    text = profiler_feedback.upper()
+    if "MEMORY-BOUND" in text or "MEMORY BOUND" in text:
+        return "memory"
+    if "COMPUTE-BOUND" in text or "COMPUTE BOUND" in text:
+        return "compute"
+    return "unknown"
+
+
+def _filter_rules_by_bottleneck(bottleneck: str) -> list:
+    """Return rules matching the profiler bottleneck.
+    'both' rules always included. Falls back to all rules if unknown."""
+    if bottleneck == "unknown":
+        return OPTIMIZATION_RULES
+    matching = [r for r in OPTIMIZATION_RULES
+                if r["bottleneck"] == bottleneck or r["bottleneck"] == "both"]
+    if len(matching) < 2:
+        return OPTIMIZATION_RULES  # fallback if too few
+    return matching
 
 
 
@@ -890,8 +929,13 @@ def _run_group_episodes(
                 # (Bug 6), stuck detection (Bug 3), actual error messages (Bug 4).
                 delta_str = ""
                 prev_opt_eval = traj_evals[i][turn_idx - 1] if turn_idx > 1 and len(traj_evals[i]) >= turn_idx else None
+                # Filter OPT rules by profiler bottleneck — don't assign
+                # compute techniques to memory-bound kernels or vice versa.
+                _bottleneck = _get_bottleneck_type(traj_prof or "")
+                _filtered_rules = _filter_rules_by_bottleneck(_bottleneck)
+
                 if prev_opt_eval is not None:
-                    prev_rule = OPTIMIZATION_RULES[(i + turn_idx - 2) % len(OPTIMIZATION_RULES)]
+                    prev_rule = _filtered_rules[(i + turn_idx - 2) % len(_filtered_rules)]
                     technique_ref = f"'{prev_rule['name']}'"
 
                     # Bug 3: stuck detection — same error class 2 turns in a row
@@ -969,7 +1013,8 @@ def _run_group_episodes(
                 # Assign a different optimization rule — rotate by BOTH
                 # trajectory index AND turn so each traj tries a different
                 # technique each turn instead of the same one every time.
-                rule = OPTIMIZATION_RULES[(i + turn_idx - 1) % len(OPTIMIZATION_RULES)]
+                # Rules are filtered by profiler bottleneck type.
+                rule = _filtered_rules[(i + turn_idx - 1) % len(_filtered_rules)]
                 rule_str = (
                     f"\n\n--- Optimization Technique to Apply ---\n"
                     f"**{rule['name']}**\n{rule['rule']}\n"
@@ -1078,9 +1123,14 @@ def _run_group_episodes(
 
         # Optimization turn summary
         if use_optimization_turn:
+            # Determine bottleneck from best kernel's profiler for the summary
+            _sum_prof = ws_best_eval.get("profiler_feedback", "") if ws_best_eval else ""
+            _sum_bottleneck = _get_bottleneck_type(_sum_prof)
+            _sum_filtered = _filter_rules_by_bottleneck(_sum_bottleneck)
             print(f"  [OPT TURN] Turn {turn_idx+1}: ALL {G} trajectories optimizing "
-                  f"best kernel from {ws_best_source} ({ws_best_speedup:.2f}x)")
-            rules_used = [OPTIMIZATION_RULES[(i + turn_idx - 1) % len(OPTIMIZATION_RULES)]["name"] for i in range(G)]
+                  f"best kernel from {ws_best_source} ({ws_best_speedup:.2f}x) "
+                  f"[bottleneck={_sum_bottleneck}, {len(_sum_filtered)}/{len(OPTIMIZATION_RULES)} rules]")
+            rules_used = [_sum_filtered[(i + turn_idx - 1) % len(_sum_filtered)]["name"] for i in range(G)]
             print(f"  [OPT TURN] Rules assigned: {rules_used}")
         elif turn_idx > 0:
             print(f"  [TURN {turn_idx+1}] No correct kernel yet — normal error-feedback path")

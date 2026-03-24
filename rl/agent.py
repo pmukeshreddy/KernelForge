@@ -239,6 +239,16 @@ def _fix_cuda_api(cuda_code: str) -> str:
         cuda_code,
     )
 
+    # Bug 14 — __shared__ VLA: "__shared__ float arr[ndim]" where ndim is runtime.
+    # CUDA __shared__ has static storage duration → no VLAs allowed.
+    # Fix: convert to extern __shared__ with dynamic shared memory.
+    # Only matches when the size variable is NOT all-caps (likely a runtime var, not a #define).
+    cuda_code = re.sub(
+        r'__shared__\s+(float|double|int|int32_t|int64_t)\s+(\w+)\[([a-z_]\w*)\]\s*;',
+        r'extern __shared__ \1 \2[];  // dynamic: pass \3*sizeof(\1) as 3rd kernel launch arg',
+        cuda_code,
+    )
+
     # Bug 12 — non-const pointer assigned from .sizes()/.strides().data().
     # These return const int64_t*, not int64_t*. Add const qualifier.
     cuda_code = re.sub(

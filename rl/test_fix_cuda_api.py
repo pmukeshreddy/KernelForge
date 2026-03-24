@@ -72,6 +72,22 @@ def test_bug12_const_pointer():
     print("✅ Bug 12: const pointer from sizes()/strides()")
 
 
+def test_bug14_shared_vla():
+    """Bug 14: __shared__ float arr[ndim] → extern __shared__ (dynamic)"""
+    code = "__shared__ float tile[block_size];"
+    fixed = _fix_cuda_api(code)
+    assert "extern __shared__ float tile[]" in fixed, f"Expected extern __shared__, got: {fixed}"
+    # Compile-time constant (ALL_CAPS) should NOT be changed
+    code2 = "__shared__ float tile[BLOCK_SIZE];"
+    fixed2 = _fix_cuda_api(code2)
+    assert "__shared__ float tile[BLOCK_SIZE]" in fixed2, f"Constant should be preserved, got: {fixed2}"
+    # double type
+    code3 = "__shared__ double sdata[num_threads];"
+    fixed3 = _fix_cuda_api(code3)
+    assert "extern __shared__ double sdata[]" in fixed3, f"Expected extern __shared__ double, got: {fixed3}"
+    print("✅ Bug 14: __shared__ VLA → extern __shared__")
+
+
 def test_regression_existing_patterns():
     """Ensure existing patterns still work."""
     # Bug 3: .ptr<T> → .data_ptr<T>
@@ -100,6 +116,7 @@ if __name__ == "__main__":
         test_bug10_no_apply_on_subscript,
         test_bug11_vla_to_vector,
         test_bug12_const_pointer,
+        test_bug14_shared_vla,
         test_regression_existing_patterns,
     ]
     passed = 0
