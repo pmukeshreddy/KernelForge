@@ -56,7 +56,10 @@ def _fix_cuda_api(cuda_code: str) -> str:
                 cuda_code,
             )
 
-    # (Removed: std::max/min/abs → fmaxf/fminf/fabsf — model should learn through RL)
+    # std:: math functions are not available in device code
+    cuda_code = re.sub(r'std::(max|min|abs|fabs)\s*\(', lambda m: {
+        'max': 'fmaxf(', 'min': 'fminf(', 'abs': 'fabsf(', 'fabs': 'fabsf('
+    }[m.group(1)], cuda_code)
 
     # C++17 structured bindings (auto [a, b, c] = x.sizes()) not supported by nvcc.
     # Rewrite to explicit indexed access.
@@ -128,7 +131,9 @@ def _fix_cuda_api(cuda_code: str) -> str:
     # Bug 3 — .ptr<T>() is not a PyTorch C++ API method; correct is .data_ptr<T>()
     cuda_code = re.sub(r'\.ptr\s*<', '.data_ptr<', cuda_code)
 
-    # (Removed: .type() → .scalar_type() — model should learn through RL)
+    # Bug 4 — tensor.type() returns DeprecatedTypeProperties, not ScalarType.
+    # AT_DISPATCH_FLOATING_TYPES and similar macros need .scalar_type().
+    cuda_code = re.sub(r'\b(\w+)\.type\(\)', r'\1.scalar_type()', cuda_code)
 
     # __host__ or __device__ on torch::Tensor binding functions is invalid.
     # The binding function must be a plain host function callable from Python.
@@ -225,8 +230,35 @@ def _fix_cuda_api(cuda_code: str) -> str:
         cuda_code,
     )
 
-    # (Removed: Bug 11 VLA, Bug 14 __shared__ VLA, Bug 15 __fminf/__fmaxf,
-    #  Bug 16 __clamp — model should learn these through RL error feedback)
+    # Bug 11 — VLA int64_t arr[ndim] → std::vector<int64_t> arr(ndim).
+    # C-style VLAs don't implicitly convert to c10::ArrayRef<int64_t> (needed by
+    # .reshape(), .view(), etc.). std::vector does via implicit conversion.
+    cuda_code = re.sub(
+        r'int64_t\s+(\w+)\[(\w+)\]\s*;',
+        r'std::vector<int64_t> \1(\2);',
+        cuda_code,
+    )
+
+    # Bug 14 — __shared__ VLA: "__shared__ float arr[ndim]" where ndim is runtime.
+    # CUDA __shared__ has static storage duration → no VLAs allowed.
+    # Fix: convert to extern __shared__ with dynamic shared memory.
+    # Only matches when the size variable is NOT all-caps (likely a runtime var, not a #define).
+    cuda_code = re.sub(
+        r'__shared__\s+(float|double|int|int32_t|int64_t)\s+(\w+)\[([a-z_]\w*)\]\s*;',
+        r'extern __shared__ \1 \2[];  // dynamic: pass \3*sizeof(\1) as 3rd kernel launch arg',
+        cuda_code,
+    )
+
+    # Bug 15 — __fminf/__fmaxf are host-only intrinsics; device code needs fminf/fmaxf.
+    cuda_code = re.sub(r'__fminf\b', 'fminf', cuda_code)
+    cuda_code = re.sub(r'__fmaxf\b', 'fmaxf', cuda_code)
+
+    # Bug 16 — __clamp doesn't exist in CUDA. Replace with fminf(fmaxf(...)).
+    cuda_code = re.sub(
+        r'__clamp\s*\(\s*([^,]+),\s*([^,]+),\s*([^)]+)\)',
+        r'fminf(fmaxf(\1, \2), \3)',
+        cuda_code,
+    )
 
     # Bug 12 — non-const pointer assigned from .sizes()/.strides().data().
     # These return const int64_t*, not int64_t*. Add const qualifier.

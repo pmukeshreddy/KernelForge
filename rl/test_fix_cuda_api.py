@@ -1,9 +1,5 @@
 """
 test_fix_cuda_api.py - Unit tests for _fix_cuda_api() auto-fix patterns.
-
-Only tests patterns we KEEP (silent bugs, type system, environment fixes).
-Removed patterns (std::max, .type(), VLA, __shared__ VLA, __fminf, __clamp)
-are now learned by the model through RL error feedback.
 """
 import sys
 import os
@@ -77,24 +73,39 @@ def test_regression_kept_patterns():
     print("✅ Kept patterns still work")
 
 
-def test_removed_patterns_no_longer_fixed():
-    """Verify removed auto-fixes are actually gone (model learns these via RL)."""
-    # std::max should NOT be auto-fixed anymore
+def test_restored_autofix_patterns():
+    """Verify all auto-fix patterns are active."""
+    # std::max → fmaxf
     code = "float r = std::max(a, b);"
     fixed = _fix_cuda_api(code)
-    assert "std::max" in fixed, f"std::max should NOT be auto-fixed, got: {fixed}"
+    assert "fmaxf" in fixed, f"std::max should be fixed to fmaxf, got: {fixed}"
 
-    # .type() should NOT be auto-fixed anymore
+    # .type() → .scalar_type()
     code2 = "auto t = input.type();"
     fixed2 = _fix_cuda_api(code2)
-    assert ".type()" in fixed2, f".type() should NOT be auto-fixed, got: {fixed2}"
+    assert ".scalar_type()" in fixed2, f".type() should be fixed to .scalar_type(), got: {fixed2}"
 
-    # __fminf should NOT be auto-fixed anymore
+    # __fminf → fminf
     code3 = "__fminf(a, b)"
     fixed3 = _fix_cuda_api(code3)
-    assert "__fminf" in fixed3, f"__fminf should NOT be auto-fixed, got: {fixed3}"
+    assert "fminf(a, b)" in fixed3 and "__fminf" not in fixed3, f"__fminf should be fixed, got: {fixed3}"
 
-    print("✅ Removed patterns are gone (model learns via RL)")
+    # __fmaxf → fmaxf
+    code4 = "__fmaxf(a, b)"
+    fixed4 = _fix_cuda_api(code4)
+    assert "fmaxf(a, b)" in fixed4 and "__fmaxf" not in fixed4, f"__fmaxf should be fixed, got: {fixed4}"
+
+    # VLA → std::vector
+    code5 = "int64_t arr[ndim];"
+    fixed5 = _fix_cuda_api(code5)
+    assert "std::vector<int64_t> arr(ndim);" in fixed5, f"VLA should be fixed, got: {fixed5}"
+
+    # __clamp → fminf(fmaxf(...))
+    code6 = "__clamp(x, lo, hi)"
+    fixed6 = _fix_cuda_api(code6)
+    assert "fminf(fmaxf(" in fixed6, f"__clamp should be fixed, got: {fixed6}"
+
+    print("✅ All auto-fix patterns are active")
 
 
 if __name__ == "__main__":
@@ -105,7 +116,7 @@ if __name__ == "__main__":
         test_bug10_no_apply_on_subscript,
         test_bug12_const_pointer,
         test_regression_kept_patterns,
-        test_removed_patterns_no_longer_fixed,
+        test_restored_autofix_patterns,
     ]
     passed = 0
     for t in tests:
