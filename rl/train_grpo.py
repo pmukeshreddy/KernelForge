@@ -130,8 +130,8 @@ class GRPOConfig:
     # Discrete milestone rewards (CUDA Agent style + graduated negatives)
     # -1 = no code/compile fail, -0.5 = wrong output, 1 = correct, 2 = beats eager, 3 = beats torch.compile
     reward_no_code: float = -1.0        # no ```python block found at all
-    reward_compile_fail: float = -0.7   # code found but fails to compile
-    reward_wrong_output: float = -0.5   # compiles but wrong output (stepping stone)
+    reward_compile_fail: float = -1.0   # code found but fails to compile
+    reward_wrong_output: float = -1.0   # compiles but wrong output
 
     # Entropy bonus — prevents entropy collapse (critical for coding tasks)
     # A small positive coefficient adds H(π) to the objective, keeping exploration alive.
@@ -1605,7 +1605,7 @@ def _run_group_episodes(
             elif eval_res is None or not eval_res.get("compiles", False):
                 r = config.reward_compile_fail * penalty_scale
             elif not eval_res["correct"]:
-                r = calculate_wrong_reward(eval_res) * penalty_scale
+                r = config.reward_wrong_output * penalty_scale
             else:
                 # Use opt reward during optimization turns for speed gradient
                 if use_optimization_turn and ws_speedup_at_opt_start and ws_speedup_at_opt_start > 0:
