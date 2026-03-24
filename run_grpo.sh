@@ -37,6 +37,7 @@ if [ "$MODE" = "test" ]; then
     --think_budget 2000 \
     --max_prompts 10 \
     --grpo_epochs 1 \
+    --no_curriculum \
     --wandb_project kernelforge-rl \
     --wandb_name grpo-speedup-reward-test \
     --use_sglang \

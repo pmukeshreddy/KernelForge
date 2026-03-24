@@ -2019,6 +2019,7 @@ if __name__ == "__main__":
     parser.add_argument("--sglang_port", type=int, default=30000)
     parser.add_argument("--sglang_tp", type=int, default=1, help="SGLang tensor parallel degree")
     parser.add_argument("--max_prompts", type=int, default=0, help="Cap dataset to N prompts (0=all). Use ~100 for a 2-3h run.")
+    parser.add_argument("--no_curriculum", action="store_true", help="Disable curriculum (random prompt order instead of easy-first)")
     args = parser.parse_args()
 
     cfg = GRPOConfig(
@@ -2042,6 +2043,7 @@ if __name__ == "__main__":
         sglang_port=args.sglang_port,
         sglang_tp=args.sglang_tp,
         max_prompts=args.max_prompts,
+        curriculum=not args.no_curriculum,
     )
     
     # Simple resume logic: swap base model for output_dir if resuming
