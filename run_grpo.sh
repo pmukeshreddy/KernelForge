@@ -31,10 +31,10 @@ if ! python -c "import llama_cpp" 2>/dev/null; then
 fi
 
 if [ ! -f "$LLM_MODEL" ]; then
-  echo "[Setup] Downloading Qwen3.5-9B GGUF for LLM feedback..."
+  echo "[Setup] Downloading Qwen3.5-9B Claude-Opus-Reasoning GGUF for LLM feedback..."
   mkdir -p "$REPO_DIR/models"
   wget -q --show-progress -O "$LLM_MODEL" \
-    "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf"
+    "https://huggingface.co/Jackrong/Qwen3.5-9B-Claude-4.6-Opus-Reasoning-Distilled-v2-GGUF/resolve/main/Qwen3.5-9B.Q4_K_M.gguf"
   if [ $? -ne 0 ]; then
     echo "[Setup] WARNING: Failed to download GGUF model. LLM feedback will be disabled."
     LLM_MODEL=""
