@@ -65,29 +65,26 @@ What is the #1 bottleneck?"""
 import re as _re
 
 def _strip_preamble(text: str) -> str:
-    """Aggressively strip LLM filler to extract just the diagnosis.
-
-    Strategy: the useful part usually starts with a backtick-quoted identifier,
-    'The bug', 'The variable', 'The kernel', or a specific technical term.
-    Everything before that is preamble. If no anchor found, strip known filler
-    sentence patterns.
-    """
+    """Aggressively strip LLM filler to extract just the diagnosis."""
+    # Remove think tags (Qwen reasoning model artifact)
+    text = _re.sub(r'</?think>', '', text)
     # Remove code blocks
     text = _re.sub(r'```\w*\n?.*?```', '', text, flags=_re.DOTALL)
     # Remove bold markers
     text = _re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
 
-    # Try to find the first useful sentence — one containing a backtick identifier
-    # or starting with a technical anchor
+    # Split into sentences and skip filler
     sentences = _re.split(r'(?<=[.!])\s+', text)
     useful = []
     found_anchor = False
     for sent in sentences:
         if not found_anchor:
-            # Skip filler sentences
+            # Skip filler / refusal sentences
             if _re.match(r'^(?:The user|Let me|Looking at|I need to|Here\'s|I can see|'
-                         r'Looking more|More critically|Let me look|'
-                         r'Now let me|First|However)', sent, _re.IGNORECASE):
+                         r'Looking more|More critically|Let me look|Now let me|'
+                         r'First|However|The error message shown|Since the|'
+                         r'The provided code|I should inform|I cannot|'
+                         r'This is a|Looking at the code)', sent, _re.IGNORECASE):
                 continue
             # Found a non-filler sentence
             found_anchor = True
@@ -96,6 +93,10 @@ def _strip_preamble(text: str) -> str:
     result = ' '.join(useful) if useful else text
     # Collapse whitespace
     result = ' '.join(result.split())
+    # If result is a refusal ("I cannot", "impossible", "incomplete"), return empty
+    if _re.search(r'(?:cannot|impossible|incomplete|truncated|not able to)', result, _re.IGNORECASE):
+        if '`' not in result:  # no backtick-quoted identifier = no real diagnosis
+            return ""
     return result.strip()
 
 
