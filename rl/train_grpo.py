@@ -1053,16 +1053,14 @@ def _run_group_episodes(
             msgs = list(base_messages)
 
             # ── Optimization-first turn strategy ─────────────────────────────
-            # Turn 2+: if a correct kernel exists, ALL trajectories get it
-            # with specific micro-optimization rules + profiler feedback.
-            # Any correct kernel (speedup > 0) is worth optimizing — a 0.99x
-            # kernel just needs float4 or grid-stride, not a rewrite.
-            # The old threshold (>= 1.0) blocked OPT turns for correct-but-slow
-            # kernels, leaving the model with vague "restructure" feedback.
+            # Turn 2+: if a correct kernel exists at reasonable speed, ALL
+            # trajectories get it with specific optimization rules + profiler.
+            # >= 0.5x: algorithm is sound, needs micro-optimization (float4, etc.)
+            # < 0.5x:  algorithm is fundamentally wrong, needs rewrite not tuning
             use_optimization_turn = (
                 turn_idx > 0
                 and ws_best_code is not None
-                and ws_best_speedup > 0
+                and ws_best_speedup >= 0.5
             )
             use_opt_rules = use_optimization_turn  # always True when opt turn is active
 
