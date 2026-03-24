@@ -22,12 +22,16 @@ Output EXACTLY ONE ```python code block containing the complete model_new.py. Th
    - Do NOT include PYBIND11_MODULE — load_inline generates bindings automatically via functions=[].
 3. Define ModelNew(torch.nn.Module) whose forward() calls the compiled extension.
    - Match the constructor signature of the reference Model exactly (same __init__ args).
-   - Store any learned parameters as nn.Parameter so they move to device correctly.
+   - Keep nn.Conv2d, nn.Linear, nn.BatchNorm2d, etc. from the reference model in __init__ \
+for parameter storage and initialization — they ensure weights match the reference.
+   - In forward(), do NOT call these modules directly (no self.conv(x)). \
+Instead, access their weights (self.conv.weight, self.linear.bias) and pass them to your CUDA kernels.
 
 # Constraints
 - Do NOT use cuBLAS, cuDNN, or CUTLASS.
 - Do NOT use `--use_fast_math` in extra_cuda_cflags.
-- Do NOT use torch.nn operations (except torch.nn.Parameter, container classes, and initializers).
+- Do NOT call torch.nn module forward methods in forward() — replace them with your CUDA kernels. \
+You may use nn modules in __init__ for parameter storage only.
 - Your answer must be a complete, self-contained model_new.py.
 """
 
