@@ -255,11 +255,28 @@ atomicAdd(sum_tensor.data_ptr<float>(), block_sum);
 
 ---
 
-## 7. Elementwise Operations
+## 7. Elementwise Operations (Activation, Loss, Pointwise)
+
+Covers: GELU, ReLU, SELU, Sigmoid, Tanh, Swish/SiLU, Mish, Softplus,
+smooth_l1_loss, mse_loss, l1_loss, huber_loss, and any per-element function.
 
 Simplest pattern — map one operation per element. Perfect for kernel fusion.
 
 ```cpp
+// Smooth L1 / Huber loss: elementwise then reduce to scalar
+__global__ void smooth_l1_kernel(const float* pred, const float* target,
+                                  float* per_elem, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float diff = pred[idx] - target[idx];
+        float abs_diff = fabsf(diff);
+        per_elem[idx] = (abs_diff < 1.0f) ? 0.5f * diff * diff : abs_diff - 0.5f;
+    }
+}
+// Host: auto per_elem = torch::empty_like(pred);
+//       smooth_l1_kernel<<<blocks, 256>>>(pred_ptr, tgt_ptr, per_elem_ptr, n);
+//       auto loss = per_elem.mean();  // reduce on PyTorch side (fastest)
+
 // GELU: y = 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
 __global__ void gelu_kernel(const float* input, float* output, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -270,6 +287,10 @@ __global__ void gelu_kernel(const float* input, float* output, int n) {
     }
 }
 ```
+
+**For loss functions that reduce to scalar**: compute per-element values in the kernel,
+then call `torch::mean()` or `torch::sum()` on the output tensor. Do NOT try to reduce
+inside the kernel with atomicAdd to a single float — use PyTorch's built-in reduction.
 
 Optimizations:
 - **Vectorize** with `float4`: process 4 elements per thread.
@@ -400,6 +421,8 @@ int blocks = (n + threads - 1) / threads;
 my_kernel<<<blocks, threads>>>(ptr, out_ptr, n);
 
 // DON'T use:
+// - .size() without args → use .sizes() or .size(dim)
+// - new float / malloc for kernel outputs → use torch::zeros({}, input.options())
 // - cudaMalloc/cudaMemcpy for tensor operations (use torch:: allocators)
 // - std::vector in __global__ functions (not available in device code)
 // - torch::ScalarTensor (doesn't exist)
@@ -423,6 +446,9 @@ my_kernel<<<blocks, threads>>>(ptr, out_ptr, n);
 | `.ptr<T>()` | Use `.data_ptr<T>()` |
 | `auto [a, b] = sizes()` (C++17 structured bindings) | Not supported by nvcc; index manually |
 | Output tensor on CPU | Always use `input.options()` or `.device(torch::kCUDA)` |
+| `tensor.size()` (no args) | Use `tensor.sizes()` — `.size()` needs a dim arg: `.size(0)` |
+| `new float(0.0f)` passed to kernel | Host memory! Use `torch::zeros({1}, input.options())` |
+| `atomicAdd` to single scalar | Compute per-element, reduce with `torch::mean()` after kernel |
 | Hardcoded shared memory size | Use `extern __shared__` or grid-stride loop |
 | `__host__ __device__` on binding functions | Binding functions must be plain host functions |
 

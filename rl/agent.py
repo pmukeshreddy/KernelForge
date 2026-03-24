@@ -213,10 +213,12 @@ def _fix_cuda_api(cuda_code: str) -> str:
         return line
     cuda_code = '\n'.join(_fix_register_conflict(l) for l in cuda_code.splitlines())
 
-    # Bug 9 — .stride() (no-arg overload) doesn't exist on at::Tensor.
-    # The model writes input.stride() but the correct no-arg accessor is .strides().
-    # Only fix the no-arg call; .stride(dim) with an argument is valid.
+    # Bug 9 — .stride() and .size() (no-arg overloads) don't exist on at::Tensor.
+    # The model writes input.stride() / input.size() but the correct no-arg
+    # accessors are .strides() / .sizes(). Only fix no-arg calls; .stride(dim)
+    # and .size(dim) with an argument are valid.
     cuda_code = re.sub(r'\.stride\(\)', '.strides()', cuda_code)
+    cuda_code = re.sub(r'\.size\(\)', '.sizes()', cuda_code)
 
     # Bug 10 — IntArrayRef (from .sizes()/.strides()) passed where const int64_t* expected.
     # Kernel launches and raw pointer assignments need .data() to get the underlying pointer.

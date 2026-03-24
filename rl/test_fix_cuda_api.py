@@ -8,8 +8,8 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from agent import _fix_cuda_api
 
 
-def test_bug9_stride_no_arg():
-    """Bug 9: .stride() (no-arg) → .strides()"""
+def test_bug9_stride_and_size_no_arg():
+    """Bug 9: .stride() → .strides(), .size() → .sizes()"""
     code = "auto s = input.stride();"
     fixed = _fix_cuda_api(code)
     assert ".strides()" in fixed, f"Expected .strides(), got: {fixed}"
@@ -17,7 +17,16 @@ def test_bug9_stride_no_arg():
     code2 = "auto s = input.stride(0);"
     fixed2 = _fix_cuda_api(code2)
     assert ".stride(0)" in fixed2, f".stride(dim) should be preserved, got: {fixed2}"
-    print("✅ Bug 9: .stride() → .strides()")
+    # .size() (no-arg) → .sizes()
+    code3 = 'TORCH_CHECK(predictions.size() == targets.size(), "mismatch");'
+    fixed3 = _fix_cuda_api(code3)
+    assert ".sizes()" in fixed3, f"Expected .sizes(), got: {fixed3}"
+    assert ".size()" not in fixed3, f".size() should be fixed, got: {fixed3}"
+    # .size(dim) should NOT be changed
+    code4 = "int n = input.size(0);"
+    fixed4 = _fix_cuda_api(code4)
+    assert ".size(0)" in fixed4, f".size(dim) should be preserved, got: {fixed4}"
+    print("✅ Bug 9: .stride()/.size() → .strides()/.sizes()")
 
 
 def test_bug10_intarrayref_data():
@@ -85,7 +94,7 @@ def test_regression_existing_patterns():
 
 if __name__ == "__main__":
     tests = [
-        test_bug9_stride_no_arg,
+        test_bug9_stride_and_size_no_arg,
         test_bug10_intarrayref_data,
         test_bug10_no_double_data,
         test_bug10_no_apply_on_subscript,
