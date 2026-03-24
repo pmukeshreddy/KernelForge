@@ -1068,6 +1068,8 @@ def _run_group_episodes(
                     msgs.append({"role": "user", "content": feedback})
 
             ctx_str = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+            # Qwen3 thinking mode: append <think> so model enters reasoning before code
+            ctx_str += "<think>\n"
             if i == 0:
                 ctx_tokens = len(tokenizer(ctx_str).input_ids)
                 print(f"  [DEBUG] Context traj=0 turn {turn_idx+1}: {ctx_tokens} tokens"
@@ -1363,7 +1365,7 @@ def _run_group_episodes(
                     if mae is not None: parts.append(f"max_err={mae:.4f}")
                     if bias and abs(bias) > 0.01: parts.append(f"bias={bias:+.3f}")
                     error_classes[cls].append(f"traj {idx_e}: {', '.join(parts) or 'incorrect'}")
-            summary_lines = ["--- ALL 8 trajectories FAILED this turn ---"]
+            summary_lines = [f"--- ALL {G} trajectories FAILED this turn ---"]
             summary_lines.append("Common failure patterns (avoid ALL of these):")
             for cls, examples in error_classes.items():
                 summary_lines.append(f"  [{cls.upper()}] ({len(examples)} trajs): {examples[0]}")
@@ -1542,6 +1544,7 @@ def _run_evaluation(model, tokenizer, config: GRPOConfig, val_prompts: list[tupl
             prompt_str = tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
+            prompt_str += "<think>\n"
             input_ids = tokenizer(prompt_str, return_tensors="pt").input_ids.to(model.device)
             
             # Generate single best guess (greedy, T=0.0)
