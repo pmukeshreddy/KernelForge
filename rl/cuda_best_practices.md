@@ -432,7 +432,20 @@ auto output = torch::empty({M}, torch::TensorOptions()
 
 // Getting data pointers
 float* ptr = input.data_ptr<float>();         // NOT .ptr<float>()
-const int64_t* sizes = input.sizes().data();  // for passing to kernels
+
+// ━━ Passing N-Dimensional Shapes ━━
+// DO NOT pass `input.sizes().data()` to a kernel, it's a host pointer!
+// Use a struct to pass dynamic multi-dimensional shapes by value.
+#define MAX_DIMS 25
+struct TensorShape {
+    int64_t sizes[MAX_DIMS];
+    int64_t strides[MAX_DIMS];
+    int ndim;
+};
+// Setup in host code:
+// TensorShape shape; shape.ndim = input.dim();
+// for (int i = 0; i < shape.ndim; ++i) { shape.sizes[i] = input.size(i); shape.strides[i] = input.stride(i); }
+// Pass `shape` by value: my_kernel<<<...>>>(ptr, shape);
 
 // Getting dimensions
 int batch = input.size(0);
@@ -446,9 +459,11 @@ my_kernel<<<blocks, threads>>>(ptr, out_ptr, n);
 
 // DON'T use:
 // - .size() without args → use .sizes() or .size(dim)
-// - new float / malloc for kernel outputs → use torch::zeros({}, input.options())
+// - new / malloc inside kernels → NEVER dynamically allocate! Use fixed local arrays (e.g. int coords[25]).
+// - new float / malloc for kernel outputs → use torch::zeros({N}, input.options())
 // - cudaMalloc/cudaMemcpy for tensor operations (use torch:: allocators)
-// - std::vector in __global__ functions (not available in device code)
+// - std::vector in __global__ functions (not available in device code, use C arrays)
+// - input.sizes().data() passed to kernel → causes illegal memory access (host pointer!). Use struct by value.
 // - torch::ScalarTensor (doesn't exist)
 // - .type() (use .scalar_type())
 // - __host__ or __device__ on binding functions
@@ -461,7 +476,9 @@ my_kernel<<<blocks, threads>>>(ptr, out_ptr, n);
 
 | Mistake | Fix |
 |---------|-----|
-| `std::vector` in `__global__` | Use C arrays or pass as kernel args |
+| `std::vector` in `__global__` | Use fixed-size local C arrays (e.g. `int64_t coords[25]`) |
+| `new` or `malloc` inside `__global__` | **CRASHES!** Never heap allocate on device. Use fixed arrays. |
+| Passing `input.sizes().data()` | **CRASHES!** Host pointer read by GPU. Pass struct by value. |
 | `std::max/min/abs` in device code | Use `fmaxf/fminf/fabsf` |
 | `std::numeric_limits<float>::infinity()` | Use `INFINITY` or `-INFINITY` |
 | `__shfl_down()` without `_sync` | Use `__shfl_down_sync(0xffffffff, ...)` |

@@ -52,7 +52,7 @@ from sys_prompt import get_system_prompt
 _cuda_rag = CudaRAG()
 
 # Global LLM feedback instance — initialized lazily when llm_feedback_model is set
-_llm_feedback: LLMFeedback | None = None
+_llm_feedback = None  # type: LLMFeedback | None
 
 
 def _worker_run_eval(args):
