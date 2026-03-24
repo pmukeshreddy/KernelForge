@@ -87,7 +87,7 @@ class LLMFeedback:
     Thread-safe for concurrent calls from multiple trajectories.
     """
 
-    def __init__(self, model_path: str, n_ctx: int = 4096, timeout: float = 30.0):
+    def __init__(self, model_path: str, n_ctx: int = 4096, timeout: float = 120.0):
         """
         Args:
             model_path: Path to GGUF model file
