@@ -1236,11 +1236,34 @@ def _run_group_episodes(
                 _tm = re.search(r'<think>(.*?)</think>', gen_text, re.DOTALL)
                 if not _tm:
                     _tm = re.search(r'<think>(.*)', gen_text, re.DOTALL)
+                if not _tm:
+                    # <think> was in context prefix; completion starts inside think block
+                    _tm = re.search(r'^(.*?)</think>', gen_text, re.DOTALL)
                 _tt = _tm.group(1).strip()[:200] if _tm else "(no think)"
                 _err = "compile" if (eval_results[i] and not eval_results[i].get("compiles")) else \
                        "wrong" if (eval_results[i] and not eval_results[i].get("correct")) else \
                        "no_code" if not candidates[i] else "?"
                 print(f"    traj {i} [{_err}]: {_tt}", flush=True)
+
+        # ── DEBUG: detect when model repeats itself across turns ──
+        if turn_idx > 0:
+            n_repeated = 0
+            for i in range(G):
+                if candidates[i] and len(traj_evals[i]) > 0:
+                    prev_code = None
+                    for t in range(turn_idx - 1, -1, -1):
+                        if t < len(traj_responses[i]):
+                            prev_code = _extract_python_block(traj_responses[i][t])
+                            if prev_code:
+                                break
+                    if prev_code and candidates[i]:
+                        # Normalize whitespace for comparison
+                        _prev_norm = re.sub(r'\s+', ' ', prev_code.strip())
+                        _curr_norm = re.sub(r'\s+', ' ', candidates[i].strip())
+                        if _prev_norm == _curr_norm:
+                            n_repeated += 1
+            if n_repeated > 0:
+                print(f"  [REPEAT] Turn {turn_idx+1}: {n_repeated}/{G} trajectories produced IDENTICAL code to their previous turn", flush=True)
 
         # OOM detection: if ALL evals on turn 1 fail (often means ref model itself OOMs),
         # skip this prompt entirely — no useful learning signal.
@@ -1905,12 +1928,15 @@ def train(config: GRPOConfig = None):
 
                 # Dynamic Sampling: skip degenerate groups (DAPO).
                 # Use mean-reward-per-trajectory as the degeneracy signal.
+                # Threshold 0.05: groups where all trajectories get nearly identical
+                # rewards (e.g., all fail the same way) produce near-zero advantages
+                # and waste a gradient step.  Old threshold 1e-4 was far too low.
                 if config.dynamic_sampling:
                     traj_means = [sum(rews) / len(rews) for rews in group_rewards]
                     reward_std = torch.tensor(traj_means).std().item()
-                    if reward_std <= 1e-4:
+                    if reward_std < 0.05:
                         n_degenerate += 1
-                        print(f"  [Dynamic Sampling] Degenerate group (std={reward_std:.6f}), skipping prompt.")
+                        print(f"  [Dynamic Sampling] Degenerate group (std={reward_std:.4f}), skipping prompt.")
                         continue
 
                 all_group_turns.append(group_turns)
