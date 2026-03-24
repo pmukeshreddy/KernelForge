@@ -91,7 +91,7 @@ class GRPOConfig:
     grpo_epochs: int = 2              # gradient updates per batch
     batch_size: int = 4               # prompts per batch
     learning_rate: float = 5e-6       # higher LR for LoRA (fewer trainable params)
-    warmup_steps: int = 10            # cosine schedule warmup (noisy advantages early in training)
+    warmup_pct: float = 0.1            # warmup as fraction of total steps (10%)
     cliprange_low: float = 0.2        # standard lower clip
     cliprange_high: float = 0.28      # DAPO Clip-Higher (asymmetric)
     max_grad_norm: float = 0.5        # standard GRPO clip (0.05 was too aggressive)
@@ -1468,17 +1468,18 @@ def _compute_grpo_loss_and_backward(
         for i in range(G):
             loo_mean = (group_sum - disc_returns[i, t]) / max(G - 1, 1)
             loo_var = (group_sq_sum - disc_returns[i, t] ** 2) / max(G - 1, 1) - loo_mean ** 2
-            # Floor at 1.0 to prevent exploding advantages. Reward range is
-            # -1.0 to ~10.0 (reward = speedup), so 1.0 floor keeps advantages
-            # bounded while preserving clear signal between speed levels.
-            loo_std = max(loo_var.clamp(min=0).sqrt().item(), 1.0)
+            # Floor std to prevent exploding advantages. Typical correct rewards
+            # are 1.0-2.0 (speedup), so 0.5 floor keeps advantages meaningful
+            # while preventing division-by-near-zero when all rewards are similar.
+            loo_std = max(loo_var.clamp(min=0).sqrt().item(), 0.5)
             advantages[i, t] = (disc_returns[i, t] - loo_mean) / loo_std
 
     # ── DEBUG: discounted returns and advantages ─────────────────────────────
-    print(f"  [DEBUG] disc_returns per turn (mean): {disc_returns.mean(dim=0).tolist()}")
-    print(f"  [DEBUG] disc_returns std per turn:    {disc_returns.std(dim=0).tolist()}")
-    print(f"  [DEBUG] advantages range: min={advantages.min().item():.3f} max={advantages.max().item():.3f}")
-    print(f"  [DEBUG] TRLOO baseline (leave-one-out)")
+    print(f"  [DEBUG] disc_returns per turn (mean): {disc_returns.mean(dim=0).tolist()}", flush=True)
+    print(f"  [DEBUG] disc_returns std per turn:    {disc_returns.std(dim=0).tolist()}", flush=True)
+    print(f"  [DEBUG] advantages range: min={advantages.min().item():.3f} max={advantages.max().item():.3f}", flush=True)
+    for t in range(T):
+        print(f"  [DEBUG]   turn {t+1}: rewards={rewards_t[:, t].tolist()} → disc_ret={disc_returns[:, t].tolist()} → adv={advantages[:, t].tolist()}", flush=True)
     # ── END DEBUG ────────────────────────────────────────────────────────────
 
     # Count valid sequences upfront for loss normalization
@@ -1782,7 +1783,8 @@ def train(config: GRPOConfig = None):
 
     # Cosine LR schedule with linear warmup — stabilizes early steps when advantages are noisy
     total_steps = max(1, (len(train_prompts) // config.batch_size) * config.num_train_epochs)
-    warmup_steps = config.warmup_steps
+    warmup_steps = max(2, int(total_steps * config.warmup_pct))
+    print(f"[LR] total_steps={total_steps}, warmup_steps={warmup_steps} ({config.warmup_pct*100:.0f}%)")
 
     def lr_lambda(step: int) -> float:
         if step < warmup_steps:
@@ -1838,8 +1840,10 @@ def train(config: GRPOConfig = None):
             t0 = time.time()
             for p_idx, (prompt_text, level) in enumerate(batch):
                 print(f"\n[Prompt {p_idx+1}/{len(batch)} level={level}] Generating {config.group_size} trajectories (batched/parallel)...")
-                # RAG dropout: decay from 100% → 0% over training
-                _rag_prob = max(0.0, 1.0 - (global_step / max(total_steps, 1)))
+                # RAG dropout: cosine decay from 100% → 0% over training
+                # Cosine decays slowly early (model still needs hints) then drops fast at end
+                _rag_progress = min(1.0, global_step / max(total_steps, 1))
+                _rag_prob = max(0.0, 0.5 * (1.0 + math.cos(math.pi * _rag_progress)))
                 group_turns, group_rewards = _run_group_episodes(prompt_text, model, tokenizer, config, difficulty=level, rag_prob=_rag_prob)
 
                 # Dynamic Sampling: skip degenerate groups (DAPO).
