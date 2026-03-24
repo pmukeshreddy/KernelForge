@@ -42,6 +42,7 @@ except ImportError:
 
 from agent import _extract_cuda_code, _fix_cuda_api
 from cuda_rag import CudaRAG
+from llm_feedback import LLMFeedback, _format_llm_hint
 from profiler import profile_kernel
 from reward import calculate_reward, calculate_wrong_reward, calculate_opt_reward
 from sandbox import evaluate
@@ -49,6 +50,9 @@ from sys_prompt import get_system_prompt
 
 # Global RAG instance — indexes cuda_best_practices.md once at import time
 _cuda_rag = CudaRAG()
+
+# Global LLM feedback instance — initialized lazily when llm_feedback_model is set
+_llm_feedback: LLMFeedback | None = None
 
 
 def _worker_run_eval(args):
@@ -149,6 +153,12 @@ class GRPOConfig:
 
     # Dataset cap: limit to N prompts (0 = use all). Useful for time-boxed runs.
     max_prompts: int = 0
+
+    # LLM feedback: path to GGUF model file for diagnosis/optimization hints
+    # When set, replaces BM25 RAG with an LLM that diagnoses specific bugs
+    # and identifies optimization bottlenecks. Runs on CPU (no GPU conflict).
+    # Empty string = disabled (uses BM25 RAG as before).
+    llm_feedback_model: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -357,13 +367,10 @@ OPTIMIZATION_RULES = [
 
 def _get_bottleneck_type(profiler_feedback: str) -> str:
     """Extract bottleneck type from profiler feedback text.
-    Returns 'memory', 'compute', 'fast', or 'unknown'.
-    'fast' = already faster than PyTorch with low utilization → safe micro-opts only."""
+    Returns 'memory', 'compute', or 'unknown'."""
     if not profiler_feedback:
         return "unknown"
     text = profiler_feedback.upper()
-    if "ALREADY FASTER" in text:
-        return "fast"
     if "MEMORY-BOUND" in text or "MEMORY BOUND" in text:
         return "memory"
     if "COMPUTE-BOUND" in text or "COMPUTE BOUND" in text:
@@ -508,20 +515,9 @@ def _get_operation_type(prompt_text: str, cuda_code: str | None = None) -> str:
     return "other"
 
 
-_SAFE_MICRO_OPT_NAMES = {
-    "Occupancy Tuning", "Read-Only Cache (__ldg)", "Grid-Stride Loop", "Loop Unrolling"
-}
-
-
 def _filter_rules_by_bottleneck(bottleneck: str, op_type: str = "other") -> list:
     """Return rules matching the profiler bottleneck AND operation type.
-    'both' rules always included for bottleneck. Falls back if too few match.
-    'fast' bottleneck = already faster than PyTorch → safe micro-opts only."""
-    # Already-fast kernels: only safe micro-optimizations to avoid regressions
-    if bottleneck == "fast":
-        safe = [r for r in OPTIMIZATION_RULES if r["name"] in _SAFE_MICRO_OPT_NAMES]
-        return safe if len(safe) >= 2 else OPTIMIZATION_RULES
-
+    'both' rules always included for bottleneck. Falls back if too few match."""
     # First filter by bottleneck
     if bottleneck == "unknown":
         by_bottleneck = OPTIMIZATION_RULES
@@ -535,7 +531,8 @@ def _filter_rules_by_bottleneck(bottleneck: str, op_type: str = "other") -> list
     matching = [r for r in by_bottleneck if op_type in r.get("ops", ["other"])]
     if len(matching) < 2:
         # Fallback: at least return safe universal rules
-        safe = [r for r in by_bottleneck if r["name"] in _SAFE_MICRO_OPT_NAMES]
+        safe = [r for r in by_bottleneck
+                if r["name"] in ("Occupancy Tuning", "Read-Only Cache (__ldg)", "Grid-Stride Loop")]
         return safe if len(safe) >= 2 else by_bottleneck
     return matching
 
@@ -1259,35 +1256,71 @@ def _run_group_episodes(
                             sp = pe["baseline_runtime_ms"] / pe["runtime_ms"]
                             if hwm_speedup is None or sp > hwm_speedup:
                                 hwm_speedup, hwm_turn = sp, pt + 1
-                    # BM25 RAG: retrieve relevant CUDA patterns for failed turns
+                    # Feedback hints: LLM diagnosis (if available) or BM25 RAG
                     # Dropout: rag_prob decays from 1.0→0.0 over training so model
                     # learns patterns early but doesn't depend on hints later.
                     _rag_hint = None
                     _rag_sections = []
+                    _llm_hint = None
                     _eval_t = traj_evals[i][t]
                     if (_eval_t is None or not _eval_t.get("correct", False)) and random.random() < rag_prob:
-                        _rag_query = prompt_text
-                        if _eval_t and _eval_t.get("compiler_error"):
-                            _rag_query += "\n" + _eval_t["compiler_error"]
+                        # Extract code for diagnosis
+                        _code = ""
                         if t < len(traj_responses[i]) and traj_responses[i][t]:
                             _code = _extract_python_block(traj_responses[i][t])
+
+                        # Try LLM feedback first (targeted diagnosis)
+                        if _llm_feedback is not None and _llm_feedback.available:
+                            _error_msg = ""
+                            if _eval_t is None:
+                                _error_msg = "No code was extracted from the response"
+                            elif not _eval_t.get("compiles", False):
+                                _error_msg = _eval_t.get("compiler_error") or "Unknown compile error"
+                            else:
+                                _error_msg = _eval_t.get("compiler_error") or "Outputs do not match reference"
+                                # Add numerical error details
+                                _wf = _eval_t.get("wrong_frac")
+                                _mae = _eval_t.get("max_abs_error")
+                                if _wf is not None:
+                                    _error_msg += f" | {_wf*100:.0f}% of elements wrong"
+                                if _mae is not None:
+                                    _error_msg += f" | max_abs_error={_mae:.5f}"
+
+                            _llm_hint = _llm_feedback.diagnose_error(
+                                task=prompt_text,
+                                code=_code or "(no code extracted)",
+                                error=_error_msg,
+                            )
+                            if _llm_hint:
+                                _rag_hint = _format_llm_hint(_llm_hint, "diagnosis")
+                            if i == 0:
+                                print(f"  [LLM] traj=0 turn {t+1}→{turn_idx+1}: "
+                                      f"{'got diagnosis' if _llm_hint else 'no response, falling back to RAG'}",
+                                      flush=True)
+
+                        # Fallback to BM25 RAG if LLM unavailable or returned nothing
+                        if not _rag_hint:
+                            _rag_query = prompt_text
+                            if _eval_t and _eval_t.get("compiler_error"):
+                                _rag_query += "\n" + _eval_t["compiler_error"]
                             if _code:
-                                _rag_query += "\n" + _code[:1000]  # cap code length
-                        _rag_sections = _cuda_rag.retrieve(_rag_query, top_k=2)
-                        _rag_hint = _cuda_rag.retrieve_text(_rag_query, top_k=2, max_chars=2000)
-                    if i == 0 and _rag_sections:
-                        print(f"  [RAG] traj=0 turn {t+1}→{turn_idx+1}: retrieved {len(_rag_sections)} sections:", flush=True)
-                        for _rs in _rag_sections:
-                            print(f"    → '{_rs.title}' ({len(_rs.content)} chars)", flush=True)
-                    elif i == 0:
-                        print(f"  [RAG] traj=0 turn {t+1}→{turn_idx+1}: skipped (correct={_eval_t.get('correct', False) if _eval_t else None}, rag_prob={rag_prob:.2f})", flush=True)
+                                _rag_query += "\n" + _code[:1000]
+                            _rag_sections = _cuda_rag.retrieve(_rag_query, top_k=2)
+                            _rag_hint = _cuda_rag.retrieve_text(_rag_query, top_k=2, max_chars=2000)
+                            if i == 0 and _rag_sections:
+                                print(f"  [RAG] traj=0 turn {t+1}→{turn_idx+1}: retrieved {len(_rag_sections)} sections:", flush=True)
+                                for _rs in _rag_sections:
+                                    print(f"    → '{_rs.title}' ({len(_rs.content)} chars)", flush=True)
+                            elif i == 0:
+                                print(f"  [RAG] traj=0 turn {t+1}→{turn_idx+1}: skipped (correct={_eval_t.get('correct', False) if _eval_t else None}, rag_prob={rag_prob:.2f})", flush=True)
 
                     _has_profiler = bool(_eval_t and _eval_t.get("profiler_feedback"))
                     _rag_titles = [_rs.title for _rs in _rag_sections] if _rag_sections else []
                     traj_turn_feedback_source[i] = {
-                        "type": "NORMAL",
+                        "type": "LLM" if _llm_hint else "NORMAL",
                         "profiler": _has_profiler,
                         "rag": _rag_titles,
+                        "llm_diagnosis": bool(_llm_hint),
                         "correct_prev": bool(_eval_t and _eval_t.get("correct")),
                     }
                     feedback = _build_turn_feedback(
@@ -1298,11 +1331,13 @@ def _run_group_episodes(
                         rag_hint=_rag_hint,
                     )
                     if i == 0:
+                        _fb_has_llm = "Bug Diagnosis" in feedback
                         _fb_has_rag = "--- Relevant CUDA Pattern ---" in feedback
                         _fb_has_group = "ALL" in feedback and "FAILED" in feedback
                         _fb_has_stuck = "same type of error" in feedback
                         print(f"  [DEBUG] Feedback traj=0 turn {t+1}→{turn_idx+1} "
-                              f"({len(feedback)} chars, RAG={'YES' if _fb_has_rag else 'NO'}, "
+                              f"({len(feedback)} chars, LLM={'YES' if _fb_has_llm else 'NO'}, "
+                              f"RAG={'YES' if _fb_has_rag else 'NO'}, "
                               f"group_fail={'YES' if _fb_has_group else 'NO'}, "
                               f"stuck={'YES' if _fb_has_stuck else 'NO'}):\n{feedback}", flush=True)
                     elif (traj_evals[i][t] is not None
@@ -2341,6 +2376,9 @@ if __name__ == "__main__":
     parser.add_argument("--sglang_tp", type=int, default=1, help="SGLang tensor parallel degree")
     parser.add_argument("--max_prompts", type=int, default=0, help="Cap dataset to N prompts (0=all). Use ~100 for a 2-3h run.")
     parser.add_argument("--no_curriculum", action="store_true", help="Disable curriculum (random prompt order instead of easy-first)")
+    parser.add_argument("--llm_feedback_model", type=str, default="",
+                        help="Path to GGUF model for LLM-based feedback (replaces BM25 RAG). "
+                             "Runs on CPU, no GPU conflict. Empty = use RAG only.")
     args = parser.parse_args()
 
     cfg = GRPOConfig(
@@ -2365,7 +2403,13 @@ if __name__ == "__main__":
         sglang_tp=args.sglang_tp,
         max_prompts=args.max_prompts,
         curriculum=not args.no_curriculum,
+        llm_feedback_model=args.llm_feedback_model,
     )
+
+    # Initialize LLM feedback if model path is provided
+    global _llm_feedback  # noqa: used conditionally
+    if cfg.llm_feedback_model:
+        _llm_feedback = LLMFeedback(cfg.llm_feedback_model)
     
     # Simple resume logic: swap base model for output_dir if resuming
     if args.resume and os.path.exists(args.output_dir):

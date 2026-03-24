@@ -44,6 +44,9 @@ if [ "$MODE" = "test" ]; then
     --sglang_python ~/sglang_env/bin/python \
     --sglang_port 30000 \
     --sglang_tp 1
+    # LLM feedback (optional, requires: pip install llama-cpp-python)
+    # Download model: huggingface-cli download Jackrong/Qwen3.5-9B-Claude-4.6-Opus-Reasoning-Distilled-v2-GGUF --include '*Q4_K_M*' --local-dir models/
+    # --llm_feedback_model models/Qwen3.5-9B-Claude-4.6-Opus-Reasoning-Distilled-v2-Q4_K_M.gguf
 else
   echo "=== FULL TRAINING RUN ==="
   python train_grpo.py \
@@ -61,4 +64,5 @@ else
     --sglang_python ~/sglang_env/bin/python \
     --sglang_port 30000 \
     --sglang_tp 1
+    # LLM feedback (optional): --llm_feedback_model models/Qwen3.5-9B-Claude-4.6-Opus-Reasoning-Distilled-v2-Q4_K_M.gguf
 fi
