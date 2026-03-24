@@ -1132,10 +1132,14 @@ def _run_group_episodes(
         # ── DEBUG: dump model's thinking for traj 0 ──────────────────────────
         if completions:
             _raw0 = completions[0]
-            # Extract think block
+            # Extract think block — <think> may be in context prefix, so also
+            # check for content before </think> without opening tag
             _think_match = re.search(r'<think>(.*?)</think>', _raw0, re.DOTALL)
             if not _think_match:
                 _think_match = re.search(r'<think>(.*)', _raw0, re.DOTALL)
+            if not _think_match:
+                # <think> was in context prefix; completion starts with reasoning before </think>
+                _think_match = re.search(r'^(.*?)</think>', _raw0, re.DOTALL)
             _think_text = _think_match.group(1).strip() if _think_match else "(no think block)"
             _think_tokens = len(_think_text.split())
             _total_tokens = len(_raw0.split())
