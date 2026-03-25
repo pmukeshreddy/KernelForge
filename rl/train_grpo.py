@@ -693,7 +693,7 @@ def _run_group_episodes(
     T = config.num_turns
 
     sys_content = get_system_prompt().strip()
-    user_msg = FORMAT_EXAMPLE + f"Reference Program:\n```python\n{prompt_text}\n```"
+    user_msg = f"Optimize the following PyTorch reference code into a pure CUDA extension:\n\n```python\n{prompt_text}\n```"
     base_messages = [
         {"role": "system", "content": sys_content},
         {"role": "user", "content": user_msg},
@@ -1490,7 +1490,7 @@ def _run_evaluation(model, tokenizer, config: GRPOConfig, val_prompts: list[tupl
 
     with torch.no_grad():
         for prompt_text, _level in val_prompts:
-            user_msg = FORMAT_EXAMPLE + f"Reference Program:\n```python\n{prompt_text}\n```"
+            user_msg = f"Optimize the following PyTorch reference code into a pure CUDA extension:\n\n```python\n{prompt_text}\n```"
             sys_content = get_system_prompt().strip()
             messages = [
                 {"role": "system", "content": sys_content},
