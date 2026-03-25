@@ -1098,8 +1098,11 @@ def _run_group_episodes(
                 _ec = _classify_error(_prev_eval)
                 if _ec != "correct" and _ec not in _error_classes:
                     _error_classes[_ec] = _gi
-            # Diagnose one representative per error class
-            for _ec, _rep_i in _error_classes.items():
+            # Diagnose all unique error classes in parallel via batch API
+            _ec_list = list(_error_classes.keys())
+            _batch_items = []
+            for _ec in _ec_list:
+                _rep_i = _error_classes[_ec]
                 _rep_eval = traj_evals[_rep_i][_prev_turn]
                 _rep_code = ""
                 if _prev_turn < len(traj_responses[_rep_i]) and traj_responses[_rep_i][_prev_turn]:
@@ -1117,13 +1120,15 @@ def _run_group_episodes(
                         _rep_error += f" | {_wf*100:.0f}% of elements wrong"
                     if _mae is not None:
                         _rep_error += f" | max_abs_error={_mae:.5f}"
-                _hint = _llm_feedback.diagnose_error(
-                    task=prompt_text,
-                    code=_rep_code or "(no code extracted)",
-                    error=_rep_error,
-                )
-                if _hint:
-                    _diag_cache[_ec] = _format_llm_hint(_hint, "diagnosis")
+                _batch_items.append({
+                    "task": prompt_text,
+                    "code": _rep_code or "(no code extracted)",
+                    "error": _rep_error,
+                })
+            _batch_results = _llm_feedback.diagnose_batch(_batch_items)
+            for _idx, _ec in enumerate(_ec_list):
+                if _batch_results[_idx]:
+                    _diag_cache[_ec] = _format_llm_hint(_batch_results[_idx], "diagnosis")
             _n_unique = len(_error_classes)
             _n_failed = sum(1 for _gi in range(G)
                             if _classify_error(
@@ -1133,6 +1138,53 @@ def _run_group_episodes(
                 print(f"  [LLM-DEDUP] {_n_failed} failed trajs → {_n_unique} unique error class(es), "
                       f"{_n_unique} diagnosis call(s) (saved {max(0, _n_failed - _n_unique)})",
                       flush=True)
+
+        # ── Pre-compute optimization hints in parallel ────────────────────
+        # Batch all LLM opt hint calls before the per-trajectory loop so
+        # they run concurrently across the worker pool.
+        _opt_hint_cache: dict[int, str] = {}  # traj_index → hint string
+        _ws_prof = ws_best_eval.get("profiler_feedback", "") if ws_best_eval else ""
+        _already_fast_low_util = (
+            "Already Faster Than PyTorch" in _ws_prof
+            and ws_best_speedup >= 1.0
+        )
+        _pre_use_opt = (
+            turn_idx > 0
+            and ws_best_code is not None
+            and ws_best_speedup >= 0.5
+            and not _already_fast_low_util
+            and _llm_feedback is not None and _llm_feedback.available
+        )
+        if _pre_use_opt:
+            _pre_bottleneck = _get_bottleneck_type(_ws_prof)
+            _pre_op_type = _get_operation_type(prompt_text, cuda_code=ws_best_code)
+            _pre_filtered = _filter_rules_by_bottleneck(_pre_bottleneck, _pre_op_type)
+            _pre_rt = ws_best_eval.get("runtime_ms") if ws_best_eval else None
+            _pre_bt = ws_best_eval.get("baseline_runtime_ms") if ws_best_eval else None
+            _pre_speedup = (_pre_bt / _pre_rt) if (_pre_rt and _pre_bt and _pre_rt > 0) else 0.0
+            _LLM_OPT_TEMPS = [0.3, 0.5, 0.7, 0.9]
+
+            _opt_batch_items = []
+            _opt_batch_trajs = []  # track which traj index each batch item maps to
+            for _oi in range(G):
+                if _oi % 2 != 0:  # only even-indexed trajectories get LLM hints
+                    continue
+                _oi_rule = _pre_filtered[(_oi + turn_idx - 1) % len(_pre_filtered)]
+                _oi_temp = _LLM_OPT_TEMPS[_oi % len(_LLM_OPT_TEMPS)]
+                _opt_batch_items.append({
+                    "task": prompt_text,
+                    "code": ws_best_code or "",
+                    "speedup": _pre_speedup,
+                    "profiler_info": _ws_prof,
+                    "technique_hint": _oi_rule["name"],
+                    "temperature": _oi_temp,
+                })
+                _opt_batch_trajs.append(_oi)
+            if _opt_batch_items:
+                _opt_batch_results = _llm_feedback.optimize_batch(_opt_batch_items)
+                for _bi, _oi in enumerate(_opt_batch_trajs):
+                    if _opt_batch_results[_bi]:
+                        _opt_hint_cache[_oi] = _opt_batch_results[_bi]
 
         for i in range(G):
             msgs = list(base_messages)
@@ -1147,11 +1199,6 @@ def _run_group_episodes(
             # utilization — the kernel is already near-optimal for a small
             # workload. Forcing optimization risks breaking correctness
             # for marginal gain.
-            _ws_prof = ws_best_eval.get("profiler_feedback", "") if ws_best_eval else ""
-            _already_fast_low_util = (
-                "Already Faster Than PyTorch" in _ws_prof
-                and ws_best_speedup >= 1.0
-            )
             use_optimization_turn = (
                 turn_idx > 0
                 and ws_best_code is not None
@@ -1292,33 +1339,16 @@ def _run_group_episodes(
                 # Rules are filtered by profiler bottleneck type.
                 rule = _filtered_rules[(i + turn_idx - 1) % len(_filtered_rules)]
 
-                # LLM hints for even-indexed trajectories (with per-traj
-                # technique + varied temperature for diversity).
+                # LLM hints for even-indexed trajectories (pre-computed in
+                # parallel via optimize_batch above).
                 # Odd-indexed trajectories use hardcoded rule rotation
                 # to maintain exploration diversity across the group.
-                _LLM_OPT_TEMPS = [0.3, 0.5, 0.7, 0.9]
-                _use_llm_for_traj = (i % 2 == 0) and _llm_feedback is not None and _llm_feedback.available
-
-                _opt_llm_hint = None
-                if _use_llm_for_traj:
-                    _opt_speedup = 0.0
-                    if rt and bt and rt > 0:
-                        _opt_speedup = bt / rt
-                    _opt_code = ws_best_code or ""
-                    _traj_temp = _LLM_OPT_TEMPS[i % len(_LLM_OPT_TEMPS)]
-                    _opt_llm_hint = _llm_feedback.suggest_optimization(
-                        task=prompt_text,
-                        code=_opt_code,
-                        speedup=_opt_speedup,
-                        profiler_info=traj_prof or "",
-                        technique_hint=rule["name"],
-                        temperature=_traj_temp,
-                    )
-                    if i == 0:
-                        print(f"  [LLM-OPT] traj=0 turn {turn_idx+1}: "
-                              f"{'got hint' if _opt_llm_hint else 'no response, using rules'}"
-                              f" (technique={rule['name']}, temp={_traj_temp})",
-                              flush=True)
+                _opt_llm_hint = _opt_hint_cache.get(i)
+                if i == 0 and (i % 2 == 0):
+                    print(f"  [LLM-OPT] traj=0 turn {turn_idx+1}: "
+                          f"{'got hint (pre-computed)' if _opt_llm_hint else 'no response, using rules'}"
+                          f" (technique={rule['name']})",
+                          flush=True)
 
                 if _opt_llm_hint:
                     # Use LLM-generated optimization hint (targeted to rule)
@@ -2585,7 +2615,7 @@ if __name__ == "__main__":
 
     # Initialize LLM feedback if model path is provided
     if cfg.llm_feedback_model:
-        _llm_feedback = LLMFeedback(cfg.llm_feedback_model)
+        _llm_feedback = LLMFeedback(cfg.llm_feedback_model, n_workers=2)
     
     # Simple resume logic: swap base model for output_dir if resuming
     if args.resume and os.path.exists(args.output_dir):

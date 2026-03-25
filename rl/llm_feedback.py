@@ -6,12 +6,13 @@ Replaces BM25 RAG with a local GGUF model (via llama-cpp-python) that:
 2. Identifies specific bottlenecks in correct-but-slow kernels (optimization turns)
 
 The model runs on CPU (n_gpu_layers=0) to avoid competing with training for GPU memory.
-Load once at startup, call directly — no external server needed.
+Loads a POOL of N model instances at startup for parallel inference.
 
 Usage:
-    fb = LLMFeedback("/path/to/model.gguf")
+    fb = LLMFeedback("/path/to/model.gguf", n_workers=2)
     hint = fb.diagnose_error(task_description, broken_code, error_message)
-    hint = fb.suggest_optimization(task_description, code, speedup, profiler_info)
+    hints = fb.diagnose_batch([{"task": ..., "code": ..., "error": ...}, ...])
+    hints = fb.optimize_batch([{"task": ..., "code": ..., "speedup": ..., ...}, ...])
 """
 
 import os
@@ -62,7 +63,7 @@ potentially slow CUDA kernel. Your job is to identify its #1 performance bottlen
 and suggest ONE specific optimization.
 
 Rules:
-- Analyze the actual code structure (memory access pattern, thread utilization, etc.)
+- Start with the bottleneck. NEVER begin with "Let me", "Looking at", or any preamble.
 - Identify the SINGLE most impactful bottleneck
 - Suggest ONE concrete optimization technique with a brief explanation
 - Keep your response to 3-5 sentences
@@ -81,23 +82,60 @@ Current kernel code (correct, {speedup:.2f}x vs PyTorch):
 Identify the #1 performance bottleneck and suggest ONE specific optimization."""
 
 
-class LLMFeedback:
-    """LLM-based feedback using a local GGUF model via llama-cpp-python.
+# ── Worker: one Llama instance + its own lock ────────────────────────────────
 
-    Loads the model on CPU to avoid GPU memory conflicts with training.
-    Thread-safe for concurrent calls from multiple trajectories.
+class _LLMWorker:
+    """A single Llama model instance with its own lock for thread safety."""
+
+    __slots__ = ("llm", "lock", "worker_id")
+
+    def __init__(self, model_path: str, n_ctx: int, n_threads: int, worker_id: int):
+        self.worker_id = worker_id
+        self.lock = threading.Lock()
+        self.llm = Llama(
+            model_path=model_path,
+            n_ctx=n_ctx,
+            n_gpu_layers=0,
+            n_threads=n_threads,
+            verbose=False,
+        )
+
+    def generate(self, system: str, user: str,
+                 max_tokens: int, temperature: float) -> str:
+        with self.lock:
+            resp = self.llm.create_chat_completion(
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=0.9,
+            )
+        return resp["choices"][0]["message"]["content"].strip()
+
+
+class LLMFeedback:
+    """LLM-based feedback using a pool of local GGUF model instances.
+
+    Loads N copies of the model on CPU (each with its own threads) so
+    multiple diagnoses / optimization hints can run in parallel.
     """
 
-    def __init__(self, model_path: str, n_ctx: int = 4096, timeout: float = 120.0):
+    def __init__(self, model_path: str, n_ctx: int = 4096,
+                 timeout: float = 120.0, n_workers: int = 2):
         """
         Args:
             model_path: Path to GGUF model file
-            n_ctx: Context window size (4096 is enough for code + error + response)
+            n_ctx: Context window size
             timeout: Max seconds per LLM call before giving up
+            n_workers: Number of parallel model instances (2-4 recommended)
         """
         self.timeout = timeout
-        self._llm = None
-        self._lock = threading.Lock()  # llama-cpp is not thread-safe
+        self._workers: list[_LLMWorker] = []
+        self._pool: ThreadPoolExecutor | None = None
+        self._robin = 0  # round-robin counter
+        self._robin_lock = threading.Lock()
 
         if not model_path:
             print("[LLM Feedback] No model path — LLM feedback disabled")
@@ -112,20 +150,37 @@ class LLMFeedback:
             print(f"[LLM Feedback] Model file not found: {model_path}")
             return
 
+        # Split CPU threads across workers
+        total_threads = max(4, os.cpu_count() or 4)
+        threads_per_worker = max(2, total_threads // n_workers)
+
         t0 = time.time()
-        print(f"[LLM Feedback] Loading {os.path.basename(model_path)} on CPU...", flush=True)
-        self._llm = Llama(
-            model_path=model_path,
-            n_ctx=n_ctx,
-            n_gpu_layers=0,      # CPU only — GPU stays free for training
-            n_threads=4,          # reasonable CPU parallelism
-            verbose=False,
-        )
-        print(f"[LLM Feedback] Model loaded in {time.time()-t0:.1f}s", flush=True)
+        print(f"[LLM Feedback] Loading {n_workers}x {os.path.basename(model_path)} "
+              f"on CPU ({threads_per_worker} threads each)...", flush=True)
+        for wid in range(n_workers):
+            try:
+                w = _LLMWorker(model_path, n_ctx, threads_per_worker, wid)
+                self._workers.append(w)
+            except Exception as e:
+                print(f"[LLM Feedback] Worker {wid} failed to load: {e}")
+                break
+        if self._workers:
+            self._pool = ThreadPoolExecutor(max_workers=len(self._workers))
+            print(f"[LLM Feedback] {len(self._workers)} workers loaded in "
+                  f"{time.time()-t0:.1f}s", flush=True)
+        else:
+            print("[LLM Feedback] No workers loaded — LLM feedback disabled")
 
     @property
     def available(self) -> bool:
-        return self._llm is not None
+        return len(self._workers) > 0
+
+    def _pick_worker(self) -> _LLMWorker:
+        """Round-robin worker selection."""
+        with self._robin_lock:
+            w = self._workers[self._robin % len(self._workers)]
+            self._robin += 1
+        return w
 
     def _call(self, system: str, user: str, max_tokens: int = 250,
               temperature: float = 0.3) -> str:
@@ -133,36 +188,54 @@ class LLMFeedback:
         if not self.available:
             return ""
 
-        result = [None]
-        error = [None]
+        worker = self._pick_worker()
 
-        def _generate():
+        future = self._pool.submit(
+            worker.generate, system, user, max_tokens, temperature
+        )
+        try:
+            return future.result(timeout=self.timeout) or ""
+        except FuturesTimeoutError:
+            print(f"[LLM Feedback] Timeout after {self.timeout}s (worker {worker.worker_id})")
+            return ""
+        except Exception as e:
+            print(f"[LLM Feedback] Error (worker {worker.worker_id}): {e}")
+            return ""
+
+    def _call_parallel(self, calls: list[dict]) -> list[str]:
+        """Run multiple LLM calls in parallel across the worker pool.
+
+        Args:
+            calls: list of dicts with keys: system, user, max_tokens, temperature
+
+        Returns:
+            list of result strings (empty string for failures)
+        """
+        if not self.available or not calls:
+            return [""] * len(calls)
+
+        futures = []
+        for c in calls:
+            worker = self._pick_worker()
+            f = self._pool.submit(
+                worker.generate,
+                c["system"], c["user"],
+                c.get("max_tokens", 250),
+                c.get("temperature", 0.3),
+            )
+            futures.append(f)
+
+        results = []
+        for f in futures:
             try:
-                with self._lock:
-                    resp = self._llm.create_chat_completion(
-                        messages=[
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": user},
-                        ],
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        top_p=0.9,
-                    )
-                result[0] = resp["choices"][0]["message"]["content"].strip()
+                results.append(f.result(timeout=self.timeout) or "")
+            except FuturesTimeoutError:
+                print(f"[LLM Feedback] Timeout in parallel call")
+                results.append("")
             except Exception as e:
-                error[0] = str(e)
-
-        thread = threading.Thread(target=_generate, daemon=True)
-        thread.start()
-        thread.join(timeout=self.timeout)
-
-        if thread.is_alive():
-            print(f"[LLM Feedback] Timeout after {self.timeout}s")
-            return ""
-        if error[0]:
-            print(f"[LLM Feedback] Error: {error[0]}")
-            return ""
-        return result[0] or ""
+                print(f"[LLM Feedback] Error in parallel call: {e}")
+                results.append("")
+        return results
 
     def diagnose_error(self, task: str, code: str, error: str) -> str:
         """Diagnose why a CUDA kernel failed.
@@ -175,7 +248,6 @@ class LLMFeedback:
         Returns:
             2-4 sentence diagnosis, or empty string on failure
         """
-        # Truncate inputs to fit context window
         task_trunc = task[:2000]
         code_trunc = code[:3000] if code else "(no code extracted)"
         error_trunc = error[:1000] if error else "Unknown error"
@@ -215,8 +287,6 @@ class LLMFeedback:
             if profiler_info else ""
         )
 
-        # If a specific technique is given, append it to the prompt so the LLM
-        # gives targeted advice instead of generic suggestions.
         technique_section = ""
         if technique_hint:
             technique_section = (
@@ -237,12 +307,13 @@ class LLMFeedback:
             print(f"[LLM Feedback] Optimization hint ({time.time()-t0:.1f}s): {result[:150]}...")
         return result
 
-    def diagnose_batch(self, items: list[dict], max_workers: int = 2) -> list[str]:
-        """Diagnose multiple errors concurrently.
+    # ── Batch APIs: run multiple calls in parallel ────────────────────────
+
+    def diagnose_batch(self, items: list[dict]) -> list[str]:
+        """Diagnose multiple errors in parallel across worker pool.
 
         Args:
             items: list of dicts with keys: task, code, error
-            max_workers: concurrent threads (limited by CPU — 2 is usually optimal)
 
         Returns:
             list of diagnosis strings (empty string for failures)
@@ -250,16 +321,79 @@ class LLMFeedback:
         if not self.available or not items:
             return [""] * len(items)
 
-        # Sequential with the lock — llama-cpp isn't thread-safe for the same model
-        # But we still use the batch API for a clean interface
-        results = []
+        calls = []
         for item in items:
-            r = self.diagnose_error(
-                task=item.get("task", ""),
-                code=item.get("code", ""),
-                error=item.get("error", ""),
+            task_trunc = item.get("task", "")[:2000]
+            code_trunc = (item.get("code") or "(no code extracted)")[:3000]
+            error_trunc = (item.get("error") or "Unknown error")[:1000]
+            user_msg = _DIAGNOSE_USER.format(
+                task=task_trunc, code=code_trunc, error=error_trunc,
             )
-            results.append(r)
+            calls.append({
+                "system": _DIAGNOSE_SYSTEM,
+                "user": user_msg,
+                "max_tokens": 512,
+                "temperature": 0.3,
+            })
+
+        t0 = time.time()
+        results = self._call_parallel(calls)
+        elapsed = time.time() - t0
+        n_ok = sum(1 for r in results if r)
+        print(f"[LLM Feedback] Batch diagnosis: {n_ok}/{len(items)} in {elapsed:.1f}s "
+              f"({len(self._workers)} workers)", flush=True)
+        return results
+
+    def optimize_batch(self, items: list[dict]) -> list[str]:
+        """Generate multiple optimization hints in parallel.
+
+        Args:
+            items: list of dicts with keys:
+                task, code, speedup, profiler_info (opt),
+                technique_hint (opt), temperature (opt)
+
+        Returns:
+            list of hint strings (empty string for failures)
+        """
+        if not self.available or not items:
+            return [""] * len(items)
+
+        calls = []
+        for item in items:
+            task_trunc = item.get("task", "")[:2000]
+            code_trunc = (item.get("code") or "")[:3000]
+            speedup = item.get("speedup", 0.0)
+            profiler_info = item.get("profiler_info", "")
+            technique_hint = item.get("technique_hint", "")
+            temperature = item.get("temperature", 0.3)
+
+            profiler_section = (
+                f"\n\nProfiler analysis:\n{profiler_info[:500]}"
+                if profiler_info else ""
+            )
+            technique_section = ""
+            if technique_hint:
+                technique_section = (
+                    f"\n\nFocus your suggestion on applying this technique: "
+                    f"**{technique_hint}**. Explain how it applies to this specific kernel."
+                )
+            user_msg = _OPTIMIZE_USER.format(
+                task=task_trunc, code=code_trunc,
+                speedup=speedup, profiler_section=profiler_section,
+            ) + technique_section
+            calls.append({
+                "system": _OPTIMIZE_SYSTEM,
+                "user": user_msg,
+                "max_tokens": 250,
+                "temperature": temperature,
+            })
+
+        t0 = time.time()
+        results = self._call_parallel(calls)
+        elapsed = time.time() - t0
+        n_ok = sum(1 for r in results if r)
+        print(f"[LLM Feedback] Batch optimize: {n_ok}/{len(items)} in {elapsed:.1f}s "
+              f"({len(self._workers)} workers)", flush=True)
         return results
 
 
@@ -285,7 +419,6 @@ if __name__ == "__main__":
         print("Usage: python llm_feedback.py <path_to_gguf_model>")
         print("\nRunning without model (testing prompt construction only)...\n")
 
-        # Test prompt construction
         user_msg = _DIAGNOSE_USER.format(
             task="torch.nn.functional.relu(x)",
             code='cuda_source = """\n__global__ void relu_kernel(float* x, int n) {\n    int idx = threadIdx.x;\n    if (idx < n) x[idx] = fmaxf(0.0f, x[idx]);\n}\n"""',
@@ -304,12 +437,12 @@ if __name__ == "__main__":
         print("\nDone.")
         sys.exit(0)
 
-    fb = LLMFeedback(model_path)
+    fb = LLMFeedback(model_path, n_workers=2)
     if not fb.available:
         print("Model failed to load!")
         sys.exit(1)
 
-    # Test error diagnosis
+    # Test single diagnosis
     print("\n=== Testing Error Diagnosis ===")
     hint = fb.diagnose_error(
         task="torch.nn.functional.relu(x) — element-wise ReLU activation",
@@ -330,9 +463,17 @@ if __name__ == "__main__":
         error="Outputs do not match reference. wrong_frac=0.95, max_abs_error=3.14159",
     )
     print(f"Diagnosis: {hint}")
-    print(f"Formatted: {_format_llm_hint(hint)}")
 
-    # Test optimization suggestion
+    # Test batch diagnosis (parallel)
+    print("\n=== Testing Batch Diagnosis (parallel) ===")
+    batch_results = fb.diagnose_batch([
+        {"task": "relu", "code": "kernel code 1", "error": "wrong output"},
+        {"task": "relu", "code": "kernel code 2", "error": "compile error"},
+    ])
+    for i, r in enumerate(batch_results):
+        print(f"  [{i}]: {r[:100]}...")
+
+    # Test optimization
     print("\n=== Testing Optimization Suggestion ===")
     hint2 = fb.suggest_optimization(
         task="torch.nn.functional.relu(x) — element-wise ReLU activation",
@@ -345,4 +486,3 @@ if __name__ == "__main__":
         profiler_info="Memory-bound kernel. Global memory throughput: 450 GB/s (56% of peak).",
     )
     print(f"Optimization: {hint2}")
-    print(f"Formatted: {_format_llm_hint(hint2, 'optimization')}")
