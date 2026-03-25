@@ -43,8 +43,7 @@ if [ "$MODE" = "test" ]; then
     --use_sglang \
     --sglang_python ~/sglang_env/bin/python \
     --sglang_port 30000 \
-    --sglang_tp 1 \
-    --llm_feedback_model ../models/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf
+    --sglang_tp 1
 else
   echo "=== FULL TRAINING RUN ==="
   python train_grpo.py \
@@ -61,7 +60,6 @@ else
     --use_sglang \
     --sglang_python ~/sglang_env/bin/python \
     --sglang_port 30000 \
-    --sglang_tp 1 \
-    --llm_feedback_model ../models/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf
+    --sglang_tp 1
 fi
 
