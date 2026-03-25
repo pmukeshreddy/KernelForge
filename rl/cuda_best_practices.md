@@ -472,7 +472,46 @@ my_kernel<<<blocks, threads>>>(ptr, out_ptr, n);
 
 ---
 
-## 11. Common Pitfalls
+## 11. PyTorch Tensor Access (CRITICAL)
+
+The MOST common reason CUDA extensions fail (with `no suitable conversion function`, `user-defined conversion`, or `IndexError: select()`) is treating PyTorch objects like C++ arrays in host code.
+
+**CRITICAL RULE:** `torch::Tensor` and `at::Tensor` are complex C++ objects. You CANNOT index them directly with `[]` in your host C++ functions (like `forward`).
+If you do `tensor[i]` in host code, PyTorch thinks you want a tensor slice (calling `.select()`), which will cause an `IndexError` or a compilation failure.
+
+**Wrong (Will Crash or Fail to Compile):**
+```cpp
+// ❌ WRONG: Trying to index a Tensor object directly
+float norm = output[b * channels + c]; 
+
+// ❌ WRONG: Modifying a Tensor slice in a host loop
+for (int i = 0; i < n; i++) { output[i] += bias[i]; }
+
+// ❌ WRONG: Assigning a scalar directly to a Tensor
+output = 0.0f;
+```
+
+**Right (Extract the raw pointer first!):**
+```cpp
+// ✅ CORRECT: Extract the raw data pointer before doing any indexing
+float* in_ptr = input.data_ptr<float>();
+float* out_ptr = output.data_ptr<float>();
+
+// Now you can index the raw pointer safely in host loops (if needed)
+float norm = out_ptr[b * channels + c];
+
+// Pass the RAW POINTERS to your CUDA kernels, NOT the Tensor objects
+my_kernel<<<blocks, threads>>>(in_ptr, out_ptr, n);
+```
+
+**Compiler Error Translation Cheat Sheet:**
+*   `no suitable conversion function from "at::Tensor" to "float"` ➡️ You forgot `.data_ptr<float>()`. You are trying to assign a tensor slice to a float.
+*   `no suitable user-defined conversion from "c10::Scalar" to "at::Tensor"` ➡️ You tried to assign a float to a Tensor object instead of its data pointer.
+*   `IndexError: select(): index X out of range` ➡️ You used `tensor[i]` in a host `for` loop instead of `tensor.data_ptr<float>()[i]`.
+
+---
+
+## 12. Common Pitfalls
 
 | Mistake | Fix |
 |---------|-----|
@@ -495,7 +534,7 @@ my_kernel<<<blocks, threads>>>(ptr, out_ptr, n);
 
 ---
 
-## 12. Quick Checklist
+## 13. Quick Checklist
 
 - [ ] Access pattern is coalesced (consecutive threads → consecutive addresses)
 - [ ] Block size is a multiple of 32 (warp size), prefer 128 or 256

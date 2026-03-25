@@ -41,7 +41,19 @@ except ImportError:
     SGLANG_AVAILABLE = False
 
 from agent import _extract_cuda_code, _fix_cuda_api
-# RAG and LLM feedback removed — model learns to self-correct via RL signal alone
+from cuda_rag import CudaRAG
+
+# Initialize RAG system for autonomous bug fixing
+_rag_system = None
+def get_rag():
+    global _rag_system
+    if _rag_system is None:
+        try:
+            _rag_system = CudaRAG(os.path.join(os.path.dirname(__file__), "cuda_best_practices.md"))
+        except Exception as e:
+            print(f"Warning: Failed to initialize CudaRAG: {e}")
+    return _rag_system
+
 from profiler import profile_kernel
 from reward import calculate_reward, calculate_wrong_reward, calculate_opt_reward
 from sandbox import evaluate
@@ -308,18 +320,22 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
         )
     if not eval_res.get("compiles", False):
         err = (eval_res.get("compiler_error") or "Unknown compile error")
+        rag = get_rag()
+        rag_hint = rag.retrieve_text(err, top_k=1) if rag else ""
         return (
             stuck_prefix +
             f"Your previous answer failed to compile. Here is the error message:\n{err}"
-            + hwm_suffix + group_suffix + "\n\n"
+            + hwm_suffix + group_suffix + rag_hint + "\n\n"
             "Fix the compilation error and generate new, complete code."
         )
     if not eval_res.get("correct", False):
         err = (eval_res.get("compiler_error") or "Outputs do not match reference")
+        rag = get_rag()
+        rag_hint = rag.retrieve_text(err, top_k=1) if rag else ""
         return (
             stuck_prefix +
             f"Your previous answer was incorrect. Here is the error message:\n{err}"
-            + hwm_suffix + group_suffix + "\n\n"
+            + hwm_suffix + group_suffix + rag_hint + "\n\n"
             "Fix the correctness issue and generate new, complete code."
         )
     # Correct kernel — include timing milestones and optional profiler data
@@ -1042,11 +1058,11 @@ def _run_group_episodes(
         n_valid = sum(1 for c in candidates if c is not None)
         t_eval = time.time()
         print(f"  [{turn_label}] Evaluating {n_valid}/{G} valid kernels...", end=" ", flush=True)
-        with ProcessPoolExecutor(max_workers=min(G, 16), mp_context=_MP_SPAWN_CTX) as pool:
-            eval_results = list(pool.map(
-                _worker_run_eval,
-                [(c, prompt_text, True, 10 if is_final_turn else 2) for c in candidates],
-            ))
+        global _sandbox_pool
+        eval_results = list(_sandbox_pool.map(
+            _worker_run_eval,
+            [(c, prompt_text, True, 10 if is_final_turn else 2) for c in candidates],
+        ))
         n_compiled = sum(1 for r in eval_results if r is not None and r.get("compiles", False))
         n_correct  = sum(1 for r in eval_results if r is not None and r.get("correct",  False))
         print(f"done ({time.time()-t_eval:.1f}s) | compiled={n_compiled}/{n_valid} correct={n_correct}/{G}")
@@ -1501,9 +1517,9 @@ def _run_evaluation(model, tokenizer, config: GRPOConfig, val_prompts: list[tupl
     valid = 0
     total_speedup = 0.0
 
-    with ProcessPoolExecutor(max_workers=min(16, len(val_prompts)), mp_context=_MP_SPAWN_CTX) as pool:
-        eval_results = list(pool.map(_worker_run_eval,
-                                     [(c, p, True, 10) for c, p in candidates_to_eval]))
+    global _sandbox_pool
+    eval_results = list(_sandbox_pool.map(_worker_run_eval,
+                                 [(c, p, True, 10) for c, p in candidates_to_eval]))
         
     for res in eval_results:
         if res is not None:
@@ -1740,6 +1756,12 @@ def train(config: GRPOConfig = None):
 
     global_step = 0
 
+    global _sandbox_pool
+    # 32 max workers for sandbox evaluation (assumes 4-8 CPU cores per prompt across batch size 4)
+    _sandbox_pool = ProcessPoolExecutor(max_workers=32, mp_context=_MP_SPAWN_CTX)
+    import atexit
+    atexit.register(lambda: _sandbox_pool.shutdown(wait=False))
+
     # Launch SGLang server if enabled
     if not config.mock_mode and config.use_sglang:
         if not SGLANG_AVAILABLE and not config.sglang_python:
@@ -1776,10 +1798,17 @@ def train(config: GRPOConfig = None):
 
             n_degenerate = 0
             t0 = time.time()
-            for p_idx, (prompt_text, level) in enumerate(batch):
-                print(f"\n[Prompt {p_idx+1}/{len(batch)} level={level}] Generating {config.group_size} trajectories (batched/parallel)...")
-                group_turns, group_rewards = _run_group_episodes(prompt_text, model, tokenizer, config, difficulty=level)
 
+            from concurrent.futures import ThreadPoolExecutor
+            def _process_prompt(args):
+                p_idx_local, (prompt_text_local, level_local) = args
+                print(f"\n[Prompt {p_idx_local+1}/{len(batch)} level={level_local}] Generating {config.group_size} trajectories (batched/parallel)...")
+                return _run_group_episodes(prompt_text_local, model, tokenizer, config, difficulty=level_local)
+
+            with ThreadPoolExecutor(max_workers=config.batch_size) as batch_pool:
+                results = list(batch_pool.map(_process_prompt, enumerate(batch)))
+
+            for p_idx, (group_turns, group_rewards) in enumerate(results):
                 # Dynamic Sampling: skip degenerate groups (DAPO).
                 # Use mean-reward-per-trajectory as the degeneracy signal.
                 # Threshold 0.05: groups where all trajectories get nearly identical
@@ -1790,7 +1819,7 @@ def train(config: GRPOConfig = None):
                     reward_std = torch.tensor(traj_means).std().item()
                     if reward_std < 0.05:
                         n_degenerate += 1
-                        print(f"  [Dynamic Sampling] Degenerate group (std={reward_std:.4f}), skipping prompt.")
+                        print(f"  [Dynamic Sampling] Prompt {p_idx+1}/{len(batch)}: Degenerate group (std={reward_std:.4f}), skipping prompt.")
                         continue
 
                 all_group_turns.append(group_turns)
@@ -1800,7 +1829,7 @@ def train(config: GRPOConfig = None):
                 mean_r = sum(traj_means) / len(traj_means)
                 best_r = max(traj_means)
                 reward_std = torch.tensor(traj_means).std().item()
-                print(f"  Group: mean={mean_r:.2f}, best={best_r:.2f}, std={reward_std:.3f}")
+                print(f"  Group {p_idx+1}: mean={mean_r:.2f}, best={best_r:.2f}, std={reward_std:.3f}")
 
             elapsed = time.time() - t0
             step_bar.update(1)
