@@ -322,6 +322,8 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
         err = (eval_res.get("compiler_error") or "Unknown compile error")
         rag = get_rag()
         rag_hint = rag.retrieve_text(err, top_k=1) if rag else ""
+        if rag_hint:
+            print(f"\n\033[96m[RAG HINT INJECTED] {rag_hint.strip()[:150]}...\033[0m")
         return (
             stuck_prefix +
             f"Your previous answer failed to compile. Here is the error message:\n{err}"
@@ -332,6 +334,8 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
         err = (eval_res.get("compiler_error") or "Outputs do not match reference")
         rag = get_rag()
         rag_hint = rag.retrieve_text(err, top_k=1) if rag else ""
+        if rag_hint:
+            print(f"\n\033[93m[RAG HINT INJECTED] {rag_hint.strip()[:150]}...\033[0m")
         return (
             stuck_prefix +
             f"Your previous answer was incorrect. Here is the error message:\n{err}"
