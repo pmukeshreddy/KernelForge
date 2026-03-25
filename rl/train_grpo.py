@@ -41,18 +41,12 @@ except ImportError:
     SGLANG_AVAILABLE = False
 
 from agent import _extract_cuda_code, _fix_cuda_api
-from cuda_rag import CudaRAG
-from llm_feedback import LLMFeedback, _format_llm_hint
+# RAG and LLM feedback removed — model learns to self-correct via RL signal alone
 from profiler import profile_kernel
 from reward import calculate_reward, calculate_wrong_reward, calculate_opt_reward
 from sandbox import evaluate
 from sys_prompt import get_system_prompt
 
-# Global RAG instance — indexes cuda_best_practices.md once at import time
-_cuda_rag = CudaRAG()
-
-# Global LLM feedback instance — initialized lazily when llm_feedback_model is set
-_llm_feedback = None  # type: LLMFeedback | None
 
 
 def _worker_run_eval(args):
@@ -158,7 +152,6 @@ class GRPOConfig:
     # When set, replaces BM25 RAG with an LLM that diagnoses specific bugs
     # and identifies optimization bottlenecks. Runs on CPU (no GPU conflict).
     # Empty string = disabled (uses BM25 RAG as before).
-    llm_feedback_model: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -218,323 +211,6 @@ Reflection: <2-3 sentences covering: (1) your parallelization strategy and block
 # Different trajectories get assigned different rules for GRPO diversity.
 # ---------------------------------------------------------------------------
 
-OPTIMIZATION_RULES = [
-    {
-        "name": "Vectorized Memory Access (float4)",
-        "bottleneck": "memory",
-        "ops": ["elementwise", "reduction", "other"],  # NOT matmul/conv (complex indexing)
-        "rule": (
-            "Load/store 4 floats at once using float4 for 128-bit memory transactions (4x fewer transactions).\n"
-            "Replace:\n"
-            "  float val = input[idx];\n"
-            "  output[idx] = f(val);\n"
-            "With:\n"
-            "  float4 in4 = reinterpret_cast<const float4*>(input)[idx];\n"
-            "  float4 out4;\n"
-            "  out4.x = f(in4.x); out4.y = f(in4.y); out4.z = f(in4.z); out4.w = f(in4.w);\n"
-            "  reinterpret_cast<float4*>(output)[idx] = out4;\n"
-            "Adjust grid size: blocks = (n/4 + threads - 1) / threads. Handle remainder elements separately if n % 4 != 0.\n"
-            "IMPORTANT: only use float4 on the CONTIGUOUS dimension (last dim). The pointer must be 16-byte aligned.\n"
-            "Check alignment: if (n % 4 != 0) fall back to scalar loads for remainder. "
-            "Do NOT cast strided pointers (e.g. input + b*stride) to float4* — this causes misaligned address crashes."
-        ),
-    },
-    {
-        "name": "Grid-Stride Loop",
-        "bottleneck": "both",
-        "ops": ["elementwise", "reduction", "other"],  # universal for simple kernels
-        "rule": (
-            "Process multiple elements per thread with a grid-stride loop. Handles any size, improves occupancy.\n"
-            "Replace:\n"
-            "  int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
-            "  if (idx < n) output[idx] = f(input[idx]);\n"
-            "With:\n"
-            "  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {\n"
-            "      output[i] = f(input[i]);\n"
-            "  }\n"
-            "Launch fewer blocks (e.g. 128 blocks × 256 threads) and let each thread loop over its stride."
-        ),
-    },
-    {
-        "name": "Warp-Level Reduction",
-        "bottleneck": "compute",
-        "ops": ["reduction"],  # ONLY reductions — never elementwise/matmul
-        "rule": (
-            "For reductions (sum, max, min), use warp shuffle instead of shared memory — no sync needed.\n"
-            "  float val = thread_value;\n"
-            "  for (int offset = 16; offset > 0; offset >>= 1)\n"
-            "      val += __shfl_down_sync(0xffffffff, val, offset);\n"
-            "  // Now thread 0 of each warp has the warp's sum.\n"
-            "For block-wide reduction: each warp reduces to lane 0, then lane 0s reduce via shared memory (only 32 elements)."
-        ),
-    },
-    {
-        "name": "Shared Memory Tiling",
-        "bottleneck": "memory",
-        "ops": ["matmul", "conv"],  # ONLY matmul/conv — never elementwise
-        "rule": (
-            "For operations that reuse data (matmul, conv, stencil), tile data into shared memory.\n"
-            "IMPORTANT: __shared__ array sizes MUST be compile-time constants (not runtime variables).\n"
-            "  #define TILE_SIZE 32\n"
-            "  __shared__ float tile[TILE_SIZE][TILE_SIZE];\n"
-            "  // Step 1: Load tile from global memory (coalesced access)\n"
-            "  tile[ty][tx] = input[row * N + col];\n"
-            "  __syncthreads();\n"
-            "  // Step 2: Compute from shared memory (fast, no global memory latency)\n"
-            "  for (int k = 0; k < TILE_SIZE; k++) sum += tile[ty][k] * ...;\n"
-            "  __syncthreads();\n"
-            "For dynamic sizes use: extern __shared__ float tile[]; and pass size as 3rd kernel launch arg.\n"
-            "Typical tile sizes: 16x16 or 32x32. Shared memory is ~100x faster than global."
-        ),
-    },
-    {
-        "name": "Loop Unrolling",
-        "bottleneck": "both",
-        "ops": ["matmul", "conv", "reduction"],  # needs inner loops — NOT pure elementwise
-        "rule": (
-            "Unroll inner loops so the compiler can pipeline instructions and use registers efficiently.\n"
-            "  #pragma unroll\n"
-            "  for (int k = 0; k < TILE_K; k++) {\n"
-            "      sum += a[k] * b[k];\n"
-            "  }\n"
-            "Or manually unroll by 4:\n"
-            "  sum += a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3];\n"
-            "Best for small, fixed-size inner loops. Combine with vectorized loads for maximum throughput."
-        ),
-    },
-    {
-        "name": "Kernel Fusion",
-        "bottleneck": "memory",
-        "ops": ["elementwise", "other"],  # fusing is for multi-op elementwise chains
-        "rule": (
-            "Combine multiple element-wise operations into a single kernel to eliminate intermediate memory traffic.\n"
-            "Instead of separate kernels:\n"
-            "  kernel1: temp[i] = relu(x[i])\n"
-            "  kernel2: out[i] = temp[i] + bias[i]\n"
-            "Fuse into one kernel:\n"
-            "  out[i] = fmaxf(0.0f, x[i]) + bias[i];\n"
-            "This halves memory traffic (no temp array) and eliminates kernel launch overhead."
-        ),
-    },
-    {
-        "name": "Read-Only Cache (__ldg)",
-        "bottleneck": "memory",
-        "ops": ["elementwise", "reduction", "matmul", "conv", "other"],  # universal
-        "rule": (
-            "For read-only input data, use __ldg() to use the texture/L2 cache path.\n"
-            "Replace:\n"
-            "  float val = input[idx];\n"
-            "With:\n"
-            "  float val = __ldg(&input[idx]);\n"
-            "This hints the hardware to cache the read in L2 without polluting L1. "
-            "Especially useful for scattered or read-many access patterns."
-        ),
-    },
-    {
-        "name": "Occupancy Tuning",
-        "bottleneck": "both",
-        "ops": ["elementwise", "reduction", "matmul", "conv", "other"],  # universal
-        "rule": (
-            "Increase occupancy (active warps per SM) to better hide memory latency.\n"
-            "- Try 128 threads/block instead of 256 — more blocks fit per SM.\n"
-            "- Reduce local variables to lower register pressure.\n"
-            "- Reduce shared memory usage so more blocks can coexist.\n"
-            "- Use __launch_bounds__(maxThreads, minBlocks) to guide the compiler:\n"
-            "  __global__ void __launch_bounds__(128, 8) my_kernel(...) { ... }\n"
-            "Check: blocks_per_SM = shared_mem_per_SM / shared_mem_per_block. Aim for >= 4."
-        ),
-    },
-    {
-        "name": "Coalesced Memory Access (Loop Reordering)",
-        "bottleneck": "memory",
-        "ops": ["matmul", "conv", "reduction", "other"],  # NOT pure elementwise (already coalesced)
-        "rule": (
-            "Ensure consecutive threads access consecutive memory addresses (coalesced access).\n"
-            "Bad (strided access — threads jump across memory):\n"
-            "  for (int c = 0; c < C; c++)\n"
-            "    for (int h = 0; h < H; h++)\n"
-            "      output[c * H + h] = ...;  // threads access c*H apart\n"
-            "Good (consecutive access — threads access neighbors):\n"
-            "  for (int h = 0; h < H; h++)\n"
-            "    for (int c = 0; c < C; c++)\n"
-            "      output[c * H + h] = ...;  // threads access 1 apart\n"
-            "Rule: the innermost loop index should match the fastest-varying memory dimension. "
-            "For row-major tensors, the last dimension is fastest."
-        ),
-    },
-]
-
-
-def _get_bottleneck_type(profiler_feedback: str) -> str:
-    """Extract bottleneck type from profiler feedback text.
-    Returns 'memory', 'compute', or 'unknown'."""
-    if not profiler_feedback:
-        return "unknown"
-    text = profiler_feedback.upper()
-    if "MEMORY-BOUND" in text or "MEMORY BOUND" in text:
-        return "memory"
-    if "COMPUTE-BOUND" in text or "COMPUTE BOUND" in text:
-        return "compute"
-    return "unknown"
-
-
-def _classify_code_structure(cuda_code: str) -> dict:
-    """Analyze generated CUDA code to detect what structures are present.
-    Returns a dict of boolean flags for code features.
-
-    This is the ground truth — looks at the ACTUAL code the model wrote,
-    not keywords in the prompt. Works for any operation type.
-    """
-    if not cuda_code:
-        return {}
-    features = {}
-
-    # Inner for-loops (candidates for unrolling / tiling)
-    # Look for `for (` patterns inside __global__ functions
-    for_loops = re.findall(r'for\s*\(', cuda_code)
-    features["has_inner_loops"] = len(for_loops) >= 2  # at least 2 loops = nested
-
-    # Shared memory usage
-    features["has_shared_memory"] = "__shared__" in cuda_code
-
-    # Reduction patterns (atomicAdd, __shfl, warp-level ops)
-    features["has_reduction"] = any(p in cuda_code for p in [
-        "atomicAdd", "atomicMax", "atomicMin",
-        "__shfl_down_sync", "__shfl_xor_sync", "__shfl_sync",
-        "__syncthreads",  # often signals data sharing / reduction
-    ])
-
-    # Data reuse patterns (same array indexed with different offsets in a loop)
-    # Heuristic: multiple accesses to same array in a for-loop body
-    features["has_data_reuse"] = bool(re.search(
-        r'for\s*\(.*?\).*?\{[^}]*\w+\[[^]]+\].*?\w+\[[^]]+\].*?\}',
-        cuda_code, re.DOTALL
-    ))
-
-    # Simple elementwise pattern: one idx, one read, one write, no loops
-    features["is_simple_elementwise"] = (
-        not features["has_inner_loops"]
-        and not features["has_shared_memory"]
-        and not features["has_reduction"]
-        and bool(re.search(r'blockIdx\.x\s*\*\s*blockDim\.x\s*\+\s*threadIdx\.x', cuda_code))
-    )
-
-    # Multiple nested loops with accumulation (matmul-like)
-    features["has_accumulation_loop"] = bool(re.search(
-        r'for\s*\(.*?\).*?\{[^}]*\+=', cuda_code, re.DOTALL
-    ))
-
-    # Sliding window / stencil pattern (offsets like [i+1], [i-1], [row+k])
-    features["has_stencil"] = bool(re.search(
-        r'\w+\[\s*\w+\s*[+-]\s*\d+\s*\]', cuda_code
-    ))
-
-    return features
-
-
-def _get_operation_type(prompt_text: str, cuda_code: str | None = None) -> str:
-    """Classify the kernel operation type.
-    Returns 'elementwise', 'reduction', 'matmul', 'conv', or 'other'.
-
-    Primary signal: structural analysis of the generated CUDA code (if available).
-    Fallback: keyword matching on the prompt text.
-
-    Code-based classification generalizes to ANY operation because it looks at
-    what the model actually wrote, not what the prompt asked for.
-    """
-    # ── Primary: analyze the actual generated code ──
-    if cuda_code:
-        feat = _classify_code_structure(cuda_code)
-
-        # Simple elementwise: no loops, no shared mem, no reduction, just idx→read→write
-        if feat.get("is_simple_elementwise"):
-            return "elementwise"
-
-        # Reduction: has warp shuffles, atomics, or syncthreads without nested loops
-        if feat.get("has_reduction") and not feat.get("has_inner_loops"):
-            return "reduction"
-
-        # Matmul-like: nested loops with accumulation, possible data reuse
-        if feat.get("has_inner_loops") and feat.get("has_accumulation_loop"):
-            # Distinguish matmul from conv by checking for stencil patterns
-            if feat.get("has_stencil"):
-                return "conv"
-            return "matmul"
-
-        # Stencil/conv: sliding window with offsets
-        if feat.get("has_stencil") and feat.get("has_inner_loops"):
-            return "conv"
-
-        # Reduction with loops (block-wide reduction, layernorm-style)
-        if feat.get("has_reduction") and feat.get("has_inner_loops"):
-            return "reduction"
-
-        # Has loops but no accumulation or reduction — could be complex elementwise
-        if feat.get("has_inner_loops") and not feat.get("has_accumulation_loop"):
-            return "other"
-
-        # Simple kernel with no interesting structure
-        if not feat.get("has_inner_loops") and not feat.get("has_reduction"):
-            return "elementwise"
-
-    # ── Fallback: keyword matching on prompt text ──
-    text = prompt_text.lower()
-
-    matmul_kw = ["matmul", "matrix_multiply", "matrix multiply", "gemm",
-                 "matrix multiplication", "torch.mm", "torch.bmm",
-                 "torch.matmul", "einsum"]
-    if any(kw in text for kw in matmul_kw):
-        if "einsum" in text:
-            if any(p in text for p in ["ij,jk", "bij,bjk", "bhij,bhjk", "ik,kj"]):
-                return "matmul"
-            return "other"
-        return "matmul"
-
-    conv_kw = ["conv1d", "conv2d", "conv3d", "convolution", "conv_transpose",
-               "depthwise_conv", "deconv", "sliding window", "stencil",
-               "torch.nn.conv", "f.conv"]
-    if any(kw in text for kw in conv_kw):
-        return "conv"
-
-    reduce_kw = ["reduce", "sum(", ".sum(", "mean(", ".mean(", "norm(",
-                 ".norm(", "softmax", "layernorm", "layer_norm",
-                 "batchnorm", "batch_norm", "groupnorm", "group_norm",
-                 "argmax", "argmin", ".max(", ".min(", "logsumexp",
-                 "cross_entropy", "nll_loss"]
-    if any(kw in text for kw in reduce_kw):
-        return "reduction"
-
-    elem_kw = ["relu", "gelu", "silu", "sigmoid", "tanh", "leaky_relu",
-               "leakyrelu", "elu(", "selu", "mish", "swish", "hardswish",
-               "hardsigmoid", "softplus", "clamp", "elementwise",
-               "pointwise", "element-wise", "point-wise",
-               "activation", "+ bias", "add(", "mul(", "dropout"]
-    if any(kw in text for kw in elem_kw):
-        return "elementwise"
-
-    return "other"
-
-
-def _filter_rules_by_bottleneck(bottleneck: str, op_type: str = "other") -> list:
-    """Return rules matching the profiler bottleneck AND operation type.
-    'both' rules always included for bottleneck. Falls back if too few match."""
-    # First filter by bottleneck
-    if bottleneck == "unknown":
-        by_bottleneck = OPTIMIZATION_RULES
-    else:
-        by_bottleneck = [r for r in OPTIMIZATION_RULES
-                         if r["bottleneck"] == bottleneck or r["bottleneck"] == "both"]
-        if len(by_bottleneck) < 2:
-            by_bottleneck = OPTIMIZATION_RULES
-
-    # Then filter by operation type
-    matching = [r for r in by_bottleneck if op_type in r.get("ops", ["other"])]
-    if len(matching) < 2:
-        # Fallback: at least return safe universal rules
-        safe = [r for r in by_bottleneck
-                if r["name"] in ("Occupancy Tuning", "Read-Only Cache (__ldg)", "Grid-Stride Loop")]
-        return safe if len(safe) >= 2 else by_bottleneck
-    return matching
 
 
 
@@ -589,11 +265,10 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
                          best_speedup: float | None = None,
                          best_turn: int | None = None,
                          profiler_feedback: str | None = None,
-                         group_error_summary: str | None = None,
-                         rag_hint: str | None = None,
-                         opt_hint: str | None = None) -> str:
+                         group_error_summary: str | None = None) -> str:
     """
     Feedback: raw execution results + high water mark for optimization context.
+    No RAG or LLM hints — the model learns to self-correct via RL signal alone.
 
     - Raw error data (compiler errors, wrong values with numbers) is the primary signal.
     - When the same error class repeats, prepends a "try again" signal.
@@ -624,14 +299,11 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
                 f" at {best_speedup:.2f}x speedup over PyTorch."
             )
 
-    # RAG hint: inject relevant CUDA patterns from best practices doc
-    rag_suffix = f"\n\n{rag_hint}" if rag_hint else ""
-
     if eval_res is None:
         return (
             stuck_prefix +
             "Your previous answer failed to be parsed due to not adhering to the desired formatting."
-            + hwm_suffix + group_suffix + rag_suffix + "\n\n"
+            + hwm_suffix + group_suffix + "\n\n"
             "Try a completely different approach and generate new, complete code."
         )
     if not eval_res.get("compiles", False):
@@ -639,7 +311,7 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
         return (
             stuck_prefix +
             f"Your previous answer failed to compile. Here is the error message:\n{err}"
-            + hwm_suffix + group_suffix + rag_suffix + "\n\n"
+            + hwm_suffix + group_suffix + "\n\n"
             "Fix the compilation error and generate new, complete code."
         )
     if not eval_res.get("correct", False):
@@ -647,7 +319,7 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
         return (
             stuck_prefix +
             f"Your previous answer was incorrect. Here is the error message:\n{err}"
-            + hwm_suffix + group_suffix + rag_suffix + "\n\n"
+            + hwm_suffix + group_suffix + "\n\n"
             "Fix the correctness issue and generate new, complete code."
         )
     # Correct kernel — include timing milestones and optional profiler data
@@ -665,45 +337,20 @@ def _build_turn_feedback(eval_res: dict | None, prev_eval: dict | None = None,
 
     speedup_val = (bt / rt) if (rt and bt and rt > 0) else 0.0
 
-    # LLM optimization hint (if available) replaces generic advice
-    opt_suffix = f"\n\n{opt_hint}" if opt_hint else ""
-
     if speedup_val >= 1.0:
-        # OPT TURN: already faster than PyTorch — safe micro-optimizations only
-        if opt_hint:
-            advice = (
-                "IMPORTANT: Your kernel is correct AND already faster than PyTorch.\n"
-                "Do NOT rewrite it from scratch. Make small, incremental changes only."
-                + opt_suffix
-            )
-        else:
-            advice = (
-                "IMPORTANT: Your kernel is correct AND already faster than PyTorch.\n"
-                "Do NOT rewrite it from scratch. Make small, incremental changes only.\n"
-                "Safe optimizations: adjust block/grid sizes, add #pragma unroll, "
-                "use float4/int4 vectorized loads, reduce redundant computation.\n"
-                "Do NOT attempt shared memory tiling or major algorithmic rewrites — "
-                "those often break correctness."
-            )
+        advice = (
+            "IMPORTANT: Your kernel is correct AND already faster than PyTorch.\n"
+            "Do NOT rewrite it from scratch. Make small, incremental changes only."
+        )
         return (
             f"Your previous answer was correct.\n{timing_str}{profiler_str}\n\n"
             + advice + "\nGenerate the complete improved code."
         )
     else:
-        # REWRITE TURN: slower than PyTorch — allow algorithmic restructuring
-        if opt_hint:
-            advice = (
-                "Your kernel is correct but SLOWER than PyTorch. "
-                "You may restructure the algorithm to improve performance."
-                + opt_suffix
-            )
-        else:
-            advice = (
-                "Your kernel is correct but SLOWER than PyTorch. "
-                "You may restructure the algorithm to improve performance.\n"
-                "Focus on: reducing total work, improving memory access patterns, "
-                "increasing parallelism, and ensuring coalesced memory access."
-            )
+        advice = (
+            "Your kernel is correct but SLOWER than PyTorch. "
+            "You may restructure the algorithm to improve performance."
+        )
         return (
             f"Your previous answer was correct.\n{timing_str}{profiler_str}\n\n"
             + advice + "\nKeep the same function signature and output shape. "
@@ -1005,7 +652,6 @@ def _run_group_episodes(
     tokenizer,
     config: GRPOConfig,
     difficulty: int = 1,
-    rag_prob: float = 1.0,
 ) -> tuple[list[list[TurnData]], list[list[float]]]:
     """
     Generate G trajectories × T turns (Kevin's multi-turn recipe).
@@ -1083,116 +729,20 @@ def _run_group_episodes(
         # see all prior attempts to identify which approach was best and avoid repeating mistakes.
         context_texts = []
 
-        # ── Pre-compute deduplicated LLM diagnoses for this turn ──────────
-        # When multiple trajectories have the same error class on the
-        # previous turn, diagnose once and reuse — avoids redundant
-        # sequential LLM calls (saves ~35s per duplicate).
-        _diag_cache: dict[str, str] = {}  # error_class → formatted diagnosis
-        if (turn_idx > 0
-                and _llm_feedback is not None and _llm_feedback.available):
-            _prev_turn = turn_idx - 1
-            # Group trajectories by error class
-            _error_classes: dict[str, int] = {}  # class → first traj index
-            for _gi in range(G):
-                _prev_eval = traj_evals[_gi][_prev_turn] if _prev_turn < len(traj_evals[_gi]) else None
-                _ec = _classify_error(_prev_eval)
-                if _ec != "correct" and _ec not in _error_classes:
-                    _error_classes[_ec] = _gi
-            # Diagnose all unique error classes in parallel via batch API
-            _ec_list = list(_error_classes.keys())
-            _batch_items = []
-            for _ec in _ec_list:
-                _rep_i = _error_classes[_ec]
-                _rep_eval = traj_evals[_rep_i][_prev_turn]
-                _rep_code = ""
-                if _prev_turn < len(traj_responses[_rep_i]) and traj_responses[_rep_i][_prev_turn]:
-                    _rep_code = _extract_python_block(traj_responses[_rep_i][_prev_turn])
-                _rep_error = ""
-                if _rep_eval is None:
-                    _rep_error = "No code was extracted from the response"
-                elif not _rep_eval.get("compiles", False):
-                    _rep_error = _rep_eval.get("compiler_error") or "Unknown compile error"
-                else:
-                    _rep_error = _rep_eval.get("compiler_error") or "Outputs do not match reference"
-                    _wf = _rep_eval.get("wrong_frac")
-                    _mae = _rep_eval.get("max_abs_error")
-                    if _wf is not None:
-                        _rep_error += f" | {_wf*100:.0f}% of elements wrong"
-                    if _mae is not None:
-                        _rep_error += f" | max_abs_error={_mae:.5f}"
-                _batch_items.append({
-                    "task": prompt_text,
-                    "code": _rep_code or "(no code extracted)",
-                    "error": _rep_error,
-                })
-            _batch_results = _llm_feedback.diagnose_batch(_batch_items)
-            for _idx, _ec in enumerate(_ec_list):
-                if _batch_results[_idx]:
-                    _diag_cache[_ec] = _format_llm_hint(_batch_results[_idx], "diagnosis")
-            _n_unique = len(_error_classes)
-            _n_failed = sum(1 for _gi in range(G)
-                            if _classify_error(
-                                traj_evals[_gi][_prev_turn] if _prev_turn < len(traj_evals[_gi]) else None
-                            ) != "correct")
-            if _n_unique > 0:
-                print(f"  [LLM-DEDUP] {_n_failed} failed trajs → {_n_unique} unique error class(es), "
-                      f"{_n_unique} diagnosis call(s) (saved {max(0, _n_failed - _n_unique)})",
-                      flush=True)
-
-        # ── Pre-compute optimization hints in parallel ────────────────────
-        # Batch all LLM opt hint calls before the per-trajectory loop so
-        # they run concurrently across the worker pool.
-        _opt_hint_cache: dict[int, str] = {}  # traj_index → hint string
+        # Check if profiler says "Already Faster" with low utilization
         _ws_prof = ws_best_eval.get("profiler_feedback", "") if ws_best_eval else ""
         _already_fast_low_util = (
             "Already Faster Than PyTorch" in _ws_prof
             and ws_best_speedup >= 1.0
         )
-        _pre_use_opt = (
-            turn_idx > 0
-            and ws_best_code is not None
-            and ws_best_speedup >= 0.5
-            and not _already_fast_low_util
-            and _llm_feedback is not None and _llm_feedback.available
-        )
-        if _pre_use_opt:
-            _pre_bottleneck = _get_bottleneck_type(_ws_prof)
-            _pre_op_type = _get_operation_type(prompt_text, cuda_code=ws_best_code)
-            _pre_filtered = _filter_rules_by_bottleneck(_pre_bottleneck, _pre_op_type)
-            _pre_rt = ws_best_eval.get("runtime_ms") if ws_best_eval else None
-            _pre_bt = ws_best_eval.get("baseline_runtime_ms") if ws_best_eval else None
-            _pre_speedup = (_pre_bt / _pre_rt) if (_pre_rt and _pre_bt and _pre_rt > 0) else 0.0
-            _LLM_OPT_TEMPS = [0.3, 0.5, 0.7, 0.9]
-
-            _opt_batch_items = []
-            _opt_batch_trajs = []  # track which traj index each batch item maps to
-            for _oi in range(G):
-                if _oi % 2 != 0:  # only even-indexed trajectories get LLM hints
-                    continue
-                _oi_rule = _pre_filtered[(_oi + turn_idx - 1) % len(_pre_filtered)]
-                _oi_temp = _LLM_OPT_TEMPS[_oi % len(_LLM_OPT_TEMPS)]
-                _opt_batch_items.append({
-                    "task": prompt_text,
-                    "code": ws_best_code or "",
-                    "speedup": _pre_speedup,
-                    "profiler_info": _ws_prof,
-                    "technique_hint": _oi_rule["name"],
-                    "temperature": _oi_temp,
-                })
-                _opt_batch_trajs.append(_oi)
-            if _opt_batch_items:
-                _opt_batch_results = _llm_feedback.optimize_batch(_opt_batch_items)
-                for _bi, _oi in enumerate(_opt_batch_trajs):
-                    if _opt_batch_results[_bi]:
-                        _opt_hint_cache[_oi] = _opt_batch_results[_bi]
 
         for i in range(G):
             msgs = list(base_messages)
 
             # ── Optimization-first turn strategy ─────────────────────────────
             # Turn 2+: if a correct kernel exists at reasonable speed, ALL
-            # trajectories get it with specific optimization rules + profiler.
-            # >= 0.5x: algorithm is sound, needs micro-optimization (float4, etc.)
+            # trajectories get it with profiler feedback for optimization.
+            # >= 0.5x: algorithm is sound, needs optimization
             # < 0.5x:  algorithm is fundamentally wrong, needs rewrite not tuning
             #
             # Skip opt turn when profiler says "Already Faster" with low
@@ -1210,7 +760,6 @@ def _run_group_episodes(
                     print(f"  [OPT SKIP] Profiler says 'Already Faster' with low util "
                           f"({ws_best_speedup:.2f}x) — skipping optimization turn",
                           flush=True)
-            use_opt_rules = use_optimization_turn  # always True when opt turn is active
 
             if use_optimization_turn:
                 # Freeze baseline on first opt turn (Bug 1)
@@ -1249,19 +798,9 @@ def _run_group_episodes(
                 # (Bug 6), stuck detection (Bug 3), actual error messages (Bug 4).
                 delta_str = ""
                 prev_opt_eval = traj_evals[i][turn_idx - 1] if turn_idx > 1 and len(traj_evals[i]) >= turn_idx else None
-                # Filter OPT rules by profiler bottleneck AND operation type —
-                # don't assign shared memory tiling to elementwise ops, etc.
-                # Uses the actual generated code (ws_best_code) for classification,
-                # not just prompt keywords — generalizes to any operation.
-                _bottleneck = _get_bottleneck_type(traj_prof or "")
-                _op_type = _get_operation_type(prompt_text, cuda_code=ws_best_code)
-                _filtered_rules = _filter_rules_by_bottleneck(_bottleneck, _op_type)
 
                 if prev_opt_eval is not None:
-                    prev_rule = _filtered_rules[(i + turn_idx - 2) % len(_filtered_rules)]
-                    technique_ref = f"'{prev_rule['name']}'"
-
-                    # Bug 3: stuck detection — same error class 2 turns in a row
+                    # Stuck detection — same error class 2 turns in a row
                     stuck_str = ""
                     if turn_idx > 2 and len(traj_evals[i]) >= turn_idx:
                         prev_prev = traj_evals[i][turn_idx - 2]
@@ -1274,19 +813,16 @@ def _run_group_episodes(
                             )
 
                     if not prev_opt_eval.get("compiles", False):
-                        # Bug 4+5: include actual compiler error
                         err_msg = prev_opt_eval.get("compiler_error") or "Unknown error"
-                        # Truncate to avoid flooding context
                         if len(err_msg) > 500:
                             err_msg = err_msg[:500] + "..."
                         delta_str = (
-                            f"\n\n⚠ REGRESSION: Last turn {technique_ref} — "
-                            f"it BROKE COMPILATION of your working kernel.\n"
+                            f"\n\n⚠ REGRESSION: Your last optimization attempt "
+                            f"BROKE COMPILATION of your working kernel.\n"
                             f"{stuck_str}"
                             f"Error: {err_msg}"
                         )
                     elif not prev_opt_eval.get("correct", False):
-                        # Bug 4+5+6: include rich error detail from sandbox
                         err_msg = prev_opt_eval.get("compiler_error") or "Outputs do not match reference"
                         if len(err_msg) > 500:
                             err_msg = err_msg[:500] + "..."
@@ -1302,98 +838,49 @@ def _run_group_episodes(
                             detail_parts.append(f"systematic_bias={bias:+.4f} ({'too high' if bias > 0 else 'too low'})")
                         detail_suffix = " | ".join(detail_parts)
                         delta_str = (
-                            f"\n\n⚠ REGRESSION: Last turn {technique_ref} — "
-                            f"it BROKE CORRECTNESS of your working kernel.\n"
+                            f"\n\n⚠ REGRESSION: Your last optimization attempt "
+                            f"BROKE CORRECTNESS of your working kernel.\n"
                             f"{stuck_str}"
                             f"{err_msg}\n"
                             f"{detail_suffix}"
                         )
                     else:
-                        # Correct — compare against frozen baseline (Bug 1)
+                        # Correct — compare against frozen baseline
                         prev_rt = prev_opt_eval.get("runtime_ms")
                         baseline_sp = ws_speedup_at_opt_start or ws_best_speedup
                         if prev_rt and bt:
                             prev_sp = bt / prev_rt
                             if prev_sp > baseline_sp * 1.05:
                                 delta_str = (
-                                    f"\n\n✓ Last turn {technique_ref} — "
-                                    f"it IMPROVED speed to {prev_sp:.2f}x "
-                                    f"(started at {baseline_sp:.2f}x). Good technique."
+                                    f"\n\n✓ Your last optimization IMPROVED speed to {prev_sp:.2f}x "
+                                    f"(started at {baseline_sp:.2f}x)."
                                 )
                             elif prev_sp < baseline_sp * 0.95:
                                 delta_str = (
-                                    f"\n\n✗ Last turn {technique_ref} — "
-                                    f"it made the kernel SLOWER at {prev_sp:.2f}x "
-                                    f"(started at {baseline_sp:.2f}x). Avoid that approach."
+                                    f"\n\n✗ Your last optimization made the kernel SLOWER at {prev_sp:.2f}x "
+                                    f"(started at {baseline_sp:.2f}x). Try a different approach."
                                 )
                             else:
                                 delta_str = (
-                                    f"\n\n→ Last turn {technique_ref} — "
-                                    f"no significant speed change ({prev_sp:.2f}x vs "
-                                    f"started at {baseline_sp:.2f}x). Try a different technique."
+                                    f"\n\n→ Your last optimization had no significant speed change ({prev_sp:.2f}x vs "
+                                    f"started at {baseline_sp:.2f}x). Try a different approach."
                                 )
 
-                # Assign a different optimization rule — rotate by BOTH
-                # trajectory index AND turn so each traj tries a different
-                # technique each turn instead of the same one every time.
-                # Rules are filtered by profiler bottleneck type.
-                rule = _filtered_rules[(i + turn_idx - 1) % len(_filtered_rules)]
-
-                # LLM hints for even-indexed trajectories (pre-computed in
-                # parallel via optimize_batch above).
-                # Odd-indexed trajectories use hardcoded rule rotation
-                # to maintain exploration diversity across the group.
-                _opt_llm_hint = _opt_hint_cache.get(i)
-                if i == 0 and (i % 2 == 0):
-                    print(f"  [LLM-OPT] traj=0 turn {turn_idx+1}: "
-                          f"{'got hint (pre-computed)' if _opt_llm_hint else 'no response, using rules'}"
-                          f" (technique={rule['name']})",
-                          flush=True)
-
-                if _opt_llm_hint:
-                    # Use LLM-generated optimization hint (targeted to rule)
-                    rule_str = _format_llm_hint(_opt_llm_hint, "optimization")
-                    traj_turn_feedback_source[i] = {
-                        "type": "OPT-LLM",
-                        "rule": rule["name"],
-                        "bottleneck": _bottleneck,
-                        "op_type": _op_type,
-                        "profiler": bool(traj_prof),
-                    }
-                else:
-                    # Hardcoded rules (odd trajectories, or LLM fallback)
-                    traj_turn_feedback_source[i] = {
-                        "type": "OPT",
-                        "rule": rule["name"],
-                        "bottleneck": _bottleneck,
-                        "op_type": _op_type,
-                        "profiler": bool(traj_prof),
-                    }
-                    rule_str = (
-                        f"\n\n--- Optimization Technique to Apply ---\n"
-                        f"**{rule['name']}**\n{rule['rule']}\n"
-                        f"---\n"
-                        f"Apply this technique to the kernel above. "
-                        f"Keep the kernel correct while making it faster.\n"
-                        f"IMPORTANT: If this technique does not naturally fit your kernel "
-                        f"(e.g., no inner loops to unroll, no data reuse for shared memory), "
-                        f"skip it and instead do minor tuning: adjust block/grid sizes, "
-                        f"add __ldg() for read-only data, or try #pragma unroll on any existing loops."
-                    )
+                traj_turn_feedback_source[i] = {
+                    "type": "OPT",
+                    "profiler": bool(traj_prof),
+                }
 
                 feedback = (
                     f"Your previous answer was correct.\n{timing_str}{profiler_str}"
-                    f"{delta_str}"
-                    f"{rule_str}\n\n"
-                    "Apply the optimization above to improve speed. "
+                    f"{delta_str}\n\n"
+                    "Optimize the kernel to improve speed. "
                     "Generate the complete improved code."
                 )
 
                 if i == 0:
-                    _hint_source = f"LLM(rule={rule['name']})" if _opt_llm_hint else f"rule='{rule['name']}'"
                     print(f"  [OPT TURN] traj=0 turn {turn_idx+1}: "
-                          f"best kernel from {ws_best_source} ({ws_best_speedup:.2f}x), "
-                          f"{_hint_source}"
+                          f"best kernel from {ws_best_source} ({ws_best_speedup:.2f}x)"
                           f"{', delta: ' + delta_str.strip()[:200] if delta_str else ''}")
                     print(f"  [DEBUG] Feedback traj=0 →{turn_idx+1}:\n{feedback[:800]}...")
                 msgs.append({"role": "user", "content": feedback})
@@ -1420,109 +907,11 @@ def _run_group_episodes(
                             sp = pe["baseline_runtime_ms"] / pe["runtime_ms"]
                             if hwm_speedup is None or sp > hwm_speedup:
                                 hwm_speedup, hwm_turn = sp, pt + 1
-                    # Feedback hints: LLM diagnosis (if available) or BM25 RAG
-                    # Dropout: rag_prob decays from 1.0→0.0 over training so model
-                    # learns patterns early but doesn't depend on hints later.
-                    _rag_hint = None
-                    _rag_sections = []
-                    _llm_hint = None
                     _eval_t = traj_evals[i][t]
-                    _is_error = (_eval_t is None or not _eval_t.get("correct", False))
-                    if _is_error:
-                        # Extract code for diagnosis
-                        _code = ""
-                        if t < len(traj_responses[i]) and traj_responses[i][t]:
-                            _code = _extract_python_block(traj_responses[i][t])
-
-                        # LLM feedback ALWAYS fires for errors (not gated by rag_prob)
-                        # Use pre-computed deduplicated cache for the most recent
-                        # prior turn; fall back to direct call for older turns.
-                        if _llm_feedback is not None and _llm_feedback.available:
-                            _ec = _classify_error(_eval_t)
-                            if t == turn_idx - 1 and _ec in _diag_cache:
-                                # Reuse cached diagnosis (deduplicated)
-                                _rag_hint = _diag_cache[_ec]
-                                _llm_hint = _rag_hint  # for printing
-                            else:
-                                # Direct call for older turns or cache miss
-                                _error_msg = ""
-                                if _eval_t is None:
-                                    _error_msg = "No code was extracted from the response"
-                                elif not _eval_t.get("compiles", False):
-                                    _error_msg = _eval_t.get("compiler_error") or "Unknown compile error"
-                                else:
-                                    _error_msg = _eval_t.get("compiler_error") or "Outputs do not match reference"
-                                    _wf = _eval_t.get("wrong_frac")
-                                    _mae = _eval_t.get("max_abs_error")
-                                    if _wf is not None:
-                                        _error_msg += f" | {_wf*100:.0f}% of elements wrong"
-                                    if _mae is not None:
-                                        _error_msg += f" | max_abs_error={_mae:.5f}"
-
-                                _llm_hint = _llm_feedback.diagnose_error(
-                                    task=prompt_text,
-                                    code=_code or "(no code extracted)",
-                                    error=_error_msg,
-                                )
-                                if _llm_hint:
-                                    _rag_hint = _format_llm_hint(_llm_hint, "diagnosis")
-                            if i == 0:
-                                _cache_hit = (t == turn_idx - 1 and _ec in _diag_cache)
-                                print(f"  [LLM] traj=0 turn {t+1}→{turn_idx+1}: "
-                                      f"{'got diagnosis' if _llm_hint else 'no response, falling back to RAG'}"
-                                      f"{' (cached)' if _cache_hit else ''}",
-                                      flush=True)
-
-                        # Fallback to BM25 RAG if LLM unavailable or returned nothing
-                        # RAG is gated by rag_prob dropout (decays over training)
-                        if not _rag_hint and random.random() < rag_prob:
-                            _rag_query = prompt_text
-                            if _eval_t and _eval_t.get("compiler_error"):
-                                _rag_query += "\n" + _eval_t["compiler_error"]
-                            if _code:
-                                _rag_query += "\n" + _code[:1000]
-                            _rag_sections = _cuda_rag.retrieve(_rag_query, top_k=2)
-                            _rag_hint = _cuda_rag.retrieve_text(_rag_query, top_k=2, max_chars=2000)
-                            if i == 0 and _rag_sections:
-                                print(f"  [RAG] traj=0 turn {t+1}→{turn_idx+1}: retrieved {len(_rag_sections)} sections:", flush=True)
-                                for _rs in _rag_sections:
-                                    print(f"    → '{_rs.title}' ({len(_rs.content)} chars)", flush=True)
-                            elif i == 0:
-                                print(f"  [RAG] traj=0 turn {t+1}→{turn_idx+1}: skipped (correct={_eval_t.get('correct', False) if _eval_t else None}, rag_prob={rag_prob:.2f})", flush=True)
-
-                    # LLM optimization hint for correct-but-improvable kernels
-                    _opt_hint = None
-                    if (_eval_t is not None and _eval_t.get("correct", False)
-                            and _llm_feedback is not None and _llm_feedback.available):
-                        _speedup = 0.0
-                        _rt = _eval_t.get("runtime_ms")
-                        _bt = _eval_t.get("baseline_runtime_ms")
-                        if _rt and _bt and _rt > 0:
-                            _speedup = _bt / _rt
-                        _opt_code = ""
-                        if t < len(traj_responses[i]) and traj_responses[i][t]:
-                            _opt_code = _extract_python_block(traj_responses[i][t])
-                        _opt_hint = _llm_feedback.suggest_optimization(
-                            task=prompt_text,
-                            code=_opt_code or "(no code extracted)",
-                            speedup=_speedup,
-                            profiler_info=_eval_t.get("profiler_feedback") or "",
-                        )
-                        if _opt_hint:
-                            _opt_hint = _format_llm_hint(_opt_hint, "optimization")
-                        if i == 0:
-                            print(f"  [LLM-OPT] traj=0 turn {t+1}→{turn_idx+1}: "
-                                  f"{'got optimization hint' if _opt_hint else 'no response'}",
-                                  flush=True)
-
                     _has_profiler = bool(_eval_t and _eval_t.get("profiler_feedback"))
-                    _rag_titles = [_rs.title for _rs in _rag_sections] if _rag_sections else []
                     traj_turn_feedback_source[i] = {
-                        "type": "LLM" if (_llm_hint or _opt_hint) else "NORMAL",
+                        "type": "NORMAL",
                         "profiler": _has_profiler,
-                        "rag": _rag_titles,
-                        "llm_diagnosis": bool(_llm_hint),
-                        "llm_optimization": bool(_opt_hint),
                         "correct_prev": bool(_eval_t and _eval_t.get("correct")),
                     }
                     feedback = _build_turn_feedback(
@@ -1530,17 +919,12 @@ def _run_group_episodes(
                         best_speedup=hwm_speedup, best_turn=hwm_turn,
                         profiler_feedback=_eval_t.get("profiler_feedback") if _eval_t else None,
                         group_error_summary=group_error_summary,
-                        rag_hint=_rag_hint,
-                        opt_hint=_opt_hint,
                     )
                     if i == 0:
-                        _fb_has_llm = "Bug Diagnosis" in feedback or "Optimization Hint" in feedback
-                        _fb_has_rag = "--- Relevant CUDA Pattern ---" in feedback
                         _fb_has_group = "ALL" in feedback and "FAILED" in feedback
                         _fb_has_stuck = "same type of error" in feedback
                         print(f"  [DEBUG] Feedback traj=0 turn {t+1}→{turn_idx+1} "
-                              f"({len(feedback)} chars, LLM={'YES' if _fb_has_llm else 'NO'}, "
-                              f"RAG={'YES' if _fb_has_rag else 'NO'}, "
+                              f"({len(feedback)} chars, "
                               f"group_fail={'YES' if _fb_has_group else 'NO'}, "
                               f"stuck={'YES' if _fb_has_stuck else 'NO'}):\n{feedback}", flush=True)
                     elif (traj_evals[i][t] is not None
@@ -1568,21 +952,8 @@ def _run_group_episodes(
 
         # Optimization turn summary
         if use_optimization_turn:
-            # Determine bottleneck and op type from best kernel's profiler for the summary
-            _sum_prof = ws_best_eval.get("profiler_feedback", "") if ws_best_eval else ""
-            _sum_bottleneck = _get_bottleneck_type(_sum_prof)
-            _sum_op_type = _get_operation_type(prompt_text)
-            _sum_filtered = _filter_rules_by_bottleneck(_sum_bottleneck, _sum_op_type)
             print(f"  [OPT TURN] Turn {turn_idx+1}: ALL {G} trajectories optimizing "
-                  f"best kernel from {ws_best_source} ({ws_best_speedup:.2f}x) "
-                  f"[bottleneck={_sum_bottleneck}, op_type={_sum_op_type}, "
-                  f"{len(_sum_filtered)}/{len(OPTIMIZATION_RULES)} rules]")
-            rules_used = [_sum_filtered[(i + turn_idx - 1) % len(_sum_filtered)]["name"] for i in range(G)]
-            _llm_avail = _llm_feedback is not None and _llm_feedback.available
-            _llm_trajs = [j for j in range(G) if j % 2 == 0 and _llm_avail]
-            _rule_trajs = [j for j in range(G) if j not in _llm_trajs]
-            print(f"  [OPT TURN] Rules assigned: {rules_used}")
-            print(f"  [OPT TURN] LLM trajs: {_llm_trajs}, Rule trajs: {_rule_trajs}")
+                  f"best kernel from {ws_best_source} ({ws_best_speedup:.2f}x)")
         elif turn_idx > 0:
             print(f"  [TURN {turn_idx+1}] No correct kernel yet — normal error-feedback path")
 
@@ -1842,11 +1213,11 @@ def _run_group_episodes(
                         outcome = "CORRECT (no timing)"
 
                 if fb.get("type") == "OPT":
-                    print(f"    traj {i}: rule='{fb['rule']}' bottleneck={fb['bottleneck']} op_type={fb.get('op_type','?')} → {outcome}", flush=True)
-                elif fb.get("type") == "NORMAL":
-                    rag_str = f" RAG={fb['rag']}" if fb.get('rag') else ""
                     prof_str = " +profiler" if fb.get('profiler') else ""
-                    print(f"    traj {i}: NORMAL (prev_correct={fb.get('correct_prev')}){prof_str}{rag_str} → {outcome}", flush=True)
+                    print(f"    traj {i}: OPT{prof_str} → {outcome}", flush=True)
+                elif fb.get("type") == "NORMAL":
+                    prof_str = " +profiler" if fb.get('profiler') else ""
+                    print(f"    traj {i}: NORMAL (prev_correct={fb.get('correct_prev')}){prof_str} → {outcome}", flush=True)
                 else:
                     print(f"    traj {i}: (no feedback tracked) → {outcome}", flush=True)
         # ── END FEEDBACK→OUTCOME ────────────────────────────────────────────
@@ -2407,11 +1778,7 @@ def train(config: GRPOConfig = None):
             t0 = time.time()
             for p_idx, (prompt_text, level) in enumerate(batch):
                 print(f"\n[Prompt {p_idx+1}/{len(batch)} level={level}] Generating {config.group_size} trajectories (batched/parallel)...")
-                # RAG dropout: cosine decay from 100% → 0% over training
-                # Cosine decays slowly early (model still needs hints) then drops fast at end
-                _rag_progress = min(1.0, global_step / max(total_steps, 1))
-                _rag_prob = max(0.0, 0.5 * (1.0 + math.cos(math.pi * _rag_progress)))
-                group_turns, group_rewards = _run_group_episodes(prompt_text, model, tokenizer, config, difficulty=level, rag_prob=_rag_prob)
+                group_turns, group_rewards = _run_group_episodes(prompt_text, model, tokenizer, config, difficulty=level)
 
                 # Dynamic Sampling: skip degenerate groups (DAPO).
                 # Use mean-reward-per-trajectory as the degeneracy signal.
@@ -2583,9 +1950,6 @@ if __name__ == "__main__":
     parser.add_argument("--sglang_tp", type=int, default=1, help="SGLang tensor parallel degree")
     parser.add_argument("--max_prompts", type=int, default=0, help="Cap dataset to N prompts (0=all). Use ~100 for a 2-3h run.")
     parser.add_argument("--no_curriculum", action="store_true", help="Disable curriculum (random prompt order instead of easy-first)")
-    parser.add_argument("--llm_feedback_model", type=str, default="",
-                        help="Path to GGUF model for LLM-based feedback (replaces BM25 RAG). "
-                             "Runs on CPU, no GPU conflict. Empty = use RAG only.")
     args = parser.parse_args()
 
     cfg = GRPOConfig(
@@ -2610,13 +1974,8 @@ if __name__ == "__main__":
         sglang_tp=args.sglang_tp,
         max_prompts=args.max_prompts,
         curriculum=not args.no_curriculum,
-        llm_feedback_model=args.llm_feedback_model,
     )
 
-    # Initialize LLM feedback if model path is provided
-    if cfg.llm_feedback_model:
-        _llm_feedback = LLMFeedback(cfg.llm_feedback_model, n_workers=2)
-    
     # Simple resume logic: swap base model for output_dir if resuming
     if args.resume and os.path.exists(args.output_dir):
         # find the highest step checkpoint, or output_dir itself
